@@ -7,7 +7,7 @@ import Signup from './components/Auth/Signup';
 import Layout from './components/Layout/Layout';
 import Dashboard from './pages/Dashboard';
 import Patients from './pages/Patients';
-import Tests from './pages/Tests';
+import Tests from './pages/Tests_Working';
 import Orders from './pages/Orders';
 import Results from './pages/Results';
 import Reports from './pages/Reports';
@@ -15,8 +15,8 @@ import PeripheralSmearDemo from './components/Workflows/PeripheralSmearDemo';
 import Billing from './pages/Billing';
 import CashReconciliation from './pages/CashReconciliation';
 import AITools from './pages/AITools';
-import ResultsVerification from './pages/ResultsVerification';
 import Settings from './pages/Settings';
+import ResultVerificationConsole from './pages/ResultVerificationConsole';
 
 const AppRoutes: React.FC = () => {
   const { user, loading } = useAuth();
@@ -52,7 +52,7 @@ const AppRoutes: React.FC = () => {
               <Route path="/tests" element={<Tests />} />
               <Route path="/orders" element={<Orders />} />
               <Route path="/results" element={<Results />} />
-              <Route path="/results-verification" element={<ResultsVerification />} />
+              <Route path="/results-verification" element={<ResultVerificationConsole />} />
               <Route path="/reports" element={<Reports />} />
               {/* Dev workflow demo route (no DB changes) */}
               <Route path="/workflow-demo/peripheral-smear" element={<PeripheralSmearDemo />} />
@@ -60,6 +60,7 @@ const AppRoutes: React.FC = () => {
               <Route path="/cash-reconciliation" element={<CashReconciliation />} />
               <Route path="/ai-tools" element={<AITools />} />
               <Route path="/settings" element={<Settings />} />
+              <Route path="/verification" element={<ResultVerificationConsole />} />
             </Routes>
           </Layout>
         </ProtectedRoute>

@@ -17,47 +17,22 @@ const AITools: React.FC = () => {
   const handleConfigurationGenerated = async (config: TestConfigurationResponse) => {
     console.log('Generated AI configuration:', config);
     
-    // If the Edge Function already handled the insert, just show success
-    if (config.inserted) {
-      alert(`✅ Successfully created "${config.test_group.name}" with ${config.analytes.length} analytes!`);
-      return;
-    }
-    
-    // Otherwise, handle local insert using the new data structure
     try {
-      // Check if test group already exists - use array query to avoid 406 errors
-      const testCode = config.test_group.code;
-      
-      const { data: existingGroups } = await supabase
-        .from('test_groups')
-        .select('id, name, code')
-        .or(`name.eq.${config.test_group.name},code.eq.${testCode}`)
-        .limit(1);
-
-      const existingGroup = existingGroups && existingGroups.length > 0 ? existingGroups[0] : null;
-
-      if (existingGroup) {
-        const message = `⚠️ Test group "${config.test_group.name}" already exists!\n\nFound existing test group:\n• Name: ${existingGroup.name}\n• Code: ${existingGroup.code}\n\nPlease:\n1. Go to Tests page to edit the existing test group\n2. Or try a different test name\n3. Or modify the existing configuration`;
-        alert(message);
-        console.warn('Duplicate test group found:', existingGroup);
-        return;
-      }
-
-      // Convert new format to database format
+      // First, create the test group - using correct column names
       const testGroupData = {
-        name: config.test_group.name,
-        code: config.test_group.code,
-        category: config.test_group.category,
-        clinical_purpose: config.test_group.clinical_purpose,
-        price: parseFloat(config.test_group.price),
-        turnaround_time: extractHours(config.test_group.turnaround_time),
-        sample_type: config.test_group.sample_type,
-        requires_fasting: config.test_group.requires_fasting,
-        is_active: config.test_group.is_active,
-        default_ai_processing_type: config.test_group.default_ai_processing_type,
-        group_level_prompt: config.test_group.group_level_prompt,
-        lab_id: null,
-        to_be_copied: config.test_group.to_be_copied
+        name: config.testGroup.name,
+        code: config.testGroup.name.toUpperCase().replace(/\s+/g, '_'),
+        category: config.testGroup.category,
+        clinical_purpose: config.testGroup.clinical_purpose,
+        price: config.testGroup.price,
+        turnaround_time: config.testGroup.tat_hours,
+        sample_type: config.testGroup.sample_type,
+        requires_fasting: false,
+        is_active: true,
+        default_ai_processing_type: 'ocr_report',
+        group_level_prompt: config.testGroup.instructions,
+        lab_id: null, // Set to null or get from user context
+        to_be_copied: false
       };
 
       console.log('Creating test group:', testGroupData);
@@ -70,105 +45,68 @@ const AITools: React.FC = () => {
 
       if (testGroupError) {
         console.error('Error creating test group:', testGroupError);
-        if (testGroupError.code === '23505') {
-          if (testGroupError.message.includes('test_groups_code_key')) {
-            alert(`❌ Test group code "${testCode}" already exists!\n\nPlease try a different test name or check the existing test groups.`);
-          } else if (testGroupError.message.includes('test_groups_name_key')) {
-            alert(`❌ Test group name "${config.test_group.name}" already exists!\n\nPlease try a different test name or check the existing test groups.`);
-          } else {
-            alert(`❌ Duplicate entry error: ${testGroupError.message}`);
-          }
-          return;
-        }
         throw testGroupError;
       }
 
       console.log('Test group created:', newTestGroup);
 
-      // Create analytes WITHOUT test_group_id (they are independent entities)
-      const analytesToCreate = config.analytes.map((analyte) => ({
+      // Then, create the analytes
+      const analytesToCreate = config.analytes.map((analyte: any) => ({
         name: analyte.name,
-        unit: analyte.unit || '',
-        reference_range: analyte.reference_range || '',
-        category: analyte.category || config.test_group.category,
+        unit: analyte.unit,
+        method: analyte.method,
+        // description: analyte.description, // This column doesn't exist in analytes table
+        category: config.testGroup.category, // Use same category as test group
+        normal_range_min: analyte.reference_min,
+        normal_range_max: analyte.reference_max,
+        low_critical: analyte.critical_min > 0 ? analyte.critical_min : null,
+        high_critical: analyte.critical_max > 0 ? analyte.critical_max : null,
+        reference_range: `${analyte.reference_min}-${analyte.reference_max}`,
         is_active: true,
-        low_critical: analyte.low_critical ? parseFloat(analyte.low_critical) : null,
-        high_critical: analyte.high_critical ? parseFloat(analyte.high_critical) : null,
-        ai_processing_type: analyte.ai_processing_type || 'ocr_report',
-        group_ai_mode: analyte.group_ai_mode || 'individual',
-        lab_id: null
+        ai_processing_type: 'ocr_report',
+        group_ai_mode: 'individual'
       }));
 
       console.log('Creating analytes:', analytesToCreate);
 
-      // Create analytes one by one to handle duplicates gracefully
-      const createdAnalytes = [];
-      
-      for (const analyteData of analytesToCreate) {
-        // Check if analyte already exists
-        const { data: existingAnalyte } = await supabase
-          .from('analytes')
-          .select('id, name')
-          .eq('name', analyteData.name)
-          .maybeSingle();
+      const { data: newAnalytes, error: analytesError } = await supabase
+        .from('analytes')
+        .insert(analytesToCreate)
+        .select();
 
-        if (existingAnalyte) {
-          console.log(`Analyte "${analyteData.name}" already exists, using existing one`);
-          createdAnalytes.push(existingAnalyte);
-        } else {
-          // Create new analyte
-          const { data: newAnalyte, error: analyteError } = await supabase
-            .from('analytes')
-            .insert(analyteData)
-            .select()
-            .single();
-
-          if (analyteError) {
-            console.error(`Error creating analyte ${analyteData.name}:`, analyteError);
-            // Continue with other analytes even if one fails
-            continue;
-          }
-          
-          if (newAnalyte) {
-            createdAnalytes.push(newAnalyte);
-          }
-        }
+      if (analytesError) {
+        console.error('Error creating analytes:', analytesError);
+        throw analytesError;
       }
 
-      console.log('Analytes processed:', createdAnalytes);
+      console.log('Analytes created:', newAnalytes);
 
-      // Create relationships between test group and analytes
-      const relationships = createdAnalytes.map((analyte) => ({
+      // Finally, create the relationships between test group and analytes
+      const relationships = newAnalytes.map((analyte: any) => ({
         test_group_id: newTestGroup.id,
         analyte_id: analyte.id
       }));
 
       console.log('Creating relationships:', relationships);
 
-      // Insert relationships, ignoring duplicates
-      for (const relationship of relationships) {
-        const { error: relationshipError } = await supabase
-          .from('test_group_analytes')
-          .insert(relationship);
+      const { error: relationshipsError } = await supabase
+        .from('test_group_analytes')
+        .insert(relationships);
 
-        if (relationshipError && relationshipError.code !== '23505') {
-          console.error('Error creating relationship:', relationshipError);
-        }
+      if (relationshipsError) {
+        console.error('Error creating relationships:', relationshipsError);
+        throw relationshipsError;
       }
 
       console.log('✅ Test group, analytes, and relationships created successfully!');
-      alert(`✅ Successfully created "${config.test_group.name}" with ${createdAnalytes.length} analytes!`);
+      
+      // Show success message
+      alert(`✅ Successfully created "${config.testGroup.name}" with ${config.analytes.length} analytes!`);
 
     } catch (error) {
       console.error('Failed to create test configuration:', error);
       alert(`❌ Failed to create test configuration: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
-  };
-
-  // Helper function to extract hours from turnaround_time string
-  const extractHours = (timeString: string): number => {
-    const match = timeString.match(/(\d+)/);
-    return match ? parseInt(match[1]) : 4;
   };
 
   const tools = [

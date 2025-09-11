@@ -12,7 +12,9 @@ import {
   startOfMonth,
   endOfMonth,
 } from 'date-fns';
-import { generateAndSavePDFReport, viewPDFReport, downloadPDFReport } from '../utils/pdfService';
+import { generateAndSavePDFReport, viewPDFReport } from '../utils/pdfService';
+import PDFProgressModal from '../components/PDFProgressModal';
+import { usePDFGeneration } from '../hooks/usePDFGeneration';
 
 type DateFilter = 'today' | 'yesterday' | 'week' | 'month' | 'all';
 
@@ -65,8 +67,8 @@ interface OrderGroup {
 
 type ReportRow = {
   order_id: string;
-  report_status: string;
-  generated_at: string;
+  status: string;
+  generated_date: string;
 };
 
 type PreparedReport = {
@@ -108,6 +110,9 @@ const Reports: React.FC = () => {
 
   // Selection now at order level
   const [selectedOrders, setSelectedOrders] = useState<Set<string>>(new Set());
+
+  // Add PDF generation hook
+  const { isGenerating, stage, progress, generatePDF, resetState } = usePDFGeneration();
 
   // Load approved results
   const loadApprovedResults = useCallback(async () => {
@@ -159,7 +164,7 @@ const Reports: React.FC = () => {
         if (orderIds.length > 0) {
           const { data: reportsData } = await supabase
             .from('reports')
-            .select('order_id, report_status, generated_at')
+            .select('order_id, status, generated_date')
             .in('order_id', orderIds);
           existingReports = (reportsData as ReportRow[]) || [];
         }
@@ -170,8 +175,8 @@ const Reports: React.FC = () => {
         const enhancedData: ApprovedResult[] = (data as ApprovedResult[]).map((result) => ({
           ...result,
           has_report: reportMap.has(result.order_id),
-          report_status: reportMap.get(result.order_id)?.report_status,
-          report_generated_at: reportMap.get(result.order_id)?.generated_at,
+          report_status: reportMap.get(result.order_id)?.status,
+          report_generated_at: reportMap.get(result.order_id)?.generated_date,
         }));
 
         // Filter by search
@@ -266,16 +271,14 @@ const Reports: React.FC = () => {
             {
               order_id: orderId,
               patient_id: group.patient_id,
-              report_type: 'final',
-              report_status: 'generated',
-              generated_by: userId,
-              generated_at: new Date().toISOString(),
-              report_data: {
+              status: 'Generated',
+              generated_date: new Date().toISOString(),
+              notes: JSON.stringify({
                 test_names: group.test_names,
                 sample_ids: group.sample_ids,
                 verified_at: group.verified_at,
                 verified_by: group.verified_by,
-              },
+              }),
             },
             {
               onConflict: 'order_id',
@@ -382,13 +385,8 @@ const Reports: React.FC = () => {
       const reportData = await prepareReportData(group);
       console.log('Report data prepared for download:', reportData);
       
-      // Download PDF (will generate if doesn't exist)
-      const success = await downloadPDFReport(orderId, reportData);
-      console.log('Download result:', success);
-      
-      if (!success) {
-        alert('Failed to generate or download PDF report');
-      }
+      // Use the progress-enabled PDF generation
+      await generatePDF(orderId, reportData);
     } catch (error) {
       console.error('Download failed:', error);
       alert('Download failed: ' + (error instanceof Error ? error.message : 'Unknown error'));
@@ -643,11 +641,23 @@ const Reports: React.FC = () => {
                             <span>View</span>
                           </button>
                           <button
-                            className="text-green-600 hover:text-green-700 text-sm flex items-center space-x-1"
+                            className={`text-green-600 hover:text-green-700 text-sm flex items-center space-x-1 ${
+                              isGenerating ? 'opacity-50 cursor-not-allowed' : ''
+                            }`}
                             onClick={() => handleDownload(group.order_id)}
+                            disabled={isGenerating}
                           >
-                            <Download className="w-4 h-4" />
-                            <span>Download</span>
+                            {isGenerating ? (
+                              <>
+                                <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-green-600"></div>
+                                <span>Generating...</span>
+                              </>
+                            ) : (
+                              <>
+                                <Download className="w-4 h-4" />
+                                <span>Download</span>
+                              </>
+                            )}
                           </button>
                           {(group.results[0] as ApprovedResult)?.has_report && (
                             <span className="text-xs bg-green-100 text-green-800 px-2 py-1 rounded">
@@ -664,6 +674,14 @@ const Reports: React.FC = () => {
           </div>
         </div>
       </div>
+
+      {/* PDF Progress Modal */}
+      <PDFProgressModal
+        isVisible={isGenerating}
+        stage={stage}
+        progress={progress}
+        onClose={resetState}
+      />
     </div>
   );
 };

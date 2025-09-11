@@ -65,7 +65,8 @@ serve(async (req) => {
       p_lab_id: userData?.lab_id || null
     })
 
-    const systemPrompt = promptData?.[0]?.prompt || getDefaultTestConfigurationPrompt()
+    // Always use the updated default prompt for now to ensure consistency
+    const systemPrompt = getDefaultTestConfigurationPrompt()
 
     // Build the complete prompt
     const fullPrompt = `${systemPrompt}
@@ -170,41 +171,60 @@ Return ONLY valid JSON with no additional text.`
 })
 
 function getDefaultTestConfigurationPrompt(): string {
-  return `You are a medical laboratory AI assistant. Given a test name, suggest a complete test group configuration with analytes.
+  return `You are a medical laboratory AI assistant. Given a test name, suggest a complete test group configuration with analytes that matches the database schema.
 
 REQUIREMENTS:
-1. Return valid JSON matching this interface:
+1. Return valid JSON matching this exact interface:
 {
-  "testGroup": {
+  "test_group": {
     "name": "string",
-    "clinical_purpose": "string", 
+    "code": "string (unique 3-8 char code)",
     "category": "string",
-    "tat_hours": number,
-    "price": number,
-    "instructions": "string"
+    "clinical_purpose": "string",
+    "price": "string (decimal format like '45.00')",
+    "turnaround_time": "string (e.g., '24 hours', '2-3 days')",
+    "sample_type": "string",
+    "requires_fasting": boolean,
+    "is_active": true,
+    "default_ai_processing_type": "gemini",
+    "group_level_prompt": null,
+    "to_be_copied": false
   },
   "analytes": [{
     "name": "string",
     "unit": "string",
-    "method": "string",
-    "reference_min": number,
-    "reference_max": number,
-    "critical_min": number,
-    "critical_max": number,
-    "description": "string"
+    "reference_range": "string (e.g., '3.5-5.0')",
+    "low_critical": "string or null",
+    "high_critical": "string or null", 
+    "interpretation_low": "string",
+    "interpretation_normal": "string",
+    "interpretation_high": "string",
+    "category": "string",
+    "is_active": true,
+    "ai_processing_type": "gemini",
+    "ai_prompt_override": null,
+    "group_ai_mode": "individual",
+    "is_global": false,
+    "to_be_copied": false
+  }],
+  "test_group_analytes": [{
+    "test_group_code": "string (matches test_group.code)",
+    "analyte_name": "string (matches analyte.name)"
   }],
   "confidence": number,
   "reasoning": "string"
 }
 
 2. Use medically accurate reference ranges and units
-3. Provide realistic TAT (turnaround time) in hours (2-72)
-4. Suggest appropriate pricing in USD ($15-$500)
-5. Include relevant analytes for the test type
-6. Always include confidence score (0-1) and reasoning
+3. Provide realistic prices in decimal format ($15.00-$500.00)
+4. Include relevant analytes for the test type
+5. Always include confidence score (0-1) and reasoning
+6. Generate unique, meaningful codes for test groups (3-8 characters)
+7. Create test_group_analytes mapping for each analyte
 
 CONTEXT:
 - This is for a clinical laboratory information system
 - Test names may be abbreviated or colloquial
-- Base suggestions on standard medical laboratory practices`
+- Base suggestions on standard medical laboratory practices
+- Ensure all analytes have proper clinical interpretations`
 }

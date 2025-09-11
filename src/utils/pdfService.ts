@@ -107,6 +107,16 @@ export const getLabTemplate = (id: string): LabTemplate => {
   return templates.find(t => t.id === id) || defaultLabTemplate;
 };
 
+// Authentication helper - ensures user is authenticated before operations
+const ensureAuthenticated = async (): Promise<string | null> => {
+  const { data: { session }, error } = await supabase.auth.getSession();
+  if (error || !session) {
+    console.error('User not authenticated:', error);
+    return null;
+  }
+  return session.user.id;
+};
+
 // Enhanced HTML template generator
 const generateUniversalHTMLTemplate = (data: ReportData): string => {
   const { patient, report, testResults, interpretation } = data;
@@ -503,13 +513,30 @@ export const generatePDFWithBrowser = (reportData: ReportData): string => {
   return url;
 };
 
-// Save PDF to Supabase storage
+// Enhanced Save PDF to Supabase storage - For public bucket
 export const savePDFToStorage = async (pdfBlob: Blob, orderId: string): Promise<string> => {
   console.log('Saving PDF to Supabase storage...');
-  
+
   try {
-    const fileName = `reports/${orderId}_${Date.now()}.pdf`;
+    // Create a unique filename
+    const fileName = `${orderId}_${Date.now()}.pdf`;
     
+    console.log('Uploading file:', fileName, 'Size:', pdfBlob.size, 'Type:', pdfBlob.type);
+
+    // Ensure we have a proper PDF blob
+    if (!pdfBlob || pdfBlob.size === 0) {
+      throw new Error('Invalid PDF blob provided');
+    }
+
+    // Ensure blob has correct type
+    if (pdfBlob.type !== 'application/pdf') {
+      console.log('Converting blob to proper PDF type');
+      pdfBlob = new Blob([pdfBlob], { type: 'application/pdf' });
+    }
+
+    // Upload the blob directly to Supabase storage
+    // This will send raw binary data with proper content-type header
+    console.log('Starting upload to Supabase...');
     const { data, error } = await supabase.storage
       .from('reports')
       .upload(fileName, pdfBlob, {
@@ -519,14 +546,33 @@ export const savePDFToStorage = async (pdfBlob: Blob, orderId: string): Promise<
       });
 
     if (error) {
-      throw error;
+      console.error('Storage upload error details:', error);
+      console.error('Error message:', error.message);
+      throw new Error(`Storage upload failed: ${error.message}`);
     }
 
+    console.log('Upload successful, data:', data);
+
+    // Verify the file was uploaded
+    if (!data || !data.path) {
+      throw new Error('Upload succeeded but no file path returned');
+    }
+
+    // Get the public URL for the uploaded file
     const { data: { publicUrl } } = supabase.storage
       .from('reports')
       .getPublicUrl(fileName);
 
-    console.log('PDF saved to storage:', publicUrl);
+    console.log('PDF saved to storage successfully:', publicUrl);
+    
+    // Test if the URL is accessible
+    try {
+      const testResponse = await fetch(publicUrl, { method: 'HEAD' });
+      console.log('URL test response status:', testResponse.status);
+    } catch (testError) {
+      console.warn('URL test failed:', testError);
+    }
+
     return publicUrl;
   } catch (error) {
     console.error('Failed to save PDF to storage:', error);
@@ -549,6 +595,7 @@ export const updateReportWithPDFInfo = async (orderId: string, pdfUrl: string): 
       .eq('order_id', orderId);
 
     if (error) {
+      console.error('Database update error:', error);
       throw error;
     }
 
@@ -559,25 +606,98 @@ export const updateReportWithPDFInfo = async (orderId: string, pdfUrl: string): 
   }
 };
 
-// Main PDF generation function with comprehensive error handling
-export async function generateAndSavePDFReport(orderId: string, reportData: ReportData): Promise<string | null> {
-  console.log('generateAndSavePDFReport called for:', orderId);
+// Main PDF generation function with comprehensive error handling and progress tracking
+export async function generateAndSavePDFReportWithProgress(
+  orderId: string, 
+  reportData: ReportData,
+  onProgress?: (stage: string, progress?: number) => void
+): Promise<string | null> {
+  console.log('generateAndSavePDFReportWithProgress called for order:', orderId);
+  
+  onProgress?.('Checking authentication...', 5);
+  
+  // Check authentication for database operations only
+  const userId = await ensureAuthenticated();
+  if (!userId) {
+    console.error('User must be authenticated to generate reports');
+    onProgress?.('Authentication failed', 0);
+    alert('Please login to generate reports');
+    return null;
+  }
   
   try {
-    // Check if PDF already exists
-    const { data: existingReport } = await supabase
+    onProgress?.('Checking existing reports...', 10);
+    
+    // First, ensure a report record exists
+    let { data: existingReport } = await supabase
       .from('reports')
-      .select('pdf_url, pdf_generated_at')
+      .select('id, pdf_url, pdf_generated_at, status')
       .eq('order_id', orderId)
-      .single();
+      .maybeSingle(); // Use maybeSingle to avoid errors when no record exists
 
+    // If no report exists, create one
+    if (!existingReport) {
+      console.log('No report record exists, creating one...');
+      onProgress?.('Creating report record...', 15);
+      
+      // Get order details to populate report
+      const { data: orderData, error: orderError } = await supabase
+        .from('orders')
+        .select('patient_id, doctor')
+        .eq('id', orderId)
+        .single();
+      
+      if (orderError || !orderData) {
+        console.error('Failed to fetch order data:', orderError);
+        onProgress?.('Order not found', 0);
+        alert('Order not found. Please check the order ID.');
+        return null;
+      }
+      
+      // Create report record
+      const { data: newReport, error: insertError } = await supabase
+        .from('reports')
+        .insert({
+          order_id: orderId,
+          patient_id: orderData.patient_id,
+          doctor: orderData.doctor || 'Unknown',
+          status: 'pending',
+          generated_date: new Date().toISOString(),
+          report_type: 'Laboratory Report',
+          report_status: 'generating'
+        })
+        .select()
+        .single();
+
+      if (insertError) {
+        console.error('Failed to create report record:', insertError);
+        if (insertError.code === '23505') {
+          const { data: retryReport } = await supabase
+            .from('reports')
+            .select('id, pdf_url, pdf_generated_at, status')
+            .eq('order_id', orderId)
+            .single();
+          existingReport = retryReport;
+        } else {
+          onProgress?.('Failed to create report record', 0);
+          alert('Failed to create report record. Please try again.');
+          return null;
+        }
+      } else {
+        existingReport = newReport;
+      }
+    }
+
+    // Check if PDF already exists and is valid
     if (existingReport?.pdf_url) {
       console.log('PDF already exists:', existingReport.pdf_url);
+      onProgress?.('Validating existing PDF...', 20);
       
-      // Verify URL is still valid
       try {
         const response = await fetch(existingReport.pdf_url, { method: 'HEAD' });
         if (response.ok) {
+          console.log('Existing PDF is valid');
+          onProgress?.('Using existing PDF', 100);
           return existingReport.pdf_url;
         }
       } catch (error) {
@@ -585,90 +705,443 @@ export async function generateAndSavePDFReport(orderId: string, reportData: Repo
       }
     }
 
+    console.log('Generating new PDF...');
+    onProgress?.('Generating PDF with PDF.co...', 25);
+    
     let pdfUrl: string | null = null;
     let pdfBlob: Blob | null = null;
 
-    // Try PDF.co API first
+    // Try PDF.co API - this is the only method we should use
     try {
       pdfUrl = await generatePDFWithAPI(reportData);
+      console.log('✅ PDF.co URL received:', pdfUrl);
+      onProgress?.('PDF generated, downloading...', 40);
       
-      if (pdfUrl && pdfUrl.includes('pdf.co')) {
-        // Download PDF from PDF.co and convert to blob
-        const response = await fetch(pdfUrl);
-        if (response.ok) {
-          pdfBlob = await response.blob();
+      if (pdfUrl && (pdfUrl.includes('pdf.co') || pdfUrl.includes('s3.us-west-2.amazonaws.com'))) {
+        console.log('📥 Downloading PDF from PDF.co/AWS...');
+        
+        // Use the robust download function for large files with progress
+        try {
+          pdfBlob = await downloadLargePDFWithProgress(pdfUrl, onProgress);
+          console.log('✅ PDF successfully downloaded:', pdfBlob.size, 'bytes');
+          onProgress?.('PDF downloaded successfully', 80);
+        } catch (downloadError) {
+          console.warn('⚠️ Robust download failed, trying standard method:', downloadError);
+          onProgress?.('Retrying download...', 50);
+          
+          // Fallback to standard download method
+          const response = await fetch(pdfUrl, {
+            method: 'GET',
+            headers: {
+              'Accept': 'application/pdf, */*',
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+              'Cache-Control': 'no-cache'
+            }
+          });
+          
+          if (response.ok) {
+            console.log('📊 Standard download response:', {
+              status: response.status,
+              contentType: response.headers.get('content-type'),
+              contentLength: response.headers.get('content-length')
+            });
+            
+            const arrayBuffer = await response.arrayBuffer();
+            pdfBlob = new Blob([arrayBuffer], { type: 'application/pdf' });
+            console.log('✅ Standard download completed, size:', pdfBlob.size);
+            onProgress?.('PDF downloaded successfully', 80);
+          } else {
+            throw new Error(`Standard download failed: ${response.status} ${response.statusText}`);
+          }
         }
+      } else {
+        throw new Error(`Invalid PDF URL received: ${pdfUrl}`);
       }
     } catch (error) {
-      console.warn('PDF.co generation failed, trying browser fallback:', error);
-    }
-
-    // Fallback to browser generation if API failed
-    if (!pdfUrl || !pdfBlob) {
-      pdfUrl = generatePDFWithBrowser(reportData);
-      if (pdfUrl.startsWith('blob:')) {
-        const response = await fetch(pdfUrl);
-        pdfBlob = await response.blob();
-      }
+      console.error('❌ PDF.co generation failed completely:', error);
+      onProgress?.('PDF generation failed', 0);
+      throw new Error(`PDF generation failed: ${error instanceof Error ? error.message : String(error)}`);
     }
 
     if (!pdfBlob) {
-      console.error('Failed to generate PDF blob');
+      console.error('❌ Failed to generate PDF blob');
+      onProgress?.('Failed to generate PDF', 0);
+      alert('Failed to generate PDF. Please try again.');
       return null;
     }
 
-    // Save to Supabase storage
+    // Save to Supabase storage (public bucket)
+    console.log('Saving PDF to storage...');
+    onProgress?.('Uploading to storage...', 85);
     const storageUrl = await savePDFToStorage(pdfBlob, orderId);
     
     // Update database
+    console.log('Updating database with PDF URL...');
+    onProgress?.('Updating database...', 90);
     await updateReportWithPDFInfo(orderId, storageUrl);
 
+    console.log('PDF generation completed successfully');
+    onProgress?.('PDF ready for download!', 100);
     return storageUrl;
   } catch (error) {
     console.error('PDF generation and save failed:', error);
+    onProgress?.('PDF generation failed', 0);
+    alert('An error occurred while generating the PDF. Please try again.');
+    return null;
+  }
+}
+
+// Enhanced download function with progress callbacks
+export const downloadLargePDFWithProgress = async (
+  url: string, 
+  onProgress?: (stage: string, progress?: number) => void,
+  maxRetries: number = 3
+): Promise<Blob> => {
+  console.log('🔄 Downloading large PDF from:', url);
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`📥 Attempt ${attempt}/${maxRetries}...`);
+      onProgress?.(`Downloading... (Attempt ${attempt}/${maxRetries})`, 40 + (attempt - 1) * 10);
+      
+      // Create abort controller for timeout
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+      
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'Accept': 'application/pdf, */*',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Cache-Control': 'no-cache',
+          'Pragma': 'no-cache',
+          'Range': 'bytes=0-' // Request all bytes
+        },
+        signal: controller.signal
+      });
+      
+      clearTimeout(timeoutId);
+      
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+      
+      const contentLength = response.headers.get('content-length');
+      const expectedLength = contentLength ? parseInt(contentLength) : 0;
+      
+      // Read the response as a stream for large files
+      const reader = response.body?.getReader();
+      if (!reader) {
+        throw new Error('Response body is not readable');
+      }
+      
+      const chunks: Uint8Array[] = [];
+      let receivedLength = 0;
+      
+      while (true) {
+        const { done, value } = await reader.read();
+        
+        if (done) break;
+        
+        chunks.push(value);
+        receivedLength += value.length;
+        
+        if (expectedLength > 0) {
+          const downloadProgress = (receivedLength / expectedLength * 100);
+          const overallProgress = 40 + (downloadProgress * 0.4); // 40-80% range
+          onProgress?.(`Downloading: ${downloadProgress.toFixed(1)}%`, overallProgress);
+        }
+      }
+      
+      console.log(`✅ Download completed: ${receivedLength} bytes received`);
+      
+      // Verify we got the expected amount
+      if (expectedLength > 0 && receivedLength !== expectedLength) {
+        console.warn(`⚠️ Size mismatch: expected ${expectedLength}, got ${receivedLength}`);
+        if (receivedLength < expectedLength * 0.9) {
+          throw new Error(`Incomplete download: ${receivedLength}/${expectedLength} bytes`);
+        }
+      }
+      
+      // Combine all chunks into a single array buffer
+      const arrayBuffer = new ArrayBuffer(receivedLength);
+      const uint8Array = new Uint8Array(arrayBuffer);
+      let position = 0;
+      
+      for (const chunk of chunks) {
+        uint8Array.set(chunk, position);
+        position += chunk.length;
+      }
+      
+      // Validate PDF format
+      const firstBytes = new Uint8Array(arrayBuffer.slice(0, 8));
+      const header = String.fromCharCode(...firstBytes);
+      
+      if (!header.startsWith('%PDF')) {
+        throw new Error(`Invalid PDF header: ${header}`);
+      }
+      
+      // Create and return the blob
+      const blob = new Blob([arrayBuffer], { type: 'application/pdf' });
+      console.log(`✅ PDF blob created successfully: ${blob.size} bytes`);
+      
+      return blob;
+      
+    } catch (error) {
+      console.error(`❌ Attempt ${attempt} failed:`, error);
+      
+      if (attempt === maxRetries) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        throw new Error(`Failed to download PDF after ${maxRetries} attempts: ${errorMessage}`);
+      }
+      
+      // Wait before retry (exponential backoff)
+      const delay = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s...
+      onProgress?.(`Retrying in ${delay/1000}s...`, 40 + (attempt - 1) * 10);
+      console.log(`⏳ Waiting ${delay}ms before retry...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  
+  throw new Error('This should never be reached');
+};
+
+// Main PDF generation function with comprehensive error handling and authentication
+export async function generateAndSavePDFReport(orderId: string, reportData: ReportData): Promise<string | null> {
+  console.log('generateAndSavePDFReport called for order:', orderId);
+  
+  // Check authentication for database operations only
+  const userId = await ensureAuthenticated();
+  if (!userId) {
+    console.error('User must be authenticated to generate reports');
+    alert('Please login to generate reports');
+    return null;
+  }
+  
+  try {
+    // First, ensure a report record exists
+    let { data: existingReport } = await supabase
+      .from('reports')
+      .select('id, pdf_url, pdf_generated_at, status')
+      .eq('order_id', orderId)
+      .maybeSingle(); // Use maybeSingle to avoid errors when no record exists
+
+    // If no report exists, create one
+    if (!existingReport) {
+      console.log('No report record exists, creating one...');
+      
+      // Get order details to populate report
+      // Remove test_names from the query as it doesn't exist in orders table
+      const { data: orderData, error: orderError } = await supabase
+        .from('orders')
+        .select('patient_id, doctor')  // Removed test_names
+        .eq('id', orderId)
+        .single();
+      
+      if (orderError || !orderData) {
+        console.error('Failed to fetch order data:', orderError);
+        alert('Order not found. Please check the order ID.');
+        return null;
+      }
+      
+      // Create report record
+      const { data: newReport, error: insertError } = await supabase
+        .from('reports')
+        .insert({
+          order_id: orderId,
+          patient_id: orderData.patient_id,
+          doctor: orderData.doctor || 'Unknown',
+          status: 'pending',
+          generated_date: new Date().toISOString(),
+          report_type: 'Laboratory Report',
+          report_status: 'generating'
+        })
+        .select()
+        .single();
+
+      if (insertError) {
+        console.error('Failed to create report record:', insertError);
+        // Check if it's a unique constraint violation
+        if (insertError.code === '23505') {
+          // Report already exists, try to fetch it again
+          const { data: retryReport } = await supabase
+            .from('reports')
+            .select('id, pdf_url, pdf_generated_at, status')
+            .eq('order_id', orderId)
+            .single();
+          existingReport = retryReport;
+        } else {
+          alert('Failed to create report record. Please try again.');
+          return null;
+        }
+      } else {
+        existingReport = newReport;
+      }
+    }
+
+    // Check if PDF already exists and is valid
+    if (existingReport?.pdf_url) {
+      console.log('PDF already exists:', existingReport.pdf_url);
+      
+      // Verify URL is still valid
+      try {
+        const response = await fetch(existingReport.pdf_url, { method: 'HEAD' });
+        if (response.ok) {
+          console.log('Existing PDF is valid');
+          return existingReport.pdf_url;
+        }
+      } catch (error) {
+        console.warn('Existing PDF URL is invalid, regenerating...');
+      }
+    }
+
+    console.log('Generating new PDF...');
+    let pdfUrl: string | null = null;
+    let pdfBlob: Blob | null = null;
+
+    // Try PDF.co API - this is the only method we should use
+    try {
+      pdfUrl = await generatePDFWithAPI(reportData);
+      console.log('✅ PDF.co URL received:', pdfUrl);
+      
+      if (pdfUrl && (pdfUrl.includes('pdf.co') || pdfUrl.includes('s3.us-west-2.amazonaws.com'))) {
+        console.log('📥 Downloading PDF from PDF.co/AWS...');
+        
+        // Use the robust download function for large files
+        try {
+          pdfBlob = await downloadLargePDF(pdfUrl);
+          console.log('✅ PDF successfully downloaded:', pdfBlob.size, 'bytes');
+        } catch (downloadError) {
+          console.warn('⚠️ Robust download failed, trying standard method:', downloadError);
+          
+          // Fallback to standard download method
+          const response = await fetch(pdfUrl, {
+            method: 'GET',
+            headers: {
+              'Accept': 'application/pdf, */*',
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+              'Cache-Control': 'no-cache'
+            }
+          });
+          
+          if (response.ok) {
+            console.log('📊 Standard download response:', {
+              status: response.status,
+              contentType: response.headers.get('content-type'),
+              contentLength: response.headers.get('content-length')
+            });
+            
+            const arrayBuffer = await response.arrayBuffer();
+            pdfBlob = new Blob([arrayBuffer], { type: 'application/pdf' });
+            console.log('✅ Standard download completed, size:', pdfBlob.size);
+          } else {
+            throw new Error(`Standard download failed: ${response.status} ${response.statusText}`);
+          }
+        }
+      } else {
+        throw new Error(`Invalid PDF URL received: ${pdfUrl}`);
+      }
+    } catch (error) {
+      console.error('❌ PDF.co generation failed completely:', error);
+      throw new Error(`PDF generation failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    if (!pdfBlob) {
+      console.error('❌ Failed to generate PDF blob');
+      alert('Failed to generate PDF. Please try again.');
+      return null;
+    }
+
+    // Save to Supabase storage (public bucket)
+    console.log('Saving PDF to storage...');
+    const storageUrl = await savePDFToStorage(pdfBlob, orderId);
+    
+    // Update database
+    console.log('Updating database with PDF URL...');
+    await updateReportWithPDFInfo(orderId, storageUrl);
+
+    console.log('PDF generation completed successfully');
+    return storageUrl;
+  } catch (error) {
+    console.error('PDF generation and save failed:', error);
+    alert('An error occurred while generating the PDF. Please try again.');
     return null;
   }
 }
 
 // View PDF report (opens in new tab)
 export async function viewPDFReport(orderId: string, reportData: ReportData): Promise<string | null> {
-  console.log('viewPDFReport called for:', orderId);
-  
-  try {
-    const pdfUrl = await generateAndSavePDFReport(orderId, reportData);
-    return pdfUrl;
-  } catch (error) {
-    console.error('View PDF error:', error);
-    return null;
-  }
-}
-
-// Download PDF report
-export async function downloadPDFReport(orderId: string, reportData: ReportData): Promise<boolean> {
-  console.log('downloadPDFReport called for:', orderId);
+  console.log('viewPDFReport called for order:', orderId);
   
   try {
     const pdfUrl = await generateAndSavePDFReport(orderId, reportData);
     if (!pdfUrl) {
+      console.error('No PDF URL returned');
+      return null;
+    }
+    
+    console.log('PDF URL ready for viewing:', pdfUrl);
+    return pdfUrl;
+  } catch (error) {
+    console.error('View PDF error:', error);
+    alert('Failed to view PDF report');
+    return null;
+  }
+}
+
+// Enhanced Download PDF report with progress callback
+export async function downloadPDFReport(
+  orderId: string, 
+  reportData: ReportData, 
+  onProgress?: (stage: string, progress?: number) => void
+): Promise<boolean> {
+  console.log('downloadPDFReport called for order:', orderId);
+  
+  try {
+    onProgress?.('Initializing PDF generation...', 0);
+    
+    const pdfUrl = await generateAndSavePDFReportWithProgress(orderId, reportData, onProgress);
+    if (!pdfUrl) {
       console.error('No PDF URL generated');
+      onProgress?.('Failed to generate PDF', 0);
       return false;
     }
 
-    // Create download link
+    onProgress?.('Starting download...', 95);
+    console.log('Initiating download from URL:', pdfUrl);
+    
+    // Handle blob URLs differently
+    if (pdfUrl.startsWith('blob:')) {
+      // For blob URLs, open in new window
+      window.open(pdfUrl, '_blank');
+      onProgress?.('Download completed!', 100);
+      return true;
+    }
+    
+    // For regular URLs, create download link
     const link = document.createElement('a');
     link.href = pdfUrl;
     link.download = `Report_${reportData.patient.name.replace(/\s+/g, '_')}_${orderId}.pdf`;
     link.target = '_blank';
     
-    // Trigger download
+    // Some browsers require the link to be in the DOM
     document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
     
+    // Trigger download
+    link.click();
+    
+    // Clean up
+    setTimeout(() => {
+      document.body.removeChild(link);
+    }, 100);
+    
+    onProgress?.('Download completed!', 100);
     console.log('Download initiated successfully');
     return true;
   } catch (error) {
     console.error('Download failed:', error);
+    onProgress?.('Download failed', 0);
+    alert('Failed to download PDF report');
     return false;
   }
 }
@@ -693,9 +1166,13 @@ export const generateSampleReportData = (template: LabTemplate = defaultLabTempl
       { parameter: 'SGOT (AST)', result: '72', unit: 'U/L', referenceRange: '15–37', flag: 'H' },
       { parameter: 'SGPT (ALT)', result: '105', unit: 'U/L', referenceRange: '16–63', flag: 'H' },
       { parameter: 'Total Bilirubin', result: '1.9', unit: 'mg/dL', referenceRange: '0.2–1', flag: 'H' },
+      { parameter: 'Direct Bilirubin', result: '1.1', unit: 'mg/dL', referenceRange: '0.0–0.3', flag: 'H' },
       { parameter: 'Albumin', result: '2.8', unit: 'g/dL', referenceRange: '3.4–5', flag: 'L' },
+      { parameter: 'Total Protein', result: '6.2', unit: 'g/dL', referenceRange: '6.0–8.3', flag: '' },
+      { parameter: 'ALP', result: '120', unit: 'U/L', referenceRange: '40–150', flag: '' },
+      { parameter: 'GGT', result: '85', unit: 'U/L', referenceRange: '10–50', flag: 'H' },
     ],
-    interpretation: 'Liver enzymes are elevated, and total bilirubin is above the normal limit. Suggestive of hepatic stress. Clinical correlation advised.',
+    interpretation: 'Liver enzymes (AST, ALT, GGT) are significantly elevated. Bilirubin levels are increased with predominant direct fraction. Low albumin suggests impaired synthetic function. These findings are suggestive of hepatocellular injury with cholestatic pattern. Clinical correlation and further evaluation recommended.',
     template,
   };
 };
@@ -703,9 +1180,11 @@ export const generateSampleReportData = (template: LabTemplate = defaultLabTempl
 // Utility function to download PDF from URL
 export const downloadPDFFromURL = async (url: string, filename: string): Promise<void> => {
   try {
+    console.log('Downloading PDF from URL:', url);
+    
     const response = await fetch(url);
     if (!response.ok) {
-      throw new Error('Failed to download PDF');
+      throw new Error(`Failed to download PDF: ${response.statusText}`);
     }
     
     const blob = await response.blob();
@@ -718,9 +1197,388 @@ export const downloadPDFFromURL = async (url: string, filename: string): Promise
     link.click();
     document.body.removeChild(link);
     
-    window.URL.revokeObjectURL(downloadUrl);
+    // Clean up the blob URL
+    setTimeout(() => {
+      window.URL.revokeObjectURL(downloadUrl);
+    }, 100);
+    
+    console.log('PDF download completed');
   } catch (error) {
     console.error('Error downloading PDF:', error);
     throw error;
   }
+};
+
+// Function to test PDF generation without saving to database
+export const testPDFGeneration = async (): Promise<void> => {
+  console.log('Testing PDF generation...');
+  
+  try {
+    const sampleData = generateSampleReportData();
+    const pdfUrl = await generatePDFWithAPI(sampleData);
+    
+    if (pdfUrl) {
+      console.log('Test PDF generated successfully:', pdfUrl);
+      window.open(pdfUrl, '_blank');
+    } else {
+      console.error('Test PDF generation failed');
+    }
+  } catch (error) {
+    console.error('Test PDF generation error:', error);
+  }
+};
+
+// Debug function to test storage upload directly
+export const testStorageUpload = async (): Promise<void> => {
+  console.log('Testing storage upload...');
+  
+  try {
+    // Create a test PDF blob
+    const testContent = new Blob(['%PDF-1.4\n1 0 obj\n<<\n/Type /Catalog\n/Pages 2 0 R\n>>\nendobj\n2 0 obj\n<<\n/Type /Pages\n/Kids [3 0 R]\n/Count 1\n>>\nendobj\n3 0 obj\n<<\n/Type /Page\n/Parent 2 0 R\n/MediaBox [0 0 612 792]\n>>\nendobj\nxref\n0 4\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \ntrailer\n<<\n/Size 4\n/Root 1 0 R\n>>\nstartxref\n174\n%%EOF'], { type: 'application/pdf' });
+    
+    console.log('Test blob created:', testContent.size, 'bytes');
+    
+    // Check auth status
+    const { data: { session }, error: authError } = await supabase.auth.getSession();
+    console.log('Auth check - session exists:', !!session);
+    console.log('Auth error:', authError);
+    if (session) {
+      console.log('User ID:', session.user.id);
+      console.log('Access token length:', session.access_token.length);
+    }
+    
+    // Test upload
+    const fileName = `test_${Date.now()}.pdf`;
+    console.log('Attempting upload of:', fileName);
+    
+    const { data, error } = await supabase.storage
+      .from('reports')
+      .upload(fileName, testContent, {
+        contentType: 'application/pdf',
+        upsert: true
+      });
+    
+    if (error) {
+      console.error('Upload failed:', error);
+      console.error('Error details:', JSON.stringify(error, null, 2));
+    } else {
+      console.log('Upload successful:', data);
+      
+      // Get public URL
+      const { data: { publicUrl } } = supabase.storage
+        .from('reports')
+        .getPublicUrl(fileName);
+      
+      console.log('Public URL:', publicUrl);
+      
+      // Test URL accessibility
+      try {
+        const testResponse = await fetch(publicUrl, { method: 'HEAD' });
+        console.log('URL accessible:', testResponse.ok, testResponse.status);
+      } catch (urlError) {
+        console.error('URL test failed:', urlError);
+      }
+    }
+  } catch (error) {
+    console.error('Test storage upload error:', error);
+  }
+};
+
+// Robust PDF download function for large files
+export const downloadLargePDF = async (url: string, maxRetries: number = 3): Promise<Blob> => {
+  console.log('🔄 Downloading large PDF from:', url);
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`📥 Attempt ${attempt}/${maxRetries}...`);
+      
+      // Create abort controller for timeout
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+      
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'Accept': 'application/pdf, */*',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Cache-Control': 'no-cache',
+          'Pragma': 'no-cache',
+          'Range': 'bytes=0-' // Request all bytes
+        },
+        signal: controller.signal
+      });
+      
+      clearTimeout(timeoutId);
+      
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+      
+      const contentLength = response.headers.get('content-length');
+      const contentType = response.headers.get('content-type');
+      
+      console.log('📊 Response headers:', {
+        status: response.status,
+        contentType,
+        contentLength: contentLength ? `${parseInt(contentLength)} bytes` : 'unknown',
+        acceptRanges: response.headers.get('accept-ranges'),
+        cacheControl: response.headers.get('cache-control')
+      });
+      
+      // Read the response as a stream for large files
+      const reader = response.body?.getReader();
+      if (!reader) {
+        throw new Error('Response body is not readable');
+      }
+      
+      const chunks: Uint8Array[] = [];
+      let receivedLength = 0;
+      const expectedLength = contentLength ? parseInt(contentLength) : 0;
+      
+      while (true) {
+        const { done, value } = await reader.read();
+        
+        if (done) break;
+        
+        chunks.push(value);
+        receivedLength += value.length;
+        
+        if (expectedLength > 0) {
+          const progress = (receivedLength / expectedLength * 100).toFixed(1);
+          console.log(`📈 Download progress: ${progress}% (${receivedLength}/${expectedLength} bytes)`);
+        }
+      }
+      
+      console.log(`✅ Download completed: ${receivedLength} bytes received`);
+      
+      // Verify we got the expected amount
+      if (expectedLength > 0 && receivedLength !== expectedLength) {
+        console.warn(`⚠️ Size mismatch: expected ${expectedLength}, got ${receivedLength}`);
+        if (receivedLength < expectedLength * 0.9) { // If we got less than 90% of expected
+          throw new Error(`Incomplete download: ${receivedLength}/${expectedLength} bytes`);
+        }
+      }
+      
+      // Combine all chunks into a single array buffer
+      const arrayBuffer = new ArrayBuffer(receivedLength);
+      const uint8Array = new Uint8Array(arrayBuffer);
+      let position = 0;
+      
+      for (const chunk of chunks) {
+        uint8Array.set(chunk, position);
+        position += chunk.length;
+      }
+      
+      // Validate PDF format
+      const firstBytes = new Uint8Array(arrayBuffer.slice(0, 8));
+      const header = String.fromCharCode(...firstBytes);
+      
+      if (!header.startsWith('%PDF')) {
+        throw new Error(`Invalid PDF header: ${header}`);
+      }
+      
+      // Check for PDF end marker
+      const lastBytes = new Uint8Array(arrayBuffer.slice(-10));
+      const footer = String.fromCharCode(...lastBytes);
+      const hasEOF = footer.includes('%%EOF') || arrayBuffer.byteLength < 1000; // Small files might not have clear EOF
+      
+      console.log('📄 PDF validation:', {
+        header: header.substring(0, 8),
+        size: arrayBuffer.byteLength,
+        hasEOF,
+        isValid: header.startsWith('%PDF')
+      });
+      
+      if (!hasEOF && arrayBuffer.byteLength > 1000) {
+        console.warn('⚠️ PDF may be incomplete - no EOF marker found');
+      }
+      
+      // Create and return the blob
+      const blob = new Blob([arrayBuffer], { type: 'application/pdf' });
+      console.log(`✅ PDF blob created successfully: ${blob.size} bytes`);
+      
+      return blob;
+      
+    } catch (error) {
+      console.error(`❌ Attempt ${attempt} failed:`, error);
+      
+      if (attempt === maxRetries) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        throw new Error(`Failed to download PDF after ${maxRetries} attempts: ${errorMessage}`);
+      }
+      
+      // Wait before retry (exponential backoff)
+      const delay = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s...
+      console.log(`⏳ Waiting ${delay}ms before retry...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  
+  throw new Error('This should never be reached');
+};
+
+// Comprehensive debug function to test the entire PDF pipeline
+export const debugPDFPipeline = async (): Promise<void> => {
+  console.log('🔍 Starting comprehensive PDF pipeline debug...');
+  
+  try {
+    // Step 1: Generate PDF with PDF.co
+    console.log('📝 Step 1: Generating PDF with PDF.co...');
+    const sampleData = generateSampleReportData();
+    const pdfcoUrl = await generatePDFWithAPI(sampleData);
+    console.log('✅ PDF.co URL generated:', pdfcoUrl);
+    
+    // Step 2: Test PDF.co URL directly
+    console.log('🔗 Step 2: Testing PDF.co URL directly...');
+    window.open(pdfcoUrl, '_blank');
+    
+    // Step 3: Download and analyze the PDF
+    console.log('⬇️ Step 3: Downloading PDF from PDF.co...');
+    const response = await fetch(pdfcoUrl, {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/pdf',
+        'User-Agent': 'Mozilla/5.0 (compatible; LIMS-PDF-Downloader)',
+      }
+    });
+    
+    console.log('📊 Response details:', {
+      status: response.status,
+      statusText: response.statusText,
+      contentType: response.headers.get('content-type'),
+      contentLength: response.headers.get('content-length'),
+      headers: [...response.headers.entries()]
+    });
+    
+    if (!response.ok) {
+      throw new Error(`PDF.co download failed: ${response.status}`);
+    }
+    
+    // Step 4: Get ArrayBuffer and analyze
+    console.log('🔬 Step 4: Analyzing downloaded content...');
+    const arrayBuffer = await response.arrayBuffer();
+    console.log('📏 ArrayBuffer size:', arrayBuffer.byteLength);
+    
+    // Check PDF header
+    const firstBytes = new Uint8Array(arrayBuffer.slice(0, 10));
+    const header = String.fromCharCode(...firstBytes);
+    console.log('📄 PDF header:', JSON.stringify(header));
+    console.log('✅ Valid PDF header:', header.startsWith('%PDF'));
+    
+    // Check PDF footer
+    const lastBytes = new Uint8Array(arrayBuffer.slice(-10));
+    const footer = String.fromCharCode(...lastBytes);
+    console.log('📄 PDF footer:', JSON.stringify(footer));
+    
+    // Step 5: Create blob and test locally
+    console.log('💾 Step 5: Creating blob and testing locally...');
+    const pdfBlob = new Blob([arrayBuffer], { type: 'application/pdf' });
+    console.log('🎯 Blob details:', {
+      size: pdfBlob.size,
+      type: pdfBlob.type,
+      arrayBufferSize: arrayBuffer.byteLength,
+      sizesMatch: pdfBlob.size === arrayBuffer.byteLength
+    });
+    
+    // Create local blob URL and test
+    const localBlobUrl = URL.createObjectURL(pdfBlob);
+    console.log('🔗 Local blob URL:', localBlobUrl);
+    console.log('🚀 Opening local blob in new tab...');
+    setTimeout(() => window.open(localBlobUrl, '_blank'), 2000);
+    
+    // Step 6: Upload to Supabase and test
+    console.log('☁️ Step 6: Uploading to Supabase...');
+    const fileName = `debug_${Date.now()}.pdf`;
+    
+    const { data, error } = await supabase.storage
+      .from('reports')
+      .upload(fileName, pdfBlob, {
+        contentType: 'application/pdf',
+        upsert: true
+      });
+    
+    if (error) {
+      console.error('❌ Supabase upload failed:', error);
+      return;
+    }
+    
+    console.log('✅ Supabase upload successful:', data);
+    
+    // Step 7: Get public URL and test
+    const { data: { publicUrl } } = supabase.storage
+      .from('reports')
+      .getPublicUrl(fileName);
+    
+    console.log('🔗 Supabase public URL:', publicUrl);
+    
+    // Step 8: Download from Supabase and compare
+    console.log('🔄 Step 8: Downloading from Supabase to compare...');
+    const supabaseResponse = await fetch(publicUrl);
+    console.log('📊 Supabase response:', {
+      status: supabaseResponse.status,
+      contentType: supabaseResponse.headers.get('content-type'),
+      contentLength: supabaseResponse.headers.get('content-length')
+    });
+    
+    if (supabaseResponse.ok) {
+      const supabaseArrayBuffer = await supabaseResponse.arrayBuffer();
+      console.log('📏 Downloaded from Supabase size:', supabaseArrayBuffer.byteLength);
+      
+      // Compare sizes
+      console.log('🔍 Size comparison:', {
+        original: arrayBuffer.byteLength,
+        downloaded: supabaseArrayBuffer.byteLength,
+        match: arrayBuffer.byteLength === supabaseArrayBuffer.byteLength
+      });
+      
+      // Compare first few bytes
+      const downloadedFirstBytes = new Uint8Array(supabaseArrayBuffer.slice(0, 10));
+      const downloadedHeader = String.fromCharCode(...downloadedFirstBytes);
+      console.log('📄 Downloaded PDF header:', JSON.stringify(downloadedHeader));
+      
+      // Test if downloaded version works
+      const downloadedBlob = new Blob([supabaseArrayBuffer], { type: 'application/pdf' });
+      const downloadedUrl = URL.createObjectURL(downloadedBlob);
+      console.log('🚀 Opening downloaded version in new tab...');
+      setTimeout(() => window.open(downloadedUrl, '_blank'), 4000);
+      
+      // Direct comparison
+      const originalBytes = new Uint8Array(arrayBuffer);
+      const downloadedBytes = new Uint8Array(supabaseArrayBuffer);
+      let differences = 0;
+      for (let i = 0; i < Math.min(originalBytes.length, downloadedBytes.length); i++) {
+        if (originalBytes[i] !== downloadedBytes[i]) {
+          differences++;
+          if (differences <= 10) {
+            console.log(`Byte difference at ${i}: ${originalBytes[i]} vs ${downloadedBytes[i]}`);
+          }
+        }
+      }
+      console.log('🔍 Total byte differences:', differences);
+    }
+    
+    console.log('🚀 Opening Supabase URL in new tab...');
+    setTimeout(() => window.open(publicUrl, '_blank'), 6000);
+    
+    console.log('✅ Debug pipeline completed. Check the opened tabs to compare results.');
+    
+  } catch (error) {
+    console.error('❌ Debug pipeline failed:', error);
+  }
+};
+
+// Export all functions and interfaces
+export default {
+  generateAndSavePDFReport,
+  viewPDFReport,
+  downloadPDFReport,
+  generateSampleReportData,
+  downloadPDFFromURL,
+  saveLabTemplate,
+  getLabTemplates,
+  getLabTemplate,
+  defaultLabTemplate,
+  testPDFGeneration,
+  testStorageUpload,
+  debugPDFPipeline
 };
