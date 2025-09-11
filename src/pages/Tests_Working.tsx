@@ -215,13 +215,36 @@ const Tests: React.FC = () => {
   };
 
   const handleEditTestGroup = (testGroup: TestGroup) => {
-    setEditingTestGroup(testGroup);
+    // Fetch the full test group data with all fields from the database
+    const fetchFullTestGroup = async () => {
+      try {
+        const { data: fullTestGroup, error } = await supabase
+          .from('test_groups')
+          .select('*')
+          .eq('id', testGroup.id)
+          .single();
+
+        if (error) throw error;
+
+        setEditingTestGroup({
+          ...testGroup,
+          ...fullTestGroup // Merge all database fields
+        });
+      } catch (err) {
+        console.error('Error fetching full test group:', err);
+        setEditingTestGroup(testGroup); // Fallback to original data
+      }
+    };
+
+    fetchFullTestGroup();
+    
     setFormData({
       name: testGroup.name,
       category: testGroup.category,
       description: testGroup.description || '',
       selectedAnalytes: testGroup.analytes?.map(a => a.id) || []
     });
+    setAnalyteSearchTerm(''); // Reset search term when opening edit modal
     setShowEditModal(true);
   };
 
@@ -239,6 +262,14 @@ const Tests: React.FC = () => {
           name: formData.name,
           category: formData.category,
           description: formData.description,
+          clinical_purpose: (editingTestGroup as any)?.clinical_purpose || null,
+          price: (editingTestGroup as any)?.price ? parseFloat((editingTestGroup as any).price) : null,
+          turnaround_time: (editingTestGroup as any)?.turnaround_time ? parseInt((editingTestGroup as any).turnaround_time) : null,
+          sample_type: (editingTestGroup as any)?.sample_type || null,
+          requires_fasting: (editingTestGroup as any)?.requires_fasting || false,
+          default_ai_processing_type: (editingTestGroup as any)?.default_ai_processing_type || 'ocr_report',
+          group_level_prompt: (editingTestGroup as any)?.group_level_prompt || null,
+          to_be_copied: (editingTestGroup as any)?.to_be_copied || false,
           updated_at: new Date().toISOString()
         })
         .eq('id', editingTestGroup.id);
@@ -701,7 +732,10 @@ const Tests: React.FC = () => {
           <div className="bg-white rounded-lg p-6 w-full max-w-4xl max-h-[90vh] overflow-y-auto">
             <div className="flex justify-between items-center mb-6">
               <h2 className="text-xl font-semibold">Edit Test Group</h2>
-              <button onClick={() => setShowEditModal(false)} className="text-gray-400 hover:text-gray-600">
+              <button onClick={() => {
+                setShowEditModal(false);
+                setAnalyteSearchTerm(''); // Reset search term when closing modal
+              }} className="text-gray-400 hover:text-gray-600">
                 <X className="w-6 h-6" />
               </button>
             </div>
@@ -745,6 +779,130 @@ const Tests: React.FC = () => {
                   rows={3}
                   className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
+              </div>
+
+              {/* Clinical Purpose */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Clinical Purpose</label>
+                <input
+                  type="text"
+                  value={(editingTestGroup as any)?.clinical_purpose || ''}
+                  onChange={(e) => setEditingTestGroup(prev => prev ? { ...prev, clinical_purpose: e.target.value } : null)}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  placeholder="e.g., Inflammatory marker, Liver function assessment"
+                />
+              </div>
+
+              {/* Price and Turnaround Time */}
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Price *</label>
+                  <div className="relative">
+                    <span className="absolute left-3 top-2 text-gray-500">₹</span>
+                    <input
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      value={(editingTestGroup as any)?.price || ''}
+                      onChange={(e) => setEditingTestGroup(prev => prev ? { ...prev, price: e.target.value } : null)}
+                      className="w-full pl-8 pr-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      placeholder="0.00"
+                      required
+                    />
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Turnaround Time (hours) *</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="72"
+                    value={(editingTestGroup as any)?.turnaround_time || ''}
+                    onChange={(e) => setEditingTestGroup(prev => prev ? { ...prev, turnaround_time: e.target.value } : null)}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    placeholder="4"
+                    required
+                  />
+                </div>
+              </div>
+
+              {/* Sample Type and Fasting */}
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Sample Type *</label>
+                  <select
+                    value={(editingTestGroup as any)?.sample_type || ''}
+                    onChange={(e) => setEditingTestGroup(prev => prev ? { ...prev, sample_type: e.target.value } : null)}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    required
+                  >
+                    <option value="">Select Sample Type</option>
+                    <option value="Serum">Serum</option>
+                    <option value="Plasma">Plasma</option>
+                    <option value="Whole Blood">Whole Blood</option>
+                    <option value="Urine">Urine</option>
+                    <option value="Stool">Stool</option>
+                    <option value="CSF">CSF</option>
+                    <option value="Sputum">Sputum</option>
+                    <option value="Swab">Swab</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Requires Fasting</label>
+                  <select
+                    value={(editingTestGroup as any)?.requires_fasting ? 'true' : 'false'}
+                    onChange={(e) => setEditingTestGroup(prev => prev ? { ...prev, requires_fasting: e.target.value === 'true' } : null)}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  >
+                    <option value="false">No</option>
+                    <option value="true">Yes</option>
+                  </select>
+                </div>
+              </div>
+
+              {/* AI Processing Configuration */}
+              <div className="border-t pt-4">
+                <h4 className="text-md font-medium text-gray-900 mb-3">AI Processing Configuration</h4>
+                
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Default AI Processing Type</label>
+                    <select
+                      value={(editingTestGroup as any)?.default_ai_processing_type || 'ocr_report'}
+                      onChange={(e) => setEditingTestGroup(prev => prev ? { ...prev, default_ai_processing_type: e.target.value } : null)}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    >
+                      <option value="ocr_report">OCR Report</option>
+                      <option value="gemini">Gemini AI</option>
+                      <option value="manual">Manual Entry</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Template for Copying</label>
+                    <select
+                      value={(editingTestGroup as any)?.to_be_copied ? 'true' : 'false'}
+                      onChange={(e) => setEditingTestGroup(prev => prev ? { ...prev, to_be_copied: e.target.value === 'true' } : null)}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    >
+                      <option value="false">Not a Template</option>
+                      <option value="true">Use as Template</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div className="mt-4">
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Group Level AI Prompt (Optional)</label>
+                  <textarea
+                    rows={3}
+                    value={(editingTestGroup as any)?.group_level_prompt || ''}
+                    onChange={(e) => setEditingTestGroup(prev => prev ? { ...prev, group_level_prompt: e.target.value || null } : null)}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    placeholder="Custom AI prompt for processing this test group results..."
+                  />
+                  <p className="mt-1 text-xs text-gray-500">
+                    Override the default AI prompt for better result interpretation specific to this test group.
+                  </p>
+                </div>
               </div>
 
               {/* Enhanced Analytes Section */}
@@ -803,8 +961,32 @@ const Tests: React.FC = () => {
                 </div>
 
                 <label className="block text-sm font-medium text-gray-700 mb-2">➕ Add More Analytes</label>
+                
+                {/* Search bar for analytes */}
+                <div className="mb-3">
+                  <div className="relative">
+                    <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4" />
+                    <input
+                      type="text"
+                      placeholder="Search analytes by name, category, or unit..."
+                      value={analyteSearchTerm}
+                      onChange={(e) => setAnalyteSearchTerm(e.target.value)}
+                      className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                    />
+                  </div>
+                </div>
+
                 <div className="max-h-60 overflow-y-auto border border-gray-300 rounded-md p-3 bg-white">
-                  {analytes.filter(analyte => !formData.selectedAnalytes.includes(analyte.id)).map((analyte) => (
+                  {analytes
+                    .filter(analyte => 
+                      !formData.selectedAnalytes.includes(analyte.id) &&
+                      (analyteSearchTerm === '' ||
+                       analyte.name.toLowerCase().includes(analyteSearchTerm.toLowerCase()) ||
+                       analyte.category.toLowerCase().includes(analyteSearchTerm.toLowerCase()) ||
+                       analyte.unit.toLowerCase().includes(analyteSearchTerm.toLowerCase()) ||
+                       (analyte.description || '').toLowerCase().includes(analyteSearchTerm.toLowerCase()))
+                    )
+                    .map((analyte) => (
                     <div key={analyte.id} className="flex items-center space-x-2 mb-2 p-2 hover:bg-gray-50 rounded">
                       <input
                         type="checkbox"
@@ -815,20 +997,53 @@ const Tests: React.FC = () => {
                       />
                       <label htmlFor={`edit-analyte-${analyte.id}`} className="text-sm text-gray-700 cursor-pointer flex-1">
                         <span className="font-medium">{analyte.name}</span> ({analyte.unit}) - {analyte.category}
+                        {analyte.description && (
+                          <div className="text-xs text-gray-500 ml-1">{analyte.description}</div>
+                        )}
                       </label>
                     </div>
                   ))}
                   
-                  {analytes.filter(analyte => !formData.selectedAnalytes.includes(analyte.id)).length === 0 && (
+                  {analytes.filter(analyte => 
+                    !formData.selectedAnalytes.includes(analyte.id) &&
+                    (analyteSearchTerm === '' ||
+                     analyte.name.toLowerCase().includes(analyteSearchTerm.toLowerCase()) ||
+                     analyte.category.toLowerCase().includes(analyteSearchTerm.toLowerCase()) ||
+                     analyte.unit.toLowerCase().includes(analyteSearchTerm.toLowerCase()) ||
+                     (analyte.description || '').toLowerCase().includes(analyteSearchTerm.toLowerCase()))
+                  ).length === 0 && (
                     <div className="text-center py-4 text-gray-500">
-                      <p>All available analytes are already added</p>
+                      {analyteSearchTerm ? (
+                        <div>
+                          <p className="font-medium">No analytes found matching "{analyteSearchTerm}"</p>
+                          <p className="text-sm">Try a different search term</p>
+                        </div>
+                      ) : (
+                        <p>All available analytes are already added</p>
+                      )}
                     </div>
                   )}
                 </div>
+
+                {/* Search results summary */}
+                {analyteSearchTerm && (
+                  <div className="mt-2 text-xs text-gray-500">
+                    Showing {analytes.filter(analyte => 
+                      !formData.selectedAnalytes.includes(analyte.id) &&
+                      (analyte.name.toLowerCase().includes(analyteSearchTerm.toLowerCase()) ||
+                       analyte.category.toLowerCase().includes(analyteSearchTerm.toLowerCase()) ||
+                       analyte.unit.toLowerCase().includes(analyteSearchTerm.toLowerCase()) ||
+                       (analyte.description || '').toLowerCase().includes(analyteSearchTerm.toLowerCase()))
+                    ).length} analyte(s) matching your search
+                  </div>
+                )}
               </div>
 
               <div className="flex justify-end space-x-3 pt-4 border-t">
-                <button type="button" onClick={() => setShowEditModal(false)} className="px-4 py-2 text-gray-700 bg-gray-100 rounded-md hover:bg-gray-200">
+                <button type="button" onClick={() => {
+                  setShowEditModal(false);
+                  setAnalyteSearchTerm(''); // Reset search term when cancelling
+                }} className="px-4 py-2 text-gray-700 bg-gray-100 rounded-md hover:bg-gray-200">
                   Cancel
                 </button>
                 <button type="submit" className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 flex items-center space-x-2">

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Camera, Upload, Brain, Zap, Eye, FileText, AlertTriangle, CheckCircle, TestTube } from 'lucide-react';
+import { Camera, Upload, Brain, Zap, Eye, FileText, CheckCircle, TestTube } from 'lucide-react';
 import PhotoAnalysis from '../components/AITools/PhotoAnalysis';
 import PipetteValidation from '../components/AITools/PipetteValidation';
 import OCRExtraction from '../components/AITools/OCRExtraction';
@@ -85,7 +85,7 @@ const AITools: React.FC = () => {
 
       console.log('Test group created:', newTestGroup);
 
-      // Create analytes WITHOUT test_group_id (they are independent entities)
+      // Create analytes WITHOUT test_group_id and lab_id (they are independent entities)
       const analytesToCreate = config.analytes.map((analyte) => ({
         name: analyte.name,
         unit: analyte.unit || '',
@@ -94,9 +94,9 @@ const AITools: React.FC = () => {
         is_active: true,
         low_critical: analyte.low_critical ? parseFloat(analyte.low_critical) : null,
         high_critical: analyte.high_critical ? parseFloat(analyte.high_critical) : null,
-        ai_processing_type: analyte.ai_processing_type || 'ocr_report',
-        group_ai_mode: analyte.group_ai_mode || 'individual',
-        lab_id: null
+        ai_processing_type: 'ocr_report', // Use 'gemini' instead of 'ocr_report'
+        group_ai_mode: analyte.group_ai_mode || 'individual'
+        // Removed lab_id as it doesn't exist in analytes table
       }));
 
       console.log('Creating analytes:', analytesToCreate);
@@ -138,6 +138,12 @@ const AITools: React.FC = () => {
       console.log('Analytes processed:', createdAnalytes);
 
       // Create relationships between test group and analytes
+      if (createdAnalytes.length === 0) {
+        console.warn('No analytes were created, skipping relationship creation');
+        alert(`✅ Test group "${config.test_group.name}" created, but no analytes were processed.`);
+        return;
+      }
+
       const relationships = createdAnalytes.map((analyte) => ({
         test_group_id: newTestGroup.id,
         analyte_id: analyte.id
@@ -145,19 +151,30 @@ const AITools: React.FC = () => {
 
       console.log('Creating relationships:', relationships);
 
-      // Insert relationships, ignoring duplicates
+      // Insert relationships one by one to handle duplicates gracefully
+      let relationshipsCreated = 0;
       for (const relationship of relationships) {
-        const { error: relationshipError } = await supabase
+        console.log(`Attempting to create relationship:`, relationship);
+        
+        const { data: insertedRelationship, error: relationshipError } = await supabase
           .from('test_group_analytes')
-          .insert(relationship);
+          .insert(relationship)
+          .select('*');
 
-        if (relationshipError && relationshipError.code !== '23505') {
-          console.error('Error creating relationship:', relationshipError);
+        if (relationshipError) {
+          if (relationshipError.code === '23505') {
+            console.log(`Relationship already exists for analyte ${relationship.analyte_id}`);
+          } else {
+            console.error('Error creating relationship:', relationshipError);
+          }
+        } else {
+          relationshipsCreated++;
+          console.log(`Relationship created successfully:`, insertedRelationship);
         }
       }
 
-      console.log('✅ Test group, analytes, and relationships created successfully!');
-      alert(`✅ Successfully created "${config.test_group.name}" with ${createdAnalytes.length} analytes!`);
+      console.log(`✅ Test group, analytes, and relationships created successfully! ${relationshipsCreated} relationships created.`);
+      alert(`✅ Successfully created "${config.test_group.name}" with ${createdAnalytes.length} analytes and ${relationshipsCreated} relationships!`);
 
     } catch (error) {
       console.error('Failed to create test configuration:', error);
