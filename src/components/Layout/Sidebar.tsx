@@ -12,7 +12,8 @@ import {
   Settings,
   X,
   Activity,
-  CheckCircle2
+  CheckCircle2,
+  Workflow
 } from 'lucide-react';
 
 interface SidebarProps {
@@ -38,6 +39,7 @@ const navigation = [
   
   // Advanced Tools
   { name: 'AI Tools', href: '/ai-tools', icon: Brain, category: 'tools' },
+  { name: 'Workflow Demo', href: '/workflow-demo', icon: Workflow, category: 'tools' },
   { name: 'Settings', href: '/settings', icon: Settings, category: 'tools' },
 ];
 

@@ -20,7 +20,12 @@
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^6.22.0",
-    "recharts": "^2.12.1"
+    "recharts": "^2.12.1",
+    "survey-core": "^1.9.131",
+    "survey-react-ui": "^1.9.131",
+    "survey-creator-core": "^1.9.131",
+    "survey-creator-react": "^1.9.131",
+    "use-debounce": "^10.0.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.9.1",

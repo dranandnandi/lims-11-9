@@ -1,0 +1,260 @@
+{
+  "title": "CBC Test Workflow",
+  "description": "Complete Blood Count test procedure",
+  "pages": [
+    {
+      "name": "sample_collection",
+      "title": "Sample Collection",
+      "elements": [
+        {
+          "type": "text",
+          "name": "patient_id",
+          "title": "Patient ID",
+          "isRequired": true,
+          "validators": [
+            {
+              "type": "regex",
+              "text": "Please enter a valid patient ID",
+              "regex": "^[A-Z]{2}\\d{6}$"
+            }
+          ]
+        },
+        {
+          "type": "dropdown",
+          "name": "collection_site",
+          "title": "Collection Site",
+          "isRequired": true,
+          "choices": [
+            { "value": "antecubital", "text": "Antecubital Vein" },
+            { "value": "hand", "text": "Hand Vein" },
+            { "value": "finger_stick", "text": "Finger Stick" },
+            { "value": "heel_stick", "text": "Heel Stick (Pediatric)" }
+          ]
+        },
+        {
+          "type": "dropdown",
+          "name": "tube_type",
+          "title": "Collection Tube",
+          "isRequired": true,
+          "choices": [
+            { "value": "edta_purple", "text": "EDTA (Purple Top)" },
+            { "value": "edta_lavender", "text": "EDTA (Lavender Top)" }
+          ]
+        },
+        {
+          "type": "boolean",
+          "name": "fasting_status",
+          "title": "Patient fasting status confirmed"
+        }
+      ]
+    },
+    {
+      "name": "analyzer_setup",
+      "title": "Analyzer Setup",
+      "elements": [
+        {
+          "type": "dropdown",
+          "name": "analyzer_id",
+          "title": "Analyzer",
+          "isRequired": true,
+          "choices": [
+            { "value": "sysmex_xn1000", "text": "Sysmex XN-1000" },
+            { "value": "abbott_cell_dyn", "text": "Abbott Cell-Dyn" },
+            { "value": "beckman_dxh", "text": "Beckman Coulter DxH" }
+          ]
+        },
+        {
+          "type": "boolean",
+          "name": "qc_passed",
+          "title": "Quality control passed",
+          "isRequired": true
+        },
+        {
+          "type": "text",
+          "name": "qc_lot_number",
+          "title": "QC Lot Number",
+          "isRequired": true,
+          "visibleIf": "{qc_passed} = true"
+        },
+        {
+          "type": "boolean",
+          "name": "calibration_current",
+          "title": "Calibration is current",
+          "isRequired": true
+        }
+      ]
+    },
+    {
+      "name": "test_results",
+      "title": "Test Results",
+      "elements": [
+        {
+          "type": "panel",
+          "name": "wbc_panel",
+          "title": "White Blood Cells",
+          "elements": [
+            {
+              "type": "text",
+              "name": "wbc_count",
+              "title": "WBC Count (×10³/μL)",
+              "inputType": "number",
+              "isRequired": true,
+              "validators": [
+                {
+                  "type": "numeric",
+                  "minValue": 0,
+                  "maxValue": 100,
+                  "text": "WBC count must be between 0 and 100"
+                }
+              ]
+            },
+            {
+              "type": "dropdown",
+              "name": "wbc_flag",
+              "title": "WBC Flag",
+              "choices": [
+                { "value": "normal", "text": "Normal" },
+                { "value": "low", "text": "Low" },
+                { "value": "high", "text": "High" },
+                { "value": "critical", "text": "Critical" }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "panel",
+          "name": "rbc_panel",
+          "title": "Red Blood Cells",
+          "elements": [
+            {
+              "type": "text",
+              "name": "rbc_count",
+              "title": "RBC Count (×10⁶/μL)",
+              "inputType": "number",
+              "isRequired": true
+            },
+            {
+              "type": "text",
+              "name": "hemoglobin",
+              "title": "Hemoglobin (g/dL)",
+              "inputType": "number",
+              "isRequired": true
+            },
+            {
+              "type": "text",
+              "name": "hematocrit",
+              "title": "Hematocrit (%)",
+              "inputType": "number",
+              "isRequired": true
+            },
+            {
+              "type": "text",
+              "name": "mcv",
+              "title": "MCV (fL)",
+              "inputType": "number",
+              "isRequired": true
+            },
+            {
+              "type": "text",
+              "name": "mch",
+              "title": "MCH (pg)",
+              "inputType": "number",
+              "isRequired": true
+            },
+            {
+              "type": "text",
+              "name": "mchc",
+              "title": "MCHC (g/dL)",
+              "inputType": "number",
+              "isRequired": true
+            }
+          ]
+        },
+        {
+          "type": "panel",
+          "name": "platelet_panel",
+          "title": "Platelets",
+          "elements": [
+            {
+              "type": "text",
+              "name": "platelet_count",
+              "title": "Platelet Count (×10³/μL)",
+              "inputType": "number",
+              "isRequired": true
+            },
+            {
+              "type": "dropdown",
+              "name": "platelet_flag",
+              "title": "Platelet Flag",
+              "choices": [
+                { "value": "normal", "text": "Normal" },
+                { "value": "low", "text": "Low" },
+                { "value": "high", "text": "High" },
+                { "value": "clumped", "text": "Clumped" }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "review_approval",
+      "title": "Review & Approval",
+      "elements": [
+        {
+          "type": "matrix",
+          "name": "result_validation",
+          "title": "Result Validation",
+          "columns": [
+            { "value": "verified", "text": "Verified" },
+            { "value": "needs_review", "text": "Needs Review" },
+            { "value": "repeat_test", "text": "Repeat Test" }
+          ],
+          "rows": [
+            { "value": "wbc_results", "text": "WBC Results" },
+            { "value": "rbc_results", "text": "RBC Results" },
+            { "value": "platelet_results", "text": "Platelet Results" }
+          ],
+          "isAllRowRequired": true
+        },
+        {
+          "type": "comment",
+          "name": "technician_notes",
+          "title": "Technician Notes",
+          "placeholder": "Enter any observations or comments about the test..."
+        },
+        {
+          "type": "text",
+          "name": "reviewed_by",
+          "title": "Reviewed By (Technician ID)",
+          "isRequired": true
+        },
+        {
+          "type": "boolean",
+          "name": "critical_values_called",
+          "title": "Critical values called to physician (if applicable)"
+        }
+      ]
+    }
+  ],
+  "triggers": [
+    {
+      "type": "setvalue",
+      "expression": "{wbc_count} < 4.0 or {wbc_count} > 11.0",
+      "setToName": "wbc_flag",
+      "setValue": "abnormal"
+    },
+    {
+      "type": "setvalue",
+      "expression": "{platelet_count} < 150 or {platelet_count} > 450",
+      "setToName": "platelet_flag",
+      "setValue": "abnormal"
+    }
+  ],
+  "completedHtml": "<h3>CBC Test Workflow Completed!</h3><p>The Complete Blood Count test has been successfully completed and recorded.</p>",
+  "showProgressBar": "top",
+  "showQuestionNumbers": "onPage",
+  "questionTitleLocation": "top",
+  "showNavigationButtons": true,
+  "goNextPageAutomatic": false
+}

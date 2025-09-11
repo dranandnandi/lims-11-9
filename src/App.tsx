@@ -17,6 +17,8 @@ import CashReconciliation from './pages/CashReconciliation';
 import AITools from './pages/AITools';
 import Settings from './pages/Settings';
 import ResultVerificationConsole from './pages/ResultVerificationConsole';
+import { WorkflowManagement } from './pages/WorkflowManagement';
+import WorkflowDemo from './pages/WorkflowDemo';
 
 const AppRoutes: React.FC = () => {
   const { user, loading } = useAuth();
@@ -61,6 +63,8 @@ const AppRoutes: React.FC = () => {
               <Route path="/ai-tools" element={<AITools />} />
               <Route path="/settings" element={<Settings />} />
               <Route path="/verification" element={<ResultVerificationConsole />} />
+              <Route path="/workflows" element={<WorkflowManagement />} />
+              <Route path="/workflow-demo" element={<WorkflowDemo />} />
             </Routes>
           </Layout>
         </ProtectedRoute>

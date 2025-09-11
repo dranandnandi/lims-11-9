@@ -1,0 +1,219 @@
+{
+  "title": "Basic Lab Workflow",
+  "description": "Standard laboratory procedure workflow",
+  "pages": [
+    {
+      "name": "sample_preparation",
+      "title": "Sample Preparation",
+      "elements": [
+        {
+          "type": "text",
+          "name": "sample_id",
+          "title": "Sample ID",
+          "isRequired": true,
+          "validators": [
+            {
+              "type": "regex",
+              "text": "Please enter a valid sample ID (format: LAB-XXXX-YYYY)",
+              "regex": "^LAB-\\d{4}-\\d{4}$"
+            }
+          ]
+        },
+        {
+          "type": "dropdown",
+          "name": "sample_type",
+          "title": "Sample Type",
+          "isRequired": true,
+          "choices": [
+            { "value": "blood", "text": "Blood" },
+            { "value": "urine", "text": "Urine" },
+            { "value": "saliva", "text": "Saliva" },
+            { "value": "tissue", "text": "Tissue" },
+            { "value": "other", "text": "Other" }
+          ]
+        },
+        {
+          "type": "text",
+          "name": "volume",
+          "title": "Sample Volume (ml)",
+          "inputType": "number",
+          "isRequired": true,
+          "validators": [
+            {
+              "type": "numeric",
+              "minValue": 0.1,
+              "maxValue": 1000,
+              "text": "Volume must be between 0.1 and 1000 ml"
+            }
+          ]
+        },
+        {
+          "type": "comment",
+          "name": "preparation_notes",
+          "title": "Preparation Notes",
+          "placeholder": "Enter any special preparation requirements or observations..."
+        }
+      ]
+    },
+    {
+      "name": "quality_control",
+      "title": "Quality Control",
+      "elements": [
+        {
+          "type": "boolean",
+          "name": "visual_inspection",
+          "title": "Visual inspection passed",
+          "isRequired": true
+        },
+        {
+          "type": "rating",
+          "name": "sample_quality",
+          "title": "Sample Quality Rating",
+          "rateMax": 5,
+          "rateMin": 1,
+          "isRequired": true,
+          "rateValues": [
+            { "value": 1, "text": "Poor" },
+            { "value": 2, "text": "Fair" },
+            { "value": 3, "text": "Good" },
+            { "value": 4, "text": "Very Good" },
+            { "value": 5, "text": "Excellent" }
+          ]
+        },
+        {
+          "type": "matrix",
+          "name": "control_checks",
+          "title": "Control Checks",
+          "columns": [
+            { "value": "pass", "text": "Pass" },
+            { "value": "fail", "text": "Fail" },
+            { "value": "na", "text": "N/A" }
+          ],
+          "rows": [
+            { "value": "contamination", "text": "Contamination Check" },
+            { "value": "temperature", "text": "Temperature Control" },
+            { "value": "ph_level", "text": "pH Level" },
+            { "value": "clarity", "text": "Sample Clarity" }
+          ],
+          "isAllRowRequired": true
+        }
+      ]
+    },
+    {
+      "name": "testing_procedure",
+      "title": "Testing Procedure",
+      "elements": [
+        {
+          "type": "dropdown",
+          "name": "test_method",
+          "title": "Testing Method",
+          "isRequired": true,
+          "choices": [
+            { "value": "pcr", "text": "PCR Analysis" },
+            { "value": "elisa", "text": "ELISA" },
+            { "value": "microscopy", "text": "Microscopy" },
+            { "value": "chromatography", "text": "Chromatography" },
+            { "value": "spectroscopy", "text": "Spectroscopy" }
+          ]
+        },
+        {
+          "type": "text",
+          "name": "equipment_id",
+          "title": "Equipment ID",
+          "isRequired": true,
+          "placeholder": "Enter equipment serial number"
+        },
+        {
+          "type": "text",
+          "name": "technician_id",
+          "title": "Technician ID",
+          "isRequired": true,
+          "placeholder": "Enter technician identification"
+        },
+        {
+          "type": "paneldynamic",
+          "name": "test_measurements",
+          "title": "Test Measurements",
+          "minPanelCount": 1,
+          "maxPanelCount": 10,
+          "panelAddText": "Add Measurement",
+          "panelRemoveText": "Remove Measurement",
+          "templateElements": [
+            {
+              "type": "text",
+              "name": "parameter",
+              "title": "Parameter",
+              "isRequired": true
+            },
+            {
+              "type": "text",
+              "name": "value",
+              "title": "Value",
+              "inputType": "number",
+              "isRequired": true
+            },
+            {
+              "type": "text",
+              "name": "unit",
+              "title": "Unit",
+              "isRequired": true
+            },
+            {
+              "type": "dropdown",
+              "name": "status",
+              "title": "Status",
+              "choices": [
+                { "value": "normal", "text": "Normal" },
+                { "value": "abnormal", "text": "Abnormal" },
+                { "value": "critical", "text": "Critical" }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "results_validation",
+      "title": "Results Validation",
+      "elements": [
+        {
+          "type": "boolean",
+          "name": "results_reviewed",
+          "title": "Results have been reviewed by supervisor",
+          "isRequired": true
+        },
+        {
+          "type": "text",
+          "name": "reviewer_id",
+          "title": "Reviewer ID",
+          "isRequired": true,
+          "visibleIf": "{results_reviewed} = true"
+        },
+        {
+          "type": "comment",
+          "name": "validation_notes",
+          "title": "Validation Notes",
+          "placeholder": "Enter any validation observations or comments..."
+        },
+        {
+          "type": "signaturepad",
+          "name": "technician_signature",
+          "title": "Technician Signature",
+          "isRequired": true
+        }
+      ]
+    }
+  ],
+  "triggers": [
+    {
+      "type": "complete",
+      "expression": "{results_reviewed} = true and {technician_signature} notempty"
+    }
+  ],
+  "completedHtml": "<h3>Workflow Completed Successfully!</h3><p>Thank you for completing the lab workflow. The results have been recorded and will be processed.</p>",
+  "showProgressBar": "top",
+  "showQuestionNumbers": "on",
+  "questionTitleLocation": "top",
+  "showNavigationButtons": true,
+  "goNextPageAutomatic": false
+}
