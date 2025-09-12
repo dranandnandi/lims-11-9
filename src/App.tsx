@@ -18,7 +18,8 @@ import AITools from './pages/AITools';
 import Settings from './pages/Settings';
 import ResultVerificationConsole from './pages/ResultVerificationConsole';
 import { WorkflowManagement } from './pages/WorkflowManagement';
-import WorkflowDemo from './pages/WorkflowDemo';
+import WorkflowDemo from './pages/WorkflowDemo'
+import OrderDetail from './pages/OrderDetail';
 
 const AppRoutes: React.FC = () => {
   const { user, loading } = useAuth();
@@ -65,6 +66,7 @@ const AppRoutes: React.FC = () => {
               <Route path="/verification" element={<ResultVerificationConsole />} />
               <Route path="/workflows" element={<WorkflowManagement />} />
               <Route path="/workflow-demo" element={<WorkflowDemo />} />
+          <Route path="/orders/:id" element={<OrderDetail />} />
             </Routes>
           </Layout>
         </ProtectedRoute>

@@ -79,9 +79,38 @@ const SimpleWorkflowRunner: React.FC<SimpleWorkflowRunnerProps> = ({
     try {
       setIsSubmitting(true)
       
+      // HARD GATE: Block if no order ID - as specified in requirements
+      if (!orderId) {
+        alert('Create an order and collect sample first.')
+        setStatus('error')
+        setError('No order ID provided. Please create an order first.')
+        return
+      }
+      
       // Get final results from survey
       const surveyResults = sender.data
       
+      // Build exact request body as specified in requirements
+      const requestBody = {
+        workflowInstanceId: instanceId,
+        stepId: 'final_results',
+        orderId: orderId,
+        labId: null, // Should be retrieved from order context
+        testGroupId: testGroupId || null,
+        testCode: null, // Should be retrieved from order context  
+        userId: 'system', // Should be actual user ID from auth
+        results: {
+          patient_id: null, // Should come from order
+          patient_name: null, // Should come from order
+          sample_id: null, // Should come from order
+          review_status: 'submitted',
+          ...surveyResults,
+          test_name: workflowDefinition?.title || workflowDefinition?.meta?.title || 'Workflow Test',
+          measurements: extractMeasurements(surveyResults),
+          qc_data: extractQCData(surveyResults)
+        }
+      }
+
       // Submit to backend using existing results/result_values tables
       const response = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/process-workflow-result`, {
         method: 'POST',
@@ -89,21 +118,7 @@ const SimpleWorkflowRunner: React.FC<SimpleWorkflowRunnerProps> = ({
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`
         },
-        body: JSON.stringify({
-          workflowInstanceId: instanceId,
-          stepId: 'final_results',
-          results: {
-            ...surveyResults,
-            test_name: workflowDefinition?.title || workflowDefinition?.meta?.title || 'Workflow Test',
-            patient_id: orderId,
-            patient_name: 'Test Patient',
-            measurements: extractMeasurements(surveyResults),
-            qc_data: extractQCData(surveyResults)
-          },
-          userId: 'system', // Should be actual user ID from auth
-          orderId,
-          testGroupId
-        })
+        body: JSON.stringify(requestBody)
       })
 
       if (!response.ok) {
@@ -113,6 +128,12 @@ const SimpleWorkflowRunner: React.FC<SimpleWorkflowRunnerProps> = ({
 
       const result = await response.json()
       console.log('Workflow submitted successfully:', result)
+      
+      // Handle response based on status
+      if (result.status === 'warn') {
+        // Show warning but still mark as completed
+        setError(`Processed with warnings. Check audit for details.`)
+      }
       
       // Update local state
       setCompletionData(surveyResults)

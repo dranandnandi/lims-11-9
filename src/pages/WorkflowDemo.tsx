@@ -1,190 +1,249 @@
-import { useEffect, useState } from 'react';
-import { getWorkflows } from '../utils/workflowAPI';
-import SimpleWorkflowRunner from '../components/Workflow/SimpleWorkflowRunner';
+import { useState, useEffect } from 'react'
+import { getWorkflows } from '../utils/workflowAPI'
+import SimpleWorkflowRunner from '../components/Workflow/SimpleWorkflowRunner'
+import { supabase } from '../utils/supabase'
 
-interface Workflow {
-  id: string;
-  name: string;
-  scope: string;
-  definition: any;
-  version: number;
+interface Order {
+  id: string
+  patient_name: string
+  test_group_name?: string
+  test_code?: string
 }
 
-const WorkflowDemo = () => {
-  const [availableWorkflows, setAvailableWorkflows] = useState<Workflow[]>([]);
-  const [selectedWorkflow, setSelectedWorkflow] = useState<any>(null);
-  const [currentWorkflowId, setCurrentWorkflowId] = useState<string>('');
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [completionData, setCompletionData] = useState<any>(null);
+export default function WorkflowDemo() {
+  const [workflows, setWorkflows] = useState<any[]>([])
+  const [orders, setOrders] = useState<Order[]>([])
+  const [selectedWorkflow, setSelectedWorkflow] = useState<any>(null)
+  const [selectedOrder, setSelectedOrder] = useState<Order | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
 
+  // Fetch workflows and orders
   useEffect(() => {
-    const fetchWorkflows = async () => {
+    const fetchData = async () => {
       try {
-        setLoading(true);
-        const workflows = await getWorkflows();
-        setAvailableWorkflows(workflows);
-        setError(null);
-      } catch (error) {
-        console.error('Error fetching workflows:', error);
-        setError('Failed to load workflows from database');
+        setLoading(true)
+        
+        // Fetch workflows
+        const workflowData = await getWorkflows()
+        setWorkflows(workflowData)
+
+        // Fetch sample orders for testing
+        const { data: orderData, error: orderError } = await supabase
+          .from('orders')
+          .select(`
+            id,
+            patient_name,
+            patients(name),
+            order_tests(
+              test_groups(
+                id,
+                name
+              )
+            )
+          `)
+          .limit(10)
+          .order('created_at', { ascending: false })
+
+        if (orderError) {
+          console.warn('No orders found or error fetching orders:', orderError)
+          setOrders([])
+        } else {
+          const formattedOrders = (orderData || []).map((order: any) => ({
+            id: order.id,
+            patient_name: order.patient_name || order.patients?.name || 'Unknown Patient',
+            test_group_name: order.order_tests?.[0]?.test_groups?.name,
+            test_code: order.order_tests?.[0]?.test_groups?.id
+          }))
+          
+          setOrders(formattedOrders)
+        }
+
+      } catch (err) {
+        console.error('Error fetching data:', err)
+        setError(err instanceof Error ? err.message : 'Failed to load data')
       } finally {
-        setLoading(false);
+        setLoading(false)
       }
-    };
-
-    fetchWorkflows();
-  }, []);
-
-  const handleWorkflowSelect = (workflowId: string) => {
-    const selectedWorkflow = availableWorkflows.find(w => w.id === workflowId);
-    if (selectedWorkflow) {
-      setSelectedWorkflow(selectedWorkflow.definition);
-      setCurrentWorkflowId(workflowId);
-      setCompletionData(null);
     }
-  };
+
+    fetchData()
+  }, [])
 
   const handleWorkflowComplete = (results: any) => {
-    console.log('Workflow completed:', results);
-    setCompletionData(results);
-  };
+    console.log('Workflow completed with results:', results)
+    alert('Workflow completed successfully! Check the console for results.')
+  }
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-screen">
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
+        <span className="ml-2">Loading...</span>
+      </div>
+    )
+  }
 
   return (
-    <div className="container mx-auto p-6 max-w-4xl">
+    <div className="container mx-auto px-4 py-8 max-w-4xl">
       <div className="mb-8">
-        <h1 className="text-3xl font-bold mb-2">Survey.js Workflow System</h1>
+        <h1 className="text-3xl font-bold text-gray-900 mb-2">Workflow Demo</h1>
         <p className="text-gray-600">
-          Execute laboratory workflows with automated result submission to database
+          Test the AI-powered workflow system with order gating
         </p>
       </div>
 
-      {/* Workflow Selection */}
-      <div className="bg-white rounded-lg border border-gray-200 p-6 mb-6">
-        <h2 className="text-xl font-semibold mb-4">Select Workflow</h2>
-        
-        {loading && (
-          <div className="flex items-center justify-center py-8">
-            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
-            <span className="ml-2">Loading workflows...</span>
+      {error && (
+        <div className="bg-red-50 border border-red-200 rounded-lg p-4 mb-6">
+          <div className="flex items-center text-red-800">
+            <svg className="h-5 w-5 mr-2" fill="currentColor" viewBox="0 0 20 20">
+              <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+            </svg>
+            <span>{error}</span>
           </div>
-        )}
+        </div>
+      )}
 
-        {error && (
-          <div className="bg-red-50 border border-red-200 rounded-lg p-4 mb-4">
-            <div className="flex items-center text-red-600">
-              <svg className="h-5 w-5 mr-2" fill="currentColor" viewBox="0 0 20 20">
-                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
+        {/* Order Selection */}
+        <div className="bg-white rounded-lg shadow border p-6">
+          <h2 className="text-lg font-semibold mb-4">Select Order</h2>
+          {orders.length === 0 ? (
+            <div className="text-center py-4">
+              <svg className="h-12 w-12 text-gray-400 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2h-2a2 2 0 01-2-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
               </svg>
-              {error}
+              <p className="text-gray-500">No orders available</p>
+              <p className="text-sm text-gray-400 mt-1">Create an order first to test workflows</p>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {orders.map(order => (
+                <button
+                  key={order.id}
+                  onClick={() => setSelectedOrder(order)}
+                  className={`w-full text-left p-3 rounded border transition-colors ${
+                    selectedOrder?.id === order.id
+                      ? 'bg-blue-50 border-blue-200'
+                      : 'bg-gray-50 border-gray-200 hover:bg-gray-100'
+                  }`}
+                >
+                  <div className="font-medium">Order #{order.id.slice(0, 8)}</div>
+                  <div className="text-sm text-gray-600">{order.patient_name}</div>
+                  <div className="text-xs text-gray-500">
+                    {order.test_group_name || order.test_code || 'No test specified'}
+                  </div>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Workflow Selection */}
+        <div className="bg-white rounded-lg shadow border p-6">
+          <h2 className="text-lg font-semibold mb-4">Select Workflow</h2>
+          {workflows.length === 0 ? (
+            <div className="text-center py-4">
+              <svg className="h-12 w-12 text-gray-400 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+              </svg>
+              <p className="text-gray-500">No workflows available</p>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {workflows.map(workflow => (
+                <button
+                  key={workflow.id}
+                  onClick={() => setSelectedWorkflow(workflow)}
+                  className={`w-full text-left p-3 rounded border transition-colors ${
+                    selectedWorkflow?.id === workflow.id
+                      ? 'bg-blue-50 border-blue-200'
+                      : 'bg-gray-50 border-gray-200 hover:bg-gray-100'
+                  }`}
+                >
+                  <div className="font-medium">{workflow.name}</div>
+                  <div className="text-sm text-gray-600">Scope: {workflow.scope}</div>
+                  <div className="text-xs text-gray-500">Version: {workflow.version}</div>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Order Gating Warning */}
+      {!selectedOrder && (
+        <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4 mb-6">
+          <div className="flex items-center text-yellow-800">
+            <svg className="h-5 w-5 mr-2" fill="currentColor" viewBox="0 0 20 20">
+              <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+            </svg>
+            <div>
+              <p className="font-semibold">Order Required</p>
+              <p className="text-sm">Please select an order first. Workflows can only be processed with an existing order.</p>
             </div>
           </div>
-        )}
+        </div>
+      )}
 
-        {!loading && !error && (
-          <div className="space-y-4">
-            <select 
-              onChange={(e) => handleWorkflowSelect(e.target.value)}
-              value={currentWorkflowId}
-              className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-            >
-              <option value="">Select a workflow to execute...</option>
-              {availableWorkflows.map((workflow) => (
-                <option key={workflow.id} value={workflow.id}>
-                  {workflow.name} (v{workflow.version})
-                </option>
-              ))}
-            </select>
-
-            {availableWorkflows.length === 0 && (
-              <div className="text-center py-8 text-gray-500">
-                <p>No workflows found in database.</p>
-                <p className="text-sm mt-2">
-                  Make sure you have workflow definitions in the <code>workflows</code> and <code>workflow_versions</code> tables.
-                </p>
-              </div>
-            )}
+      {/* Selected Items Summary */}
+      {(selectedOrder || selectedWorkflow) && (
+        <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-6">
+          <h3 className="font-semibold text-blue-900 mb-2">Selected Items</h3>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+            <div>
+              <span className="text-blue-700">Order:</span>
+              <span className="ml-2">
+                {selectedOrder 
+                  ? `#${selectedOrder.id.slice(0, 8)} (${selectedOrder.patient_name})`
+                  : 'None selected'
+                }
+              </span>
+            </div>
+            <div>
+              <span className="text-blue-700">Workflow:</span>
+              <span className="ml-2">
+                {selectedWorkflow ? selectedWorkflow.name : 'None selected'}
+              </span>
+            </div>
           </div>
-        )}
-      </div>
+        </div>
+      )}
 
-      {/* Workflow Execution */}
+      {/* Workflow Runner */}
       {selectedWorkflow && (
-        <div className="space-y-6">
-          <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
-            <h3 className="font-semibold text-blue-800 mb-2">Database Integration Active</h3>
-            <p className="text-blue-700 text-sm">
-              This workflow will save results to the <code>results</code> and <code>result_values</code> tables 
-              when completed successfully.
+        <div className="bg-white rounded-lg shadow border">
+          <div className="p-6 border-b border-gray-200">
+            <h2 className="text-xl font-semibold">Workflow Execution</h2>
+            <p className="text-gray-600 mt-1">
+              {selectedOrder 
+                ? `Processing workflow for order #${selectedOrder.id.slice(0, 8)}`
+                : 'Workflow will be blocked without order selection'
+              }
             </p>
           </div>
-
-          <SimpleWorkflowRunner
-            workflowDefinition={selectedWorkflow}
-            onComplete={handleWorkflowComplete}
-            orderId={crypto.randomUUID()} // Generate test order ID
-            testGroupId="test-group-1"
-          />
-        </div>
-      )}
-
-      {/* Results Display */}
-      {completionData && (
-        <div className="mt-6 bg-green-50 border border-green-200 rounded-lg p-6">
-          <h3 className="text-lg font-semibold text-green-800 mb-4">
-            ✅ Workflow Results Saved Successfully
-          </h3>
-          <div className="bg-white rounded border p-4">
-            <h4 className="font-medium mb-2">Submitted Data:</h4>
-            <pre className="text-xs overflow-auto max-h-60 bg-gray-50 p-3 rounded">
-              {JSON.stringify(completionData, null, 2)}
-            </pre>
-          </div>
-          <div className="mt-4 text-sm text-green-700">
-            <p>📊 Data has been processed and stored in:</p>
-            <ul className="list-disc list-inside mt-2 space-y-1">
-              <li><code>results</code> table - Main workflow result record</li>
-              <li><code>result_values</code> table - Individual measurement values</li>
-              <li><code>quality_control_results</code> table - QC data (if applicable)</li>
-              <li><code>workflow_step_events</code> table - Workflow execution log</li>
-            </ul>
+          <div className="p-6">
+            <SimpleWorkflowRunner
+              workflowDefinition={selectedWorkflow.definition}
+              onComplete={handleWorkflowComplete}
+              orderId={selectedOrder?.id} // Order gating - only pass if order selected
+              testGroupId={selectedOrder?.test_group_name ? 'test-group-id' : undefined}
+            />
           </div>
         </div>
       )}
 
-      {/* Help Section */}
+      {/* Instructions */}
       <div className="mt-8 bg-gray-50 rounded-lg p-6">
-        <h3 className="text-lg font-semibold mb-4">📋 Testing Instructions</h3>
-        <div className="space-y-3 text-sm">
-          <div>
-            <strong>1. Select Workflow:</strong> Choose from workflows stored in your database
-          </div>
-          <div>
-            <strong>2. Execute Steps:</strong> Follow the Survey.js interface to complete each step
-          </div>
-          <div>
-            <strong>3. Submit Results:</strong> Click "Complete" to save results to database
-          </div>
-          <div>
-            <strong>4. Verify Data:</strong> Check your database tables to see the stored results
-          </div>
-        </div>
-
-        <div className="mt-4 p-4 bg-white rounded border">
-          <h4 className="font-medium mb-2">Available Workflows:</h4>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
-            {availableWorkflows.map(workflow => (
-              <div key={workflow.id} className="p-2 bg-gray-50 rounded">
-                <div className="font-medium">{workflow.name}</div>
-                <div className="text-gray-600">Scope: {workflow.scope}</div>
-                <div className="text-gray-600">Version: {workflow.version}</div>
-              </div>
-            ))}
-          </div>
-        </div>
+        <h3 className="font-semibold mb-3">How to Test Order Gating</h3>
+        <ol className="list-decimal list-inside space-y-2 text-sm text-gray-600">
+          <li>Select an order from the left panel (required)</li>
+          <li>Select a workflow from the right panel</li>
+          <li>Try to complete the workflow - it will only work with an order selected</li>
+          <li>If no order is selected, you'll see a blocking message</li>
+          <li>Results will be properly linked to the selected order</li>
+        </ol>
       </div>
     </div>
-  );
-};
-
-export default WorkflowDemo;
+  )
+}
