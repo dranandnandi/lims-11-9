@@ -169,6 +169,26 @@ interface OrderDetailsModalProps {
   onSubmitResults: (orderId: string, resultsData: ExtractedValue[]) => void;
 }
 
+interface TestGroupResult {
+  test_group_id: string
+  test_group_name: string
+  analytes: {
+    id: string
+    name: string
+    code: string
+    units?: string
+    reference_range?: string
+    normal_range_min?: number
+    normal_range_max?: number
+    existing_result?: {
+      id: string
+      value: string
+      status: string
+      verified_at?: string
+    }
+  }[]
+}
+
 const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
   order,
   onClose,
@@ -193,6 +213,9 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
   const [savingDraft, setSavingDraft] = useState(false);
   const [submittingResults, setSubmittingResults] = useState(false);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
+  const [testGroups, setTestGroups] = useState<TestGroupResult[]>([])
+  const [selectedTestGroup, setSelectedTestGroup] = useState<string>()
+  const [activeEntryMode, setActiveEntryMode] = useState<'manual' | 'ai'>('manual')
 
   // Function to generate QR code as data URL for display
   const generateQRCodeDataURL = async (data: string): Promise<string> => {
@@ -289,25 +312,176 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
     try {
       const { data: orderData, error: orderError } = await database.orders.getById(order.id);
       if (orderError || !orderData) return;
-      const testNames = orderData.order_tests?.map((test: any) => test.test_name) || order.tests;
 
-      const { data: testGroups, error: testGroupsError } = await supabase
-        .from('test_groups')
+      // Enhanced query using both order_test_groups and order_tests tables
+      const { data, error } = await supabase
+        .from('orders')
         .select(`
-          id, name,
-          test_group_analytes(
-            analytes(id, name, unit, reference_range, ai_processing_type, ai_prompt_override, group_ai_mode)
+          id,
+          lab_id,
+          patient_id,
+          patient_name,
+          order_test_groups(
+            id,
+            test_group_id,
+            test_name,
+            price,
+            test_groups(
+              id,
+              name,
+              code,
+              lab_id,
+              test_group_analytes(
+                analyte_id,
+                analytes(
+                  id,
+                  name,
+                  unit,
+                  reference_range,
+                  ai_processing_type,
+                  ai_prompt_override
+                )
+              )
+            )
+          ),
+          order_tests(
+            id,
+            test_name,
+            test_group_id,
+            sample_id,
+            test_groups(
+              id,
+              name,
+              code,
+              lab_id,
+              test_group_analytes(
+                analyte_id,
+                analytes(
+                  id,
+                  name,
+                  unit,
+                  reference_range,
+                  ai_processing_type,
+                  ai_prompt_override
+                )
+              )
+            )
+          ),
+          samples(
+            id,
+            sample_type,
+            barcode,
+            status,
+            collected_at,
+            collected_by
+          ),
+          results(
+            id,
+            order_id,
+            test_name,
+            status,
+            verified_at,
+            verified_by,
+            created_at,
+            order_test_group_id,
+            order_test_id,
+            test_group_id,
+            lab_id,
+            result_values(
+              id,
+              analyte_name,
+              value,
+              unit,
+              reference_range,
+              flag,
+              analyte_id,
+              order_test_group_id,
+              order_test_id
+            )
           )
         `)
-        .in('name', testNames);
-      if (testGroupsError) return;
+        .eq('id', order.id)
+        .single()
 
-      const collected: any[] = [];
-      testNames.forEach((tn: string) => {
-        const tg = testGroups?.find(t => t.name === tn);
-        if (tg?.test_group_analytes) collected.push(...tg.test_group_analytes.map((tga: any) => tga.analytes));
-      });
-      if (collected.length > 0) setOrderAnalytes(collected);
+      if (error) throw error
+
+      // Combine test groups from both order_test_groups and order_tests
+      const testGroupsFromOrderTestGroups = data.order_test_groups ? data.order_test_groups
+        .filter(otg => otg.test_groups)
+        .map(otg => ({
+          test_group_id: otg.test_groups.id,
+          test_group_name: otg.test_groups.name,
+          order_test_group_id: otg.id,
+          order_test_id: null,
+          source: 'order_test_groups',
+          analytes: otg.test_groups.test_group_analytes?.map(tga => ({
+            ...tga.analytes,
+            code: otg.test_groups.code,
+            units: tga.analytes.unit,
+            existing_result: data.results?.find(r => 
+              r.order_test_group_id === otg.id
+            )?.result_values?.find(rv => rv.analyte_id === tga.analytes.id)
+          })) || []
+        })) : []
+
+      const testGroupsFromOrderTests = data.order_tests ? data.order_tests
+        .filter(ot => ot.test_groups && ot.test_group_id)
+        .map(ot => ({
+          test_group_id: ot.test_groups.id,
+          test_group_name: ot.test_groups.name,
+          order_test_group_id: null,
+          order_test_id: ot.id,
+          source: 'order_tests',
+          analytes: ot.test_groups.test_group_analytes?.map(tga => ({
+            ...tga.analytes,
+            code: ot.test_groups.code,
+            units: tga.analytes.unit,
+            existing_result: data.results?.find(r => 
+              r.order_test_id === ot.id
+            )?.result_values?.find(rv => rv.analyte_id === tga.analytes.id)
+          })) || []
+        })) : []
+
+      // Merge and deduplicate test groups
+      const allTestGroups = [...testGroupsFromOrderTestGroups, ...testGroupsFromOrderTests]
+      const uniqueTestGroups = allTestGroups.reduce((acc, current) => {
+        const existingIndex = acc.findIndex(tg => tg.test_group_id === current.test_group_id)
+        if (existingIndex === -1) {
+          acc.push(current)
+        } else {
+          // Merge analytes if same test group from different sources
+          const existing = acc[existingIndex]
+          const mergedAnalytes = [...existing.analytes]
+          current.analytes.forEach(analyte => {
+            if (!mergedAnalytes.find(ma => ma.id === analyte.id)) {
+              mergedAnalytes.push(analyte)
+            }
+          })
+          acc[existingIndex] = {
+            ...existing,
+            analytes: mergedAnalytes,
+            // Prefer order_test_groups if available
+            order_test_group_id: existing.order_test_group_id || current.order_test_group_id,
+            order_test_id: existing.order_test_id || current.order_test_id
+          }
+        }
+        return acc
+      }, [] as typeof allTestGroups)
+
+      setTestGroups(uniqueTestGroups)
+
+      // Set manual values based on test groups
+      const allAnalytes = uniqueTestGroups.flatMap(tg => tg.analytes)
+      setManualValues(allAnalytes.map((analyte) => ({
+        parameter: analyte.name,
+        value: analyte.existing_result?.value || '',
+        unit: analyte.units || analyte.unit || '',
+        reference: analyte.reference_range || '',
+        flag: analyte.existing_result?.flag || undefined
+      })))
+
+      // Also set orderAnalytes for backward compatibility
+      setOrderAnalytes(allAnalytes)
     } catch (err) {
       console.error('Error fetching order analytes:', err);
     }
@@ -532,89 +706,79 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
     setSaveMessage(null);
 
     try {
-      // Group results by test name for better organization
-      const testGroups = validResults.reduce((acc, result) => {
-        const testName = result.parameter.split(' - ')[0] || order.tests[0] || 'General Test';
-        if (!acc[testName]) acc[testName] = [];
-        acc[testName].push(result);
-        return acc;
-      }, {} as Record<string, typeof validResults>);
-
-      let successCount = 0;
-      let errorCount = 0;
+      const currentUser = await supabase.auth.getUser();
+      const userLabId = await database.getCurrentUserLabId();
 
       // Process each test group
-      for (const [testName, testResults] of Object.entries(testGroups)) {
-        try {
-          // Use the new insert_or_update_result function
-          const { data: resultId, error } = await supabase
-            .rpc('insert_or_update_result', {
-              p_order_id: order.id,
-              p_test_name: testName,
-              p_patient_id: order.patient_id,
-              p_patient_name: order.patient_name,
-              p_entered_by: user?.email || 'Unknown',
-              p_value: testResults.length === 1 ? testResults[0].value : 'Multiple values',
-              p_unit: testResults.length === 1 ? testResults[0].unit : '',
-              p_reference_range: testResults.length === 1 ? testResults[0].reference : '',
-              p_flag: testResults.length === 1 ? testResults[0].flag : null,
-              p_attachment_id: attachmentId || null,
-              p_technician_notes: `AI processed results: ${testResults.map(r => `${r.parameter}: ${r.value}`).join(', ')}`
-            });
+      for (const testGroup of testGroups) {
+        const testGroupResults = validResults.filter(v => 
+          testGroup.analytes.some(a => a.name === v.parameter)
+        );
 
-          if (error) {
-            console.error(`Error saving result for ${testName}:`, error);
-            errorCount++;
-            continue;
+        if (testGroupResults.length === 0) continue;
+
+        try {
+          // Create result record with proper schema fields for both sources
+          const resultData = {
+            order_id: order.id,
+            patient_id: order.patient_id,
+            patient_name: order.patient_name,
+            test_name: testGroup.test_group_name,
+            status: 'pending_verification',
+            entered_by: currentUser.data.user?.email || 'Unknown User',
+            entered_date: new Date().toISOString().split('T')[0],
+            test_group_id: testGroup.test_group_id,
+            lab_id: userLabId,
+            extracted_by_ai: !!attachmentId,
+            ai_confidence: ocrResults?.metadata?.ocrConfidence || null,
+            attachment_id: attachmentId || null,
+            ...(testGroup.order_test_group_id && { order_test_group_id: testGroup.order_test_group_id }),
+            ...(testGroup.order_test_id && { order_test_id: testGroup.order_test_id })
           }
 
-          // Save individual analyte values if multiple results for this test
-          if (testResults.length > 1 && resultId) {
-            // Delete existing values first
-            await supabase
-              .from('result_values')
-              .delete()
-              .eq('result_id', resultId);
+          const { data: savedResult, error: resultError } = await supabase
+            .from('results')
+            .insert(resultData)
+            .select()
+            .single();
 
-            // Insert new values
-            const valuesToInsert = testResults.map((result, index) => ({
-              result_id: resultId,
+          if (resultError) throw resultError;
+
+          // Insert result_values with proper relationships
+          const resultValuesData = testGroupResults.map(result => {
+            const analyte = testGroup.analytes.find(a => a.name === result.parameter);
+            return {
+              result_id: savedResult.id,
+              analyte_id: analyte?.id,
               analyte_name: result.parameter,
+              parameter: result.parameter,
               value: result.value,
               unit: result.unit || '',
               reference_range: result.reference || '',
               flag: result.flag || null,
-              sequence_number: index + 1
-            }));
+              order_id: order.id,
+              test_group_id: testGroup.test_group_id,
+              lab_id: userLabId,
+              ...(testGroup.order_test_group_id && { order_test_group_id: testGroup.order_test_group_id }),
+              ...(testGroup.order_test_id && { order_test_id: testGroup.order_test_id })
+            };
+          });
 
-            const { error: valuesError } = await supabase
-              .from('result_values')
-              .insert(valuesToInsert);
+          const { error: valuesError } = await supabase
+            .from('result_values')
+            .insert(resultValuesData);
 
-            if (valuesError) {
-              console.error('Error saving analyte values:', valuesError);
-            }
-          }
+          if (valuesError) throw valuesError;
 
-          successCount++;
         } catch (testError) {
-          console.error(`Error processing test ${testName}:`, testError);
-          errorCount++;
+          console.error(`Error processing test group ${testGroup.test_group_name}:`, testError);
         }
       }
 
-      // Show appropriate message
-      if (successCount > 0 && errorCount === 0) {
-        setSaveMessage(`Successfully saved ${successCount} test result(s)!`);
-        setTimeout(() => onSubmitResults(order.id, validResults), 500);
-      } else if (successCount > 0 && errorCount > 0) {
-        setSaveMessage(`Saved ${successCount} test(s), ${errorCount} failed. Check console for details.`);
-        setTimeout(() => onSubmitResults(order.id, validResults), 500);
-      } else {
-        setSaveMessage('Failed to save results. Please try again.');
-      }
-      
+      setSaveMessage('Successfully saved test results!');
+      setTimeout(() => onSubmitResults(order.id, validResults), 500);
       setTimeout(() => setSaveMessage(null), 5000);
+
     } catch (err) {
       console.error('Error submitting results:', err);
       setSaveMessage('Failed to submit results. Please try again.');
@@ -693,6 +857,129 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
       <input id="file-upload" type="file" accept={aiProcessingConfig?.type === 'ocr_report' ? 'image/*,.pdf' : 'image/*'} onChange={handleFileInputChange} className="hidden" />
     </div>
   );
+
+  // Test Group Result Entry Component (similar to ResultIntake.tsx)
+  const TestGroupResultEntry: React.FC<{
+    testGroup: TestGroupResult
+    entryMode: 'manual' | 'ai'
+  }> = ({ testGroup, entryMode }) => {
+    const testGroupValues = manualValues.filter(v => 
+      testGroup.analytes.some(a => a.name === v.parameter)
+    )
+    
+    const completedCount = testGroupValues.filter(v => v.value.trim()).length
+
+    return (
+      <div className="border border-gray-200 rounded-lg p-4 mb-4">
+        <div className="flex items-center justify-between mb-4">
+          <h4 className="text-lg font-medium">{testGroup.test_group_name}</h4>
+          <div className="flex items-center space-x-3">
+            <span className="text-sm text-gray-500">
+              {completedCount}/{testGroupValues.length} completed
+            </span>
+            <div className="w-16 bg-gray-200 rounded-full h-2">
+              <div 
+                className="bg-blue-600 h-2 rounded-full transition-all"
+                style={{ width: `${(completedCount / testGroupValues.length) * 100}%` }}
+              />
+            </div>
+          </div>
+        </div>
+
+        {entryMode === 'ai' && (
+          <div className="mb-4 p-3 bg-purple-50 border border-purple-200 rounded-lg">
+            <h5 className="text-sm font-medium text-purple-900 mb-2">AI Processing for {testGroup.test_group_name}</h5>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {testGroup.analytes.map((analyte) => (
+                <div
+                  key={analyte.id}
+                  onClick={() => handleSelectAnalyteForAI(analyte)}
+                  className={`p-2 border rounded cursor-pointer transition-all ${
+                    selectedAnalyteForAI?.id === analyte.id ? 'border-purple-500 bg-purple-100' : 'border-gray-200 hover:border-gray-300'
+                  }`}
+                >
+                  <div className="text-sm font-medium">{analyte.name}</div>
+                  <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${getAIProcessingTypeColor(analyte.ai_processing_type || 'none')}`}>
+                    {getAIProcessingTypeLabel(analyte.ai_processing_type || 'none')}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div className="overflow-x-auto">
+          <table className="min-w-full divide-y divide-gray-200">
+            <thead className="bg-gray-50">
+              <tr>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Parameter</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Value</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Unit</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Reference Range</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Flag</th>
+              </tr>
+            </thead>
+            <tbody className="bg-white divide-y divide-gray-200">
+              {testGroupValues.map((value, index) => {
+                const globalIndex = manualValues.findIndex(v => v.parameter === value.parameter)
+                const analyte = testGroup.analytes.find(a => a.name === value.parameter)
+                
+                return (
+                  <tr key={index} className="hover:bg-gray-50">
+                    <td className="px-4 py-3 text-sm font-medium text-gray-900">
+                      <div>{value.parameter}</div>
+                      <div className="text-xs text-gray-500">({analyte?.code})</div>
+                      {analyte?.existing_result && (
+                        <div className="text-xs text-green-600 mt-1">
+                          Current: {analyte.existing_result.value}
+                        </div>
+                      )}
+                    </td>
+                    <td className="px-4 py-3">
+                      <input 
+                        type="text" 
+                        value={value.value} 
+                        onChange={(e) => handleManualValueChange(globalIndex, 'value', e.target.value)} 
+                        className="w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500" 
+                        placeholder="Enter value" 
+                      />
+                    </td>
+                    <td className="px-4 py-3">
+                      <input 
+                        type="text" 
+                        value={value.unit} 
+                        onChange={(e) => handleManualValueChange(globalIndex, 'unit', e.target.value)} 
+                        className="w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500" 
+                        placeholder="Unit" 
+                      />
+                    </td>
+                    <td className="px-4 py-3">
+                      <input 
+                        type="text" 
+                        value={value.reference} 
+                        onChange={(e) => handleManualValueChange(globalIndex, 'reference', e.target.value)} 
+                        className="w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500" 
+                        placeholder="Reference range" 
+                      />
+                    </td>
+                    <td className="px-4 py-3">
+                      <select 
+                        value={value.flag || ''} 
+                        onChange={(e) => handleManualValueChange(globalIndex, 'flag', e.target.value)} 
+                        className="w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      >
+                        {FLAG_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+                      </select>
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center z-50 p-4">
@@ -916,54 +1203,6 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                   AI-Powered Result Processing
                 </h3>
 
-                {/* Analyte AI Configuration Display */}
-                {orderAnalytes.length > 0 && (
-                  <div className="mb-6">
-                    <h4 className="text-sm font-medium text-purple-900 mb-3">Available AI Processing for Order Analytes</h4>
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                      {orderAnalytes.map((analyte) => (
-                        <div
-                          key={analyte.id}
-                          onClick={() => handleSelectAnalyteForAI(analyte)}
-                          className={`p-3 border-2 rounded-lg cursor-pointer transition-all ${selectedAnalyteForAI?.id === analyte.id ? 'border-purple-500 bg-purple-50' : 'border-gray-200 hover:border-gray-300 hover:bg-gray-50'}`}
-                        >
-                          <div className="flex items-center justify-between">
-                            <div className="flex-1">
-                              <div className="text-sm font-medium text-gray-900">{analyte.name}</div>
-                              <div className="text-xs text-gray-500">{analyte.category}</div>
-                            </div>
-                            <span className={`inline-flex items-center px-2 py-1 rounded text-xs font-medium ${getAIProcessingTypeColor(analyte.ai_processing_type || 'none')}`}>
-                              {getAIProcessingTypeLabel(analyte.ai_processing_type || 'none')}
-                            </span>
-                          </div>
-                          {analyte.ai_prompt_override && (
-                            <div className="mt-2 text-xs text-purple-600 bg-purple-100 px-2 py-1 rounded">Custom AI prompt configured</div>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-
-                    {selectedAnalyteForAI && (
-                      <div className="mt-4 p-3 bg-white border border-purple-200 rounded-lg">
-                        <h5 className="text-sm font-medium text-purple-900 mb-2">AI Configuration for {selectedAnalyteForAI.name}</h5>
-                        <div className="grid grid-cols-2 gap-4 text-xs text-purple-800">
-                          <div><div className="font-medium">Processing Type:</div><div>{getAIProcessingTypeLabel(selectedAnalyteForAI.ai_processing_type || 'none')}</div></div>
-                          <div><div className="font-medium">Custom Prompt:</div><div>{selectedAnalyteForAI.ai_prompt_override ? 'Yes' : 'Default'}</div></div>
-                        </div>
-                        {selectedAnalyteForAI.ai_prompt_override && (
-                          <div className="mt-2 p-2 bg-purple-50 border border-purple-200 rounded text-xs">
-                            <div className="font-medium text-purple-900 mb-1">Custom Prompt:</div>
-                            <div className="text-purple-800 italic">
-                              {selectedAnalyteForAI.ai_prompt_override.substring(0, 100)}
-                              {selectedAnalyteForAI.ai_prompt_override.length > 100 ? '...' : ''}
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                )}
-
                 <div className="space-y-4">
                   {/* File Upload */}
                   {renderFileUpload()}
@@ -974,7 +1213,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                       <button
                         onClick={() => handleRunAIProcessing()}
                         disabled={isOCRProcessing}
-                        className="w-full flex items-center justify-center px-4 py-3 bg-gradient-to-r from-purple-600 to-blue-600 text-white rounded-lg hover:from-purple-700 hover:to-blue-700 disabled:from-gray-400 disabled:to-gray-400 disabled:cursor-not-allowed transition-all"
+                        className="w-full flex items-center justify-center px-4 py-3 bg-gradient-to-r from-purple-600 to-blue-600 text-white rounded-lg hover:from-purple-700 hover:to-blue-700 disabled:from-gray-400 disabled:to-gray-400 disabled:cursor-not-allowed transition-colors"
                       >
                         {isOCRProcessing ? (
                           <>
@@ -990,6 +1229,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                         )}
                       </button>
 
+                      {/* Processing status display */}
                       {isOCRProcessing && (
                         <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
                           <div className="text-sm text-blue-800 space-y-1">
@@ -1029,93 +1269,90 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                         <div className="text-center"><div className="text-lg font-bold text-purple-600">{(extractedValues as any[]).filter(v => (v as any).matched).length}</div><div className="text-xs text-purple-700">DB Matched</div></div>
                         <div className="text-center"><div className="text-lg font-bold text-orange-600">{Math.round((ocrResults.metadata?.ocrConfidence || 0.95) * 100)}%</div><div className="text-xs text-orange-700">Confidence</div></div>
                       </div>
-                      <div className="text-xs text-green-600 bg-white border border-green-200 rounded p-2">
-                        <strong>Processing Method:</strong> {ocrResults.metadata?.processingMethod || 'Google Vision AI + Gemini NLP'}
-                        {aiProcessingConfig?.prompt && <div className="mt-1"><strong>Custom Prompt:</strong> Applied</div>}
-                      </div>
                     </div>
                   )}
                 </div>
               </div>
 
-              {/* AI OCR Extracted Results Display */}
-              {extractedValues.length > 0 && (
-                <div className="bg-white border border-gray-200 rounded-lg p-6">
-                  <h3 className="text-lg font-semibold text-gray-900 mb-4 flex items-center">
-                    <Target className="h-5 w-5 mr-2 text-green-600" />
-                    AI OCR Extracted Results
-                  </h3>
-                  <div className="overflow-x-auto">
-                    <table className="min-w-full divide-y divide-gray-200">
-                      <thead className="bg-gray-50">
-                        <tr>
-                          <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Parameter</th>
-                          <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Value</th>
-                          <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Unit</th>
-                          <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Reference Range</th>
-                          <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Flag</th>
-                          <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">DB Match</th>
-                          <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Confidence</th>
-                        </tr>
-                      </thead>
-                      <tbody className="bg-white divide-y divide-gray-200">
-                        {extractedValues.map((value, index) => (
-                          <tr key={index} className="hover:bg-gray-50">
-                            <td className="px-4 py-3 text-sm font-medium text-gray-900">{value.parameter}</td>
-                            <td className="px-4 py-3 text-sm font-bold text-gray-900">{value.value}</td>
-                            <td className="px-4 py-3 text-sm text-gray-600">{value.unit}</td>
-                            <td className="px-4 py-3 text-sm text-gray-600">{value.reference}</td>
-                            <td className="px-4 py-3 text-sm">{value.flag && (<span className={`inline-flex items-center px-2 py-1 rounded text-xs font-medium ${getFlagColor(value.flag)}`}>{value.flag}</span>)}</td>
-                            <td className="px-4 py-3 text-sm">{(value as any).matched ? (<span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800"><CheckCircle className="h-3 w-3 mr-1" />Matched</span>) : (<span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-yellow-100 text-yellow-800">New</span>)}</td>
-                            <td className="px-4 py-3 text-sm">{(value as any).confidence && (<span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${getConfidenceColor((value as any).confidence)}`}>{Math.round((value as any).confidence * 100)}%</span>)}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
+              {/* Test Group Selection */}
+              {testGroups.length > 1 && (
+                <div className="bg-white border border-gray-200 rounded-lg p-4">
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Select Test Group
+                  </label>
+                  <select
+                    value={selectedTestGroup || ''}
+                    onChange={(e) => setSelectedTestGroup(e.target.value)}
+                    className="w-full border border-gray-300 rounded-md px-3 py-2 focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                  >
+                    <option value="">All Test Groups</option>
+                    {testGroups.map(tg => (
+                      <option key={tg.test_group_id} value={tg.test_group_id}>
+                        {tg.test_group_name} ({tg.analytes.length} analytes)
+                      </option>
+                    ))}
+                  </select>
                 </div>
               )}
 
-              {/* Manual Result Entry */}
+              {/* Entry Mode Toggle */}
+              <div className="bg-white border border-gray-200 rounded-lg p-4">
+                <div className="flex items-center space-x-4">
+                  <h3 className="text-lg font-semibold">Result Entry Mode</h3>
+                  <div className="flex bg-gray-100 rounded-lg p-1">
+                    <button
+                      onClick={() => setActiveEntryMode('manual')}
+                      className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
+                        activeEntryMode === 'manual'
+                          ? 'bg-white text-blue-600 shadow-sm'
+                          : 'text-gray-600 hover:text-gray-900'
+                      }`}
+                    >
+                      Manual Entry
+                    </button>
+                    <button
+                      onClick={() => setActiveEntryMode('ai')}
+                      className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
+                        activeEntryMode === 'ai'
+                          ? 'bg-white text-blue-600 shadow-sm'
+                          : 'text-gray-600 hover:text-gray-900'
+                      }`}
+                    >
+                      AI Upload
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Test Group Results Display */}
               <div className="bg-white border border-gray-200 rounded-lg p-6">
-                <div className="flex items-center justify-between mb-4">
-                  <h3 className="text-lg font-semibold text-gray-900">Manual Result Entry & Verification</h3>
-                  {selectedAnalyteForAI && <div className="text-sm text-purple-600 bg-purple-100 px-3 py-1 rounded">AI Config: {selectedAnalyteForAI.name}</div>}
-                </div>
-                <div className="overflow-x-auto">
-                  <table className="min-w-full divide-y divide-gray-200">
-                    <thead className="bg-gray-50">
-                      <tr>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Parameter</th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Value</th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Unit</th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Reference Range</th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Flag</th>
-                      </tr>
-                    </thead>
-                    <tbody className="bg-white divide-y divide-gray-200">
-                      {manualValues.map((value, index) => (
-                        <tr key={index} className="hover:bg-gray-50">
-                          <td className="px-4 py-3 text-sm font-medium text-gray-900">{value.parameter}</td>
-                          <td className="px-4 py-3">
-                            <input type="text" value={value.value} onChange={(e) => handleManualValueChange(index, 'value', e.target.value)} className="w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500" placeholder="Enter value" />
-                          </td>
-                          <td className="px-4 py-3">
-                            <input type="text" value={value.unit} onChange={(e) => handleManualValueChange(index, 'unit', e.target.value)} className="w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500" placeholder="Unit" />
-                          </td>
-                          <td className="px-4 py-3">
-                            <input type="text" value={value.reference} onChange={(e) => handleManualValueChange(index, 'reference', e.target.value)} className="w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500" placeholder="Reference range" />
-                          </td>
-                          <td className="px-4 py-3">
-                            <select value={value.flag || ''} onChange={(e) => handleManualValueChange(index, 'flag', e.target.value)} className="w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500">
-                              {FLAG_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
-                            </select>
-                          </td>
-                        </tr>
+                <h3 className="text-lg font-semibold text-gray-900 mb-4">
+                  Test Group Results {selectedTestGroup && `- ${testGroups.find(tg => tg.test_group_id === selectedTestGroup)?.test_group_name}`}
+                </h3>
+                
+                {testGroups.length === 0 ? (
+                  <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+                    <div className="flex items-center text-yellow-800">
+                      <AlertTriangle className="h-5 w-5 mr-2" />
+                      <div>
+                        <p className="font-semibold">No Test Groups Found</p>
+                        <p className="text-sm">This order doesn't have any test groups configured for result entry.</p>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="space-y-4">
+                    {testGroups
+                      .filter(tg => !selectedTestGroup || tg.test_group_id === selectedTestGroup)
+                      .map(testGroup => (
+                        <TestGroupResultEntry
+                          key={testGroup.test_group_id}
+                          testGroup={testGroup}
+                          entryMode={activeEntryMode}
+                        />
                       ))}
-                    </tbody>
-                  </table>
-                </div>
+                  </div>
+                )}
 
                 {saveMessage && (
                   <div className={`mt-4 p-3 rounded-lg ${saveMessage.includes('successfully') ? 'bg-green-50 border border-green-200 text-green-700' : 'bg-red-50 border border-red-200 text-red-700'}`}>

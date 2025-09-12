@@ -4,18 +4,18 @@ import { supabase } from '../../utils/supabase'
 interface TestGroupResult {
   test_group_id: string
   test_group_name: string
-  order_test_group_id?: string | null
-  order_test_id?: string | null
   analytes: {
     id: string
     name: string
     code: string
     units?: string
     reference_range?: string
+    normal_range_min?: number
+    normal_range_max?: number
     existing_result?: {
       id: string
       value: string
-      flag?: string
+      status: string
       verified_at?: string
     }
   }[]
@@ -30,9 +30,6 @@ interface ResultIntakeProps {
     test_groups: TestGroupResult[]
     sample_id?: string
     status: string
-    // Optional legacy fields for backward compatibility
-    test_group_id?: string
-    test_code?: string
   }
   onResultProcessed?: (resultId: string) => void
 }
@@ -73,6 +70,11 @@ const ManualResultEntry: React.FC<{
           <div>
             <span className="font-medium">{analyte.name}</span>
             <span className="text-sm text-gray-500 ml-2">({analyte.code})</span>
+            {analyte.existing_result && (
+              <div className="text-xs text-green-600 mt-1">
+                Current: {analyte.existing_result.value}
+              </div>
+            )}
           </div>
           <div className="flex items-center space-x-2">
             <input
@@ -351,60 +353,34 @@ const TestGroupResultEntry: React.FC<{
     setError(null)
 
     try {
-      const currentUser = await supabase.auth.getUser();
-      const userLabId = currentUser.data.user?.user_metadata?.lab_id;
+      // Submit results using supabase directly since database object might not have this method
+      const resultPromises = validResults.map(([analyteId, value]) => 
+        supabase
+          .from('results')
+          .insert({
+            order_id: orderId,
+            analyte_id: analyteId,
+            test_group_id: testGroup.test_group_id,
+            value: value.trim(),
+            status: 'pending_verification',
+            created_at: new Date().toISOString()
+          })
+          .select()
+          .single()
+      )
 
-      // Create result with proper schema structure for both sources
-      const resultData = {
-        order_id: orderId,
-        patient_id: '', // This should be passed from parent
-        patient_name: '', // This should be passed from parent
-        test_name: testGroup.test_group_name,
-        status: 'pending_verification',
-        entered_by: currentUser.data.user?.email || 'Unknown User',
-        entered_date: new Date().toISOString().split('T')[0],
-        test_group_id: testGroup.test_group_id,
-        lab_id: userLabId,
-        ...(testGroup.order_test_group_id && { order_test_group_id: testGroup.order_test_group_id }),
-        ...(testGroup.order_test_id && { order_test_id: testGroup.order_test_id })
+      const savedResults = await Promise.all(resultPromises)
+      
+      // Check for errors
+      const errors = savedResults.filter(r => r.error)
+      if (errors.length > 0) {
+        throw new Error(`Failed to save ${errors.length} results`)
       }
 
-      const { data: savedResult, error } = await supabase
-        .from('results')
-        .insert(resultData)
-        .select()
-        .single()
-
-      if (error) throw error
-
-      // Insert result_values with proper relationships
-      const resultValuesData = validResults.map(([analyteId, value]) => {
-        const analyte = testGroup.analytes.find(a => a.id === analyteId)
-        return {
-          result_id: savedResult.id,
-          analyte_id: analyteId,
-          analyte_name: analyte?.name || '',
-          parameter: analyte?.name || '',
-          value: value.trim(),
-          unit: analyte?.units || '',
-          reference_range: analyte?.reference_range || '',
-          flag: null, // Will be calculated based on reference ranges
-          order_id: orderId,
-          test_group_id: testGroup.test_group_id,
-          lab_id: userLabId,
-          ...(testGroup.order_test_group_id && { order_test_group_id: testGroup.order_test_group_id }),
-          ...(testGroup.order_test_id && { order_test_id: testGroup.order_test_id })
-        }
-      })
-
-      const { error: valuesError } = await supabase
-        .from('result_values')
-        .insert(resultValuesData)
-
-      if (valuesError) throw valuesError
-
       // Notify parent component
-      onResultProcessed(savedResult.id)
+      savedResults.forEach(result => {
+        if (result.data) onResultProcessed(result.data.id)
+      })
 
       // Clear form
       setResults({})

@@ -28,6 +28,7 @@ export default function OrderDetail() {
   const navigate = useNavigate()
   const [order, setOrder] = useState<Order | null>(null)
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<'details' | 'results' | 'audit'>('details')
   const [workflowResultId, setWorkflowResultId] = useState<string>()
 
@@ -43,24 +44,100 @@ export default function OrderDetail() {
       if (!id) return
 
       try {
-        // Load order with related data
+        setLoading(true)
+        
+        // Enhanced query using both order_test_groups and order_tests tables
         const { data, error } = await supabase
           .from('orders')
           .select(`
             *,
             patients!inner(
+              id,
               name,
-              dob,
-              gender
+              age,
+              gender,
+              phone
             ),
-            test_groups(
-              name
+            order_test_groups(
+              id,
+              test_group_id,
+              test_name,
+              price,
+              test_groups(
+                id,
+                name,
+                code,
+                category,
+                lab_id,
+                test_group_analytes(
+                  analyte_id,
+                  analytes(
+                    id,
+                    name,
+                    unit,
+                    reference_range,
+                    ai_processing_type,
+                    ai_prompt_override
+                  )
+                )
+              )
+            ),
+            order_tests(
+              id,
+              test_name,
+              test_group_id,
+              sample_id,
+              test_groups(
+                id,
+                name,
+                code,
+                category,
+                lab_id,
+                test_group_analytes(
+                  analyte_id,
+                  analytes(
+                    id,
+                    name,
+                    unit,
+                    reference_range,
+                    ai_processing_type,
+                    ai_prompt_override
+                  )
+                )
+              )
             ),
             samples(
               id,
               sample_type,
-              collection_date,
-              status
+              barcode,
+              status,
+              collected_at,
+              collected_by,
+              container_type
+            ),
+            results(
+              id,
+              order_id,
+              test_name,
+              status,
+              verified_at,
+              verified_by,
+              created_at,
+              order_test_group_id,
+              order_test_id,
+              test_group_id,
+              lab_id,
+              result_values(
+                id,
+                analyte_name,
+                value,
+                unit,
+                reference_range,
+                flag,
+                analyte_id,
+                order_test_group_id,
+                order_test_id
+              )
             )
           `)
           .eq('id', id)
@@ -68,19 +145,80 @@ export default function OrderDetail() {
 
         if (error) throw error
 
-        // Format order data for component
-        const formattedOrder: Order = {
+        // Combine test groups from both order_test_groups and order_tests
+        const testGroupsFromOrderTestGroups = data.order_test_groups ? data.order_test_groups
+          .filter(otg => otg.test_groups)
+          .map(otg => ({
+            test_group_id: otg.test_groups.id,
+            test_group_name: otg.test_groups.name,
+            order_test_group_id: otg.id,
+            order_test_id: null,
+            analytes: otg.test_groups.test_group_analytes?.map(tga => ({
+              ...tga.analytes,
+              code: otg.test_groups.code,
+              units: tga.analytes.unit,
+              existing_result: data.results?.find(r => 
+                r.order_test_group_id === otg.id
+              )?.result_values?.find(rv => rv.analyte_id === tga.analytes.id)
+            })) || []
+          })) : []
+
+        const testGroupsFromOrderTests = data.order_tests ? data.order_tests
+          .filter(ot => ot.test_groups && ot.test_group_id)
+          .map(ot => ({
+            test_group_id: ot.test_groups.id,
+            test_group_name: ot.test_groups.name,
+            order_test_group_id: null,
+            order_test_id: ot.id,
+            analytes: ot.test_groups.test_group_analytes?.map(tga => ({
+              ...tga.analytes,
+              code: ot.test_groups.code,
+              units: tga.analytes.unit,
+              existing_result: data.results?.find(r => 
+                r.order_test_id === ot.id
+              )?.result_values?.find(rv => rv.analyte_id === tga.analytes.id)
+            })) || []
+          })) : []
+
+        // Merge and deduplicate test groups
+        const allTestGroups = [...testGroupsFromOrderTestGroups, ...testGroupsFromOrderTests]
+        const testGroups = allTestGroups.reduce((acc, current) => {
+          const existingIndex = acc.findIndex(tg => tg.test_group_id === current.test_group_id)
+          if (existingIndex === -1) {
+            acc.push(current)
+          } else {
+            // Merge analytes if same test group from different sources
+            const existing = acc[existingIndex]
+            const mergedAnalytes = [...existing.analytes]
+            current.analytes.forEach(analyte => {
+              if (!mergedAnalytes.find(ma => ma.id === analyte.id)) {
+                mergedAnalytes.push(analyte)
+              }
+            })
+            acc[existingIndex] = {
+              ...existing,
+              analytes: mergedAnalytes,
+              // Prefer order_test_groups if available
+              order_test_group_id: existing.order_test_group_id || current.order_test_group_id,
+              order_test_id: existing.order_test_id || current.order_test_id
+            }
+          }
+          return acc
+        }, [] as typeof allTestGroups)
+
+        const formattedOrder = {
           ...data,
           patient_name: data.patients?.name,
           patient_dob: data.patients?.dob,
           patient_gender: data.patients?.gender,
-          test_group_name: data.test_groups?.name,
-          sample_id: data.samples?.[0]?.id
+          test_groups: testGroups,
+          sample_id: data.samples?.[0]?.barcode || data.samples?.[0]?.id
         }
 
         setOrder(formattedOrder)
       } catch (err) {
         console.error('Error loading order:', err)
+        setError('Failed to load order details')
       } finally {
         setLoading(false)
       }
@@ -90,14 +228,8 @@ export default function OrderDetail() {
   }, [id])
 
   const handleResultProcessed = (resultId: string) => {
-    // Switch to audit tab and set result ID for tracking
     setWorkflowResultId(resultId)
     setActiveTab('audit')
-    
-    // Optionally refresh order data to show updated status
-    if (id) {
-      // Could reload order here if needed
-    }
   }
 
   const getStatusBadge = (status: string) => {
@@ -136,6 +268,25 @@ export default function OrderDetail() {
       <div className="flex items-center justify-center h-64">
         <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
         <span className="ml-2">Loading order...</span>
+      </div>
+    )
+  }
+
+  if (error) {
+    return (
+      <div className="text-center py-8">
+        <div className="flex flex-col items-center">
+          <svg className="h-12 w-12 text-red-400 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+          </svg>
+          <p className="text-red-500 text-lg">{error}</p>
+          <button
+            onClick={() => navigate('/orders')}
+            className="mt-4 px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700"
+          >
+            Back to Orders
+          </button>
+        </div>
       </div>
     )
   }
@@ -293,10 +444,9 @@ export default function OrderDetail() {
             order={{
               id: order.id,
               lab_id: order.lab_id,
-              test_group_id: order.test_group_id,
-              test_code: order.test_code,
               patient_id: order.patient_id,
               patient_name: order.patient_name,
+              test_groups: order.test_groups || [],
               sample_id: order.sample_id,
               status: order.status
             }}
