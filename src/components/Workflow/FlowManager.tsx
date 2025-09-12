@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Workflow, Play, Pause, CheckCircle, AlertTriangle, Loader2 } from 'lucide-react';
-import { WorkflowRunner } from './WorkflowRunner';
-import { WorkflowAPI } from '../../utils/workflowAPI';
+import WorkflowRunner from './WorkflowRunner';
+import { getWorkflows } from '../../utils/workflowAPI';
 import type { WorkflowDefinition, WorkflowInstance } from '../../types/workflow';
 
 interface FlowManagerProps {
@@ -266,10 +266,8 @@ export const FlowManager: React.FC<FlowManagerProps> = ({
       {currentFlow && currentFlowData && (
         <WorkflowRunner
           orderId={orderId}
-          workflowVersionId={currentFlowData.workflowVersionId}
-          definition={currentFlowData.definition}
+          workflowDefinition={currentFlowData.definition}
           onComplete={(results) => handleFlowComplete(currentFlow, results)}
-          onValidate={(isValid) => handleFlowValidation(currentFlow, isValid)}
         />
       )}
     </div>

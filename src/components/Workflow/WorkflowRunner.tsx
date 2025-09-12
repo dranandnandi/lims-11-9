@@ -1,293 +1,188 @@
-import React, { useState, useEffect, useCallback } from 'react';
-// import { Survey } from 'survey-react-ui';
-// import { Model } from 'survey-core';
-// import { useDebounce } from 'use-debounce';
-import { AlertCircle, CheckCircle, Loader2 } from 'lucide-react';
-import { WorkflowAPI } from '../../utils/workflowAPI';
-import type { WorkflowDefinition, ValidationState } from '../../types/workflow';
-
-// Temporary interfaces until Survey.js is installed
-interface Model {
-  data: any;
-  setVariable: (name: string, value: any) => void;
-  setValue: (name: string, value: any) => void;
-  showProgressBar: string;
-  progressBarType: string;
-  showTimerPanel: string;
-  maxTimeToFinish: number;
-  applyTheme: (theme: string) => void;
-  onValueChanged: { add: (handler: (sender: Model, options: any) => void) => void };
-  onCurrentPageChanged: { add: (handler: (sender: Model, options: any) => void) => void };
-  onComplete: { add: (handler: (sender: Model) => void) => void };
-}
-
-// Temporary hooks
-const useDebounce = (value: any, delay: number) => [value];
+import React, { useState, useEffect, useCallback } from 'react'
+import { Model } from 'survey-core'
+import { Survey } from 'survey-react-ui'
+import { submitWorkflowResults } from '../../utils/workflowAPI'
+import 'survey-core/defaultV2.min.css'
 
 interface WorkflowRunnerProps {
-  orderId: string;
-  workflowVersionId: string;
-  definition: WorkflowDefinition;
-  instanceId?: string;
-  onComplete: (results: any) => void;
-  onValidate?: (isValid: boolean) => void;
+  workflowDefinition: any
+  onComplete?: (results: any) => void
+  orderId?: string
+  testGroupId?: string
 }
 
-export const WorkflowRunner: React.FC<WorkflowRunnerProps> = ({
-  orderId,
-  workflowVersionId,
-  definition,
-  instanceId: propInstanceId,
+type WorkflowStatus = 'idle' | 'loading' | 'running' | 'completed' | 'error'
+
+const WorkflowRunner: React.FC<WorkflowRunnerProps> = ({
+  workflowDefinition,
   onComplete,
-  onValidate
+  orderId,
+  testGroupId
 }) => {
-  const [survey, setSurvey] = useState<Model | null>(null);
-  const [instanceId, setInstanceId] = useState<string | null>(propInstanceId || null);
-  const [validationState, setValidationState] = useState<ValidationState | null>(null);
-  const [isValidating, setIsValidating] = useState(false);
-  const [currentStep, setCurrentStep] = useState(1);
-  const [surveyData, setSurveyData] = useState<any>({});
+  const [survey, setSurvey] = useState<Model | null>(null)
+  const [status, setStatus] = useState<WorkflowStatus>('idle')
+  const [error, setError] = useState<string | null>(null)
+  const [isSubmitting, setIsSubmitting] = useState(false)
+  const [instanceId] = useState(() => crypto.randomUUID())
 
-  // Debounced validation
-  const [debouncedData] = useDebounce(surveyData, 500);
-
-  // Initialize survey
+  // Initialize Survey.js model when workflow definition changes
   useEffect(() => {
-    if (!definition.ui.template) return;
+    if (!workflowDefinition) return
 
     try {
-      // TODO: Replace with actual Survey.js implementation once packages are installed
-      // const surveyModel = new Model(definition.ui.template);
+      setStatus('loading')
       
-      const mockSurvey = {
-        data: {},
-        setVariable: (name: string, value: any) => console.log('setVariable:', name, value),
-        setValue: (name: string, value: any) => console.log('setValue:', name, value),
-        showProgressBar: "top",
-        progressBarType: "pages", 
-        showTimerPanel: "bottom",
-        maxTimeToFinish: 1800,
-        applyTheme: (theme: string) => console.log('applyTheme:', theme),
-        onValueChanged: { add: (handler: any) => console.log('onValueChanged added') },
-        onCurrentPageChanged: { add: (handler: any) => console.log('onCurrentPageChanged added') },
-        onComplete: { add: (handler: any) => console.log('onComplete added') }
-      };
+      // Create survey model from workflow definition
+      const surveyModel = new Model(workflowDefinition.ui?.template || workflowDefinition)
       
-      // Set runtime variables
-      mockSurvey.setVariable("orderId", orderId);
-      mockSurvey.setVariable("workflowVersionId", workflowVersionId);
-      mockSurvey.setVariable("instanceId", instanceId);
+      // Configure survey appearance and behavior
+      surveyModel.applyTheme({
+        colorPalette: 'light',
+        isPanelless: false
+      })
 
-      setSurvey(mockSurvey as any);
-    } catch (error) {
-      console.error('Failed to initialize survey:', error);
+      // Set up completion handler
+      surveyModel.onComplete.add(handleComplete)
+      
+      setSurvey(surveyModel)
+      setStatus('running')
+      setError(null)
+      
+    } catch (err) {
+      console.error('Error initializing workflow:', err)
+      setError('Failed to initialize workflow')
+      setStatus('error')
     }
-  }, [definition, orderId, workflowVersionId, instanceId]);
+  }, [workflowDefinition])
 
-  // Start workflow instance if needed
-  useEffect(() => {
-    if (!instanceId) {
-      startWorkflowInstance();
-    }
-  }, []);
-
-  // Perform validation when data changes
-  useEffect(() => {
-    if (debouncedData && Object.keys(debouncedData).length > 0) {
-      performValidation();
-    }
-  }, [debouncedData, currentStep]);
-
-  const startWorkflowInstance = async () => {
-    const newInstanceId = await WorkflowAPI.startWorkflow(orderId, workflowVersionId);
-    if (newInstanceId) {
-      setInstanceId(newInstanceId);
-    }
-  };
-
-  const handleValueChanged = useCallback((sender: Model, options: any) => {
-    setSurveyData({ ...sender.data });
-    
-    // Log data change event
-    if (instanceId) {
-      WorkflowAPI.logEvent({
-        instanceId,
-        stepId: currentStep,
-        eventType: 'VALIDATE',
-        payload: {
-          data: { field: options.name, value: options.value },
-          metadata: {
-            timestamp: new Date().toISOString()
-          }
-        }
-      });
-    }
-  }, [instanceId, currentStep]);
-
-  const handlePageChanged = useCallback((sender: Model, options: any) => {
-    const newStep = options.newCurrentPage?.index + 1 || 1;
-    setCurrentStep(newStep);
-
-    // Log page change event
-    if (instanceId) {
-      WorkflowAPI.logEvent({
-        instanceId,
-        stepId: newStep,
-        eventType: 'NEXT',
-        payload: {
-          data: sender.data,
-          metadata: {
-            timestamp: new Date().toISOString(),
-            previousStep: currentStep,
-            newStep
-          }
-        }
-      });
-    }
-  }, [instanceId, currentStep]);
-
-  const handleSurveyComplete = useCallback(async (sender: Model) => {
-    if (!instanceId) return;
-
-    // Complete the workflow
-    const success = await WorkflowAPI.completeWorkflow(instanceId, sender.data);
-    
-    if (success) {
-      onComplete(sender.data);
-    } else {
-      console.error('Failed to complete workflow');
-    }
-  }, [instanceId, onComplete]);
-
-  const performValidation = async () => {
-    if (!instanceId || isValidating) return;
-
-    setIsValidating(true);
-    
+  // Handle workflow completion
+  const handleComplete = useCallback(async (sender: any) => {
     try {
-      const result = await WorkflowAPI.validateStep(
-        workflowVersionId,
-        currentStep,
-        surveyData
-      );
+      setIsSubmitting(true)
       
-      setValidationState(result);
-      onValidate?.(result.ok);
-
-      // Update survey with validation results
-      if (survey) {
-        survey.setValue('__validate_result', result);
-      }
+      const surveyResults = sender.data
+      
+      // Submit results using the API
+      await submitWorkflowResults({
+        workflowInstanceId: instanceId,
+        stepId: 'final_results',
+        results: {
+          ...surveyResults,
+          test_name: workflowDefinition?.title || workflowDefinition?.meta?.title || 'Workflow Test',
+          patient_id: orderId,
+          patient_name: 'Test Patient'
+        },
+        orderId,
+        testGroupId
+      })
+      
+      setStatus('completed')
+      onComplete?.(surveyResults)
+      
     } catch (error) {
-      console.error('Validation failed:', error);
-      setValidationState({ ok: false, messages: ['Validation failed'] });
+      console.error('Error submitting workflow results:', error)
+      setError(error instanceof Error ? error.message : 'Failed to submit results')
+      setStatus('error')
     } finally {
-      setIsValidating(false);
+      setIsSubmitting(false)
     }
-  };
+  }, [instanceId, orderId, testGroupId, onComplete, workflowDefinition])
 
-  if (!survey) {
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (survey) {
+        survey.onComplete.clear()
+      }
+    }
+  }, [survey])
+
+  if (status === 'idle' || status === 'loading') {
     return (
-      <div className="flex items-center justify-center h-64">
-        <div className="text-center">
-          <Loader2 className="h-8 w-8 animate-spin mx-auto mb-2" />
-          <p className="text-gray-600">Loading workflow...</p>
+      <div className="bg-white rounded-lg border border-gray-200 p-6">
+        <div className="flex items-center justify-center">
+          <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-blue-600 mr-2"></div>
+          {status === 'loading' ? 'Loading workflow...' : 'Initializing...'}
         </div>
       </div>
-    );
+    )
+  }
+
+  if (status === 'error') {
+    return (
+      <div className="bg-white rounded-lg border border-gray-200 p-6">
+        <div className="flex items-center text-red-600 mb-4">
+          <svg className="h-6 w-6 mr-2" fill="currentColor" viewBox="0 0 20 20">
+            <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+          </svg>
+          <div>
+            <h3 className="font-semibold">Workflow Error</h3>
+            <p className="text-sm">{error}</p>
+          </div>
+        </div>
+        <button 
+          onClick={() => {
+            setStatus('idle')
+            setError(null)
+          }}
+          className="px-4 py-2 bg-gray-100 text-gray-700 rounded hover:bg-gray-200"
+        >
+          Retry
+        </button>
+      </div>
+    )
+  }
+
+  if (status === 'completed') {
+    return (
+      <div className="bg-white rounded-lg border border-gray-200 p-6">
+        <div className="flex items-center text-green-600 mb-4">
+          <svg className="h-6 w-6 mr-2" fill="currentColor" viewBox="0 0 20 20">
+            <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
+          </svg>
+          <h3 className="text-lg font-semibold">Workflow Completed Successfully</h3>
+        </div>
+        <p className="text-sm text-gray-600">
+          Your workflow has been completed and results have been saved.
+        </p>
+        <button 
+          onClick={() => {
+            setStatus('idle')
+            setSurvey(null)
+          }}
+          className="mt-4 px-4 py-2 bg-blue-100 text-blue-700 rounded hover:bg-blue-200"
+        >
+          Run Again
+        </button>
+      </div>
+    )
   }
 
   return (
-    <div className="workflow-runner bg-white rounded-lg shadow-sm border">
-      {/* Workflow Header */}
-      <div className="border-b px-6 py-4">
-        <div className="flex items-center justify-between">
-          <div>
-            <h3 className="text-lg font-semibold text-gray-900">
-              {definition.meta.title}
-            </h3>
-            {definition.meta.description && (
-              <p className="text-sm text-gray-600 mt-1">
-                {definition.meta.description}
-              </p>
-            )}
-          </div>
-          <div className="flex items-center space-x-4">
-            {/* Validation Status */}
-            {validationState && (
-              <div className="flex items-center space-x-2">
-                {isValidating ? (
-                  <Loader2 className="h-4 w-4 animate-spin text-blue-500" />
-                ) : validationState.ok ? (
-                  <CheckCircle className="h-4 w-4 text-green-500" />
-                ) : (
-                  <AlertCircle className="h-4 w-4 text-red-500" />
-                )}
-                <span className={`text-sm ${
-                  validationState.ok ? 'text-green-600' : 'text-red-600'
-                }`}>
-                  {validationState.ok ? 'Valid' : 'Invalid'}
-                </span>
-              </div>
-            )}
-            
-            {/* Mode Badge */}
-            <span className={`px-2 py-1 rounded-full text-xs font-medium ${
-              definition.rules.mode === 'PRO' 
-                ? 'bg-purple-100 text-purple-800'
-                : 'bg-blue-100 text-blue-800'
-            }`}>
-              {definition.rules.mode} Mode
-            </span>
-          </div>
-        </div>
+    <div className="bg-white rounded-lg border border-gray-200">
+      <div className="p-6 border-b border-gray-200">
+        <h3 className="text-lg font-semibold">
+          {workflowDefinition?.title || workflowDefinition?.meta?.title || 'Workflow'}
+        </h3>
+        {workflowDefinition?.description && (
+          <p className="text-sm text-gray-600 mt-1">{workflowDefinition.description}</p>
+        )}
       </div>
-
-      {/* Validation Messages */}
-      {validationState && !validationState.ok && (
-        <div className="mx-6 mt-4 p-3 bg-red-50 border border-red-200 rounded-md">
-          <div className="flex items-start space-x-2">
-            <AlertCircle className="h-4 w-4 text-red-600 mt-0.5 flex-shrink-0" />
-            <div>
-              <h4 className="text-sm font-medium text-red-800">Validation Issues</h4>
-              <ul className="mt-1 text-sm text-red-700 space-y-1">
-                {validationState.messages.map((message, index) => (
-                  <li key={index}>• {message}</li>
-                ))}
-              </ul>
+      
+      <div className="p-6">
+        {isSubmitting && (
+          <div className="mb-4 p-4 bg-blue-50 border border-blue-200 rounded-lg">
+            <div className="flex items-center">
+              <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-600 mr-2"></div>
+              <span className="text-sm">Submitting workflow results...</span>
             </div>
           </div>
-        </div>
-      )}
-
-      {/* Survey Component */}
-      <div className="p-6">
-        {/* TODO: Replace with actual Survey component once packages are installed */}
-        {/* <Survey model={survey} /> */}
-        <div className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center">
-          <h4 className="text-lg font-medium text-gray-700 mb-2">Survey.js Component</h4>
-          <p className="text-sm text-gray-500 mb-4">
-            Install Survey.js packages to enable the interactive workflow interface
-          </p>
-          <div className="bg-gray-50 rounded p-4 text-left">
-            <pre className="text-xs text-gray-600">
-              {JSON.stringify(definition.ui.template, null, 2)}
-            </pre>
-          </div>
-        </div>
-      </div>
-
-      {/* Workflow Info */}
-      <div className="border-t px-6 py-3 bg-gray-50">
-        <div className="flex items-center justify-between text-xs text-gray-500">
-          <div>
-            Step {currentStep} • Instance: {instanceId?.slice(-8)}
-          </div>
-          <div>
-            Version: {definition.meta.version} • Owner: {definition.meta.owner}
-          </div>
-        </div>
+        )}
+        
+        {survey && <Survey model={survey} />}
       </div>
     </div>
-  );
-};
+  )
+}
+
+export default WorkflowRunner

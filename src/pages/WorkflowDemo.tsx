@@ -1,167 +1,187 @@
-import React, { useState } from 'react';
-import { FlowManager } from '../components/Workflow/FlowManager';
-import { Workflow } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { getWorkflows } from '../utils/workflowAPI';
+import SimpleWorkflowRunner from '../components/Workflow/SimpleWorkflowRunner';
 
-const WorkflowDemo: React.FC = () => {
-  const [selectedTemplate, setSelectedTemplate] = useState<string>('');
-  const [showFlowManager, setShowFlowManager] = useState(false);
+interface Workflow {
+  id: string;
+  name: string;
+  scope: string;
+  definition: any;
+  version: number;
+}
 
-  const templates = [
-    {
-      id: 'basic-lab-workflow',
-      name: 'Basic Lab Workflow',
-      description: 'Standard laboratory procedure with sample prep, QC, testing, and validation'
-    },
-    {
-      id: 'cbc-test-workflow',
-      name: 'CBC Test Workflow',
-      description: 'Complete Blood Count test with detailed analyzer setup and results entry'
-    }
-  ];
+const WorkflowDemo = () => {
+  const [availableWorkflows, setAvailableWorkflows] = useState<Workflow[]>([]);
+  const [selectedWorkflow, setSelectedWorkflow] = useState<any>(null);
+  const [currentWorkflowId, setCurrentWorkflowId] = useState<string>('');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [completionData, setCompletionData] = useState<any>(null);
 
-  const mockOrder = {
-    id: 'ORD-2024-001',
-    patient_id: 'PAT-001',
-    test_groups: [
-      {
-        id: 'TG-001',
-        name: 'Hematology Panel',
-        analytes: [
-          { id: 'ANA-001', name: 'White Blood Cell Count' },
-          { id: 'ANA-002', name: 'Red Blood Cell Count' },
-          { id: 'ANA-003', name: 'Platelet Count' }
-        ]
+  useEffect(() => {
+    const fetchWorkflows = async () => {
+      try {
+        setLoading(true);
+        const workflows = await getWorkflows();
+        setAvailableWorkflows(workflows);
+        setError(null);
+      } catch (error) {
+        console.error('Error fetching workflows:', error);
+        setError('Failed to load workflows from database');
+      } finally {
+        setLoading(false);
       }
-    ]
+    };
+
+    fetchWorkflows();
+  }, []);
+
+  const handleWorkflowSelect = (workflowId: string) => {
+    const selectedWorkflow = availableWorkflows.find(w => w.id === workflowId);
+    if (selectedWorkflow) {
+      setSelectedWorkflow(selectedWorkflow.definition);
+      setCurrentWorkflowId(workflowId);
+      setCompletionData(null);
+    }
   };
 
-  const handleWorkflowComplete = (data: any) => {
-    console.log('Workflow completed with data:', data);
-    alert('Workflow completed successfully! Check console for data.');
-  };
-
-  const handleFlowManagerComplete = (results: any) => {
-    console.log('Flow Manager completed with results:', results);
-    alert('All workflows completed! Check console for results.');
+  const handleWorkflowComplete = (results: any) => {
+    console.log('Workflow completed:', results);
+    setCompletionData(results);
   };
 
   return (
-    <div className="space-y-6">
-      <div className="bg-white p-6 rounded-lg shadow">
-        <h1 className="text-2xl font-bold text-gray-900 mb-4">
-          Survey.js Workflow System Demo
-        </h1>
-        <p className="text-gray-600 mb-6">
-          This demo showcases the dynamic workflow system powered by Survey.js. 
-          You can run individual workflows or use the Flow Manager for complex multi-step procedures.
+    <div className="container mx-auto p-6 max-w-4xl">
+      <div className="mb-8">
+        <h1 className="text-3xl font-bold mb-2">Survey.js Workflow System</h1>
+        <p className="text-gray-600">
+          Execute laboratory workflows with automated result submission to database
         </p>
-
-        <div className="flex gap-4 mb-6">
-          <button
-            onClick={() => setShowFlowManager(false)}
-            className={`px-4 py-2 rounded ${
-              !showFlowManager 
-                ? 'bg-blue-600 text-white' 
-                : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
-            }`}
-          >
-            Individual Workflows
-          </button>
-          <button
-            onClick={() => setShowFlowManager(true)}
-            className={`px-4 py-2 rounded ${
-              showFlowManager 
-                ? 'bg-blue-600 text-white' 
-                : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
-            }`}
-          >
-            Flow Manager Demo
-          </button>
-        </div>
       </div>
 
-      {!showFlowManager ? (
-        <div className="bg-white p-6 rounded-lg shadow">
-          <h2 className="text-xl font-semibold mb-4">Select a Workflow Template</h2>
-          
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
-            {templates.map((template) => (
-              <div
-                key={template.id}
-                className={`p-4 border rounded-lg cursor-pointer transition-colors ${
-                  selectedTemplate === template.id
-                    ? 'border-blue-500 bg-blue-50'
-                    : 'border-gray-200 hover:border-gray-300'
-                }`}
-                onClick={() => setSelectedTemplate(template.id)}
-              >
-                <h3 className="font-medium text-gray-900">{template.name}</h3>
-                <p className="text-sm text-gray-600 mt-1">{template.description}</p>
-              </div>
-            ))}
+      {/* Workflow Selection */}
+      <div className="bg-white rounded-lg border border-gray-200 p-6 mb-6">
+        <h2 className="text-xl font-semibold mb-4">Select Workflow</h2>
+        
+        {loading && (
+          <div className="flex items-center justify-center py-8">
+            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
+            <span className="ml-2">Loading workflows...</span>
           </div>
+        )}
 
-          {selectedTemplate && (
-            <div className="border-t pt-6">
-              <div className="bg-yellow-50 border border-yellow-200 rounded p-4 mb-4">
-                <p className="text-sm text-yellow-700">
-                  <strong>Note:</strong> This is a demo interface. The actual WorkflowRunner requires 
-                  workflow definitions from the database. In production, workflows would be loaded 
-                  based on test group and analyte configurations.
-                </p>
-              </div>
-              
-              <div className="text-center py-8 text-gray-500">
-                <Workflow className="mx-auto h-16 w-16 mb-4" />
-                <h3 className="text-lg font-medium mb-2">Workflow: {templates.find(t => t.id === selectedTemplate)?.name}</h3>
-                <p className="mb-4">
-                  In production, this would load the {selectedTemplate} template and create an interactive Survey.js form
-                </p>
-                <button
-                  onClick={() => handleWorkflowComplete({ templateId: selectedTemplate, status: 'demo_completed' })}
-                  className="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700"
-                >
-                  Simulate Workflow Completion
-                </button>
-              </div>
+        {error && (
+          <div className="bg-red-50 border border-red-200 rounded-lg p-4 mb-4">
+            <div className="flex items-center text-red-600">
+              <svg className="h-5 w-5 mr-2" fill="currentColor" viewBox="0 0 20 20">
+                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+              </svg>
+              {error}
             </div>
-          )}
-        </div>
-      ) : (
-        <div className="bg-white p-6 rounded-lg shadow">
-          <h2 className="text-xl font-semibold mb-4">Flow Manager Demo</h2>
-          <p className="text-gray-600 mb-6">
-            The Flow Manager automatically selects and orchestrates multiple workflows based on the order context.
-          </p>
-          
-          <div className="bg-gray-50 p-4 rounded mb-6">
-            <h3 className="font-medium mb-2">Mock Order Details:</h3>
-            <ul className="text-sm text-gray-600">
-              <li>Order ID: {mockOrder.id}</li>
-              <li>Patient ID: {mockOrder.patient_id}</li>
-              <li>Test Groups: {mockOrder.test_groups.map(tg => tg.name).join(', ')}</li>
-              <li>Analytes: {mockOrder.test_groups.flatMap(tg => tg.analytes.map(a => a.name)).join(', ')}</li>
-            </ul>
+          </div>
+        )}
+
+        {!loading && !error && (
+          <div className="space-y-4">
+            <select 
+              onChange={(e) => handleWorkflowSelect(e.target.value)}
+              value={currentWorkflowId}
+              className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+            >
+              <option value="">Select a workflow to execute...</option>
+              {availableWorkflows.map((workflow) => (
+                <option key={workflow.id} value={workflow.id}>
+                  {workflow.name} (v{workflow.version})
+                </option>
+              ))}
+            </select>
+
+            {availableWorkflows.length === 0 && (
+              <div className="text-center py-8 text-gray-500">
+                <p>No workflows found in database.</p>
+                <p className="text-sm mt-2">
+                  Make sure you have workflow definitions in the <code>workflows</code> and <code>workflow_versions</code> tables.
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Workflow Execution */}
+      {selectedWorkflow && (
+        <div className="space-y-6">
+          <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+            <h3 className="font-semibold text-blue-800 mb-2">Database Integration Active</h3>
+            <p className="text-blue-700 text-sm">
+              This workflow will save results to the <code>results</code> and <code>result_values</code> tables 
+              when completed successfully.
+            </p>
           </div>
 
-          <FlowManager
-            orderId={mockOrder.id}
-            testGroupId="TG-001"
-            analyteIds={['ANA-001', 'ANA-002', 'ANA-003']}
-            labId="LAB-001"
-            onComplete={handleFlowManagerComplete}
+          <SimpleWorkflowRunner
+            workflowDefinition={selectedWorkflow}
+            onComplete={handleWorkflowComplete}
+            orderId={crypto.randomUUID()} // Generate test order ID
+            testGroupId="test-group-1"
           />
         </div>
       )}
 
-      <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
-        <h3 className="font-medium text-yellow-800 mb-2">Development Notes:</h3>
-        <ul className="text-sm text-yellow-700 space-y-1">
-          <li>• Workflow data is logged to the browser console</li>
-          <li>• Templates are loaded from the /src/workflows/templates/ directory</li>
-          <li>• The system supports conditional logic, validation, and dynamic elements</li>
-          <li>• Integration with the database is ready for production use</li>
-        </ul>
+      {/* Results Display */}
+      {completionData && (
+        <div className="mt-6 bg-green-50 border border-green-200 rounded-lg p-6">
+          <h3 className="text-lg font-semibold text-green-800 mb-4">
+            ✅ Workflow Results Saved Successfully
+          </h3>
+          <div className="bg-white rounded border p-4">
+            <h4 className="font-medium mb-2">Submitted Data:</h4>
+            <pre className="text-xs overflow-auto max-h-60 bg-gray-50 p-3 rounded">
+              {JSON.stringify(completionData, null, 2)}
+            </pre>
+          </div>
+          <div className="mt-4 text-sm text-green-700">
+            <p>📊 Data has been processed and stored in:</p>
+            <ul className="list-disc list-inside mt-2 space-y-1">
+              <li><code>results</code> table - Main workflow result record</li>
+              <li><code>result_values</code> table - Individual measurement values</li>
+              <li><code>quality_control_results</code> table - QC data (if applicable)</li>
+              <li><code>workflow_step_events</code> table - Workflow execution log</li>
+            </ul>
+          </div>
+        </div>
+      )}
+
+      {/* Help Section */}
+      <div className="mt-8 bg-gray-50 rounded-lg p-6">
+        <h3 className="text-lg font-semibold mb-4">📋 Testing Instructions</h3>
+        <div className="space-y-3 text-sm">
+          <div>
+            <strong>1. Select Workflow:</strong> Choose from workflows stored in your database
+          </div>
+          <div>
+            <strong>2. Execute Steps:</strong> Follow the Survey.js interface to complete each step
+          </div>
+          <div>
+            <strong>3. Submit Results:</strong> Click "Complete" to save results to database
+          </div>
+          <div>
+            <strong>4. Verify Data:</strong> Check your database tables to see the stored results
+          </div>
+        </div>
+
+        <div className="mt-4 p-4 bg-white rounded border">
+          <h4 className="font-medium mb-2">Available Workflows:</h4>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
+            {availableWorkflows.map(workflow => (
+              <div key={workflow.id} className="p-2 bg-gray-50 rounded">
+                <div className="font-medium">{workflow.name}</div>
+                <div className="text-gray-600">Scope: {workflow.scope}</div>
+                <div className="text-gray-600">Version: {workflow.version}</div>
+              </div>
+            ))}
+          </div>
+        </div>
       </div>
     </div>
   );
