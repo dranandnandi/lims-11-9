@@ -1,596 +1,465 @@
-import React, { useState, useEffect } from 'react'
+// components/Orders/ResultIntake.tsx
+// ───────────────────────────────────────────────────────────────────────────────
+// BLOCK 0: Imports
+// Keep paths as-is for your repo structure.
+import React, { useEffect, useMemo, useState } from 'react'
 import { supabase } from '../../utils/supabase'
+import { useAuth } from '../../contexts/AuthContext'
+import { calculateFlagsForResults } from '../../utils/flagCalculation'
+import { CheckCircle, AlertTriangle } from 'lucide-react'
 
-interface TestGroupResult {
+// ───────────────────────────────────────────────────────────────────────────────
+// BLOCK 1: Types
+
+type FlagCode = '' | 'H' | 'L' | 'C'
+
+interface Analyte {
+  id: string
+  name: string
+  code?: string
+  units?: string
+  unit?: string
+  reference_range?: string
+  existing_result?: {
+    id: string
+    value: string | null
+    unit?: string | null
+    reference_range?: string | null
+    flag?: string | null
+  } | null
+}
+
+interface TestGroup {
   test_group_id: string
   test_group_name: string
-  order_test_group_id?: string | null
-  order_test_id?: string | null
-  analytes: {
-    id: string
-    name: string
-    code: string
-    units?: string
-    reference_range?: string
-    existing_result?: {
-      id: string
-      value: string
-      flag?: string
-      verified_at?: string
-    }
-  }[]
+  order_test_group_id: string | null
+  order_test_id: string | null
+  analytes: Analyte[]
 }
 
-interface ResultIntakeProps {
-  order: {
-    id: string
-    lab_id: string
-    patient_id: string
-    patient_name: string
-    test_groups: TestGroupResult[]
-    sample_id?: string
-    status: string
-    // Optional legacy fields for backward compatibility
-    test_group_id?: string
-    test_code?: string
-  }
-  onResultProcessed?: (resultId: string) => void
-}
-
-interface Attachment {
+interface IntakeOrder {
   id: string
-  file: File
-  tag: string
-  uploaded: boolean
-  url?: string
+  lab_id: string
+  patient_id: string
+  patient_name: string
+  test_groups: TestGroup[]
+  sample_id?: string
+  status: string
 }
 
-const WORKFLOW_TAGS = [
-  { value: 'dipstick_photo', label: 'Dipstick Photo' },
-  { value: 'microscopy_slide', label: 'Microscopy Slide' },
-  { value: 'report_pdf', label: 'Report PDF' },
-  { value: 'analyzer_output', label: 'Analyzer Output' },
-  { value: 'manual_entry', label: 'Manual Entry' }
+interface Props {
+  order: IntakeOrder
+  onResultProcessed: (resultId: string) => void
+}
+
+type Entry = {
+  analyte_id: string
+  analyte_name: string
+  value: string
+  unit: string
+  reference: string
+  flag: FlagCode
+  // relationships
+  test_group_id: string
+  order_test_group_id: string | null
+  order_test_id: string | null
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// BLOCK 2: Helpers (pure)
+
+const isCompleted = (a: Analyte) =>
+  !!a.existing_result && a.existing_result.value !== null && `${a.existing_result.value}`.trim() !== ''
+
+const flagOptions: { value: FlagCode; label: string }[] = [
+  { value: '', label: 'Normal' },
+  { value: 'H', label: 'High' },
+  { value: 'L', label: 'Low' },
+  { value: 'C', label: 'Critical' },
 ]
 
-// Manual Result Entry Component
-const ManualResultEntry: React.FC<{
-  analytes: TestGroupResult['analytes']
-  results: Record<string, string>
-  onResultChange: (results: Record<string, string>) => void
-}> = ({ analytes, results, onResultChange }) => {
-  const updateResult = (analyteId: string, value: string) => {
-    onResultChange({
-      ...results,
-      [analyteId]: value
-    })
-  }
+// ───────────────────────────────────────────────────────────────────────────────
+// BLOCK 3: Component
 
-  return (
-    <div className="space-y-3">
-      {analytes.map(analyte => (
-        <div key={analyte.id} className="grid grid-cols-3 gap-4 items-center">
-          <div>
-            <span className="font-medium">{analyte.name}</span>
-            <span className="text-sm text-gray-500 ml-2">({analyte.code})</span>
-          </div>
-          <div className="flex items-center space-x-2">
-            <input
-              type="text"
-              value={results[analyte.id] || ''}
-              onChange={(e) => updateResult(analyte.id, e.target.value)}
-              placeholder="Enter value"
-              className="flex-1 px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-            />
-            {analyte.units && (
-              <span className="text-sm text-gray-600">{analyte.units}</span>
-            )}
-          </div>
-          <div className="text-sm text-gray-500">
-            {analyte.reference_range || 
-             (analyte.normal_range_min !== undefined && analyte.normal_range_max !== undefined
-               ? `${analyte.normal_range_min}-${analyte.normal_range_max}${analyte.units ? ` ${analyte.units}` : ''}`
-               : 'No reference range')}
-          </div>
-        </div>
-      ))}
-    </div>
-  )
-}
+export function ResultIntake({ order, onResultProcessed }: Props) {
+  const { user } = useAuth()
 
-// AI Result Entry Component
-const AIResultEntry: React.FC<{
-  testGroupId: string
-  analytes: TestGroupResult['analytes']
-  orderId: string
-  onResultProcessed: (resultId: string) => void
-}> = ({ testGroupId, analytes, orderId, onResultProcessed }) => {
-  const [attachments, setAttachments] = useState<Attachment[]>([])
-  const [isProcessing, setIsProcessing] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  // UI state
+  const [showCompleted, setShowCompleted] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [submitting, setSubmitting] = useState(false)
+  const [toast, setToast] = useState<string | null>(null)
 
-  // Handle file upload
-  const handleFileUpload = async (file: File, tag: string) => {
-    const id = crypto.randomUUID()
-    const newAttachment: Attachment = {
-      id,
-      file,
-      tag,
-      uploaded: false
-    }
-    
-    setAttachments(prev => [...prev, newAttachment])
+  // Editable entries keyed by analyte_id (only for NOT completed analytes)
+  const [entries, setEntries] = useState<Record<string, Entry>>({})
 
-    try {
-      const fileName = `${orderId}/${id}_${file.name}`
-      const { data, error } = await supabase.storage
-        .from('attachments')
-        .upload(fileName, file)
+  // ───────────────────────────────────────────────────────────────────────────
+  // BLOCK 3A: Initialize editable entries from order (pending analytes only)
 
-      if (error) throw error
-
-      setAttachments(prev => 
-        prev.map(a => 
-          a.id === id 
-            ? { ...a, uploaded: true, url: data.path }
-            : a
-        )
-      )
-    } catch (err) {
-      console.error('Upload error:', err)
-      setError('Failed to upload file. Please try again.')
-      setAttachments(prev => prev.filter(a => a.id !== id))
-    }
-  }
-
-  const processAIResults = async () => {
-    if (attachments.length === 0) {
-      setError('Please upload at least one file for AI processing')
-      return
-    }
-
-    setIsProcessing(true)
-    setError(null)
-
-    try {
-      const workflowInstanceId = crypto.randomUUID()
-      const requestBody = {
-        workflowInstanceId,
-        stepId: 'final_results',
-        orderId,
-        labId: (await supabase.auth.getUser()).data.user?.user_metadata?.lab_id,
-        testGroupId,
-        userId: (await supabase.auth.getUser()).data.user?.id,
-        results: {
-          test_group_id: testGroupId,
-          analyte_ids: analytes.map(a => a.id),
-          review_status: 'submitted'
-        }
-      }
-
-      const response = await fetch(
-        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/process-workflow-result`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${(await supabase.auth.getSession()).data.session?.access_token}`
-          },
-          body: JSON.stringify(requestBody)
-        }
-      )
-
-      const result = await response.json()
-
-      if (!response.ok) {
-        throw new Error(result.error || 'Processing failed')
-      }
-
-      // Link attachments to workflow result
-      if (result.workflow_result_id && attachments.length > 0) {
-        for (const attachment of attachments) {
-          if (attachment.uploaded) {
-            await supabase
-              .from('attachments')
-              .insert({
-                related_table: 'workflow_results',
-                related_id: result.workflow_result_id,
-                file_path: attachment.url,
-                tag: attachment.tag,
-                file_name: attachment.file.name,
-                file_type: attachment.file.type,
-                file_size: attachment.file.size
-              })
+  useEffect(() => {
+    const next: Record<string, Entry> = {}
+    order.test_groups.forEach(tg => {
+      tg.analytes.forEach(a => {
+        if (!isCompleted(a)) {
+          next[a.id] = {
+            analyte_id: a.id,
+            analyte_name: a.name,
+            value: '',
+            unit: a.units || a.unit || '',
+            reference: a.reference_range || '',
+            flag: '',
+            test_group_id: tg.test_group_id,
+            order_test_group_id: tg.order_test_group_id,
+            order_test_id: tg.order_test_id,
           }
         }
-      }
-
-      if (result.status === 'ok' || result.status === 'warn') {
-        onResultProcessed(result.result_id)
-        setAttachments([]) // Clear attachments on success
-      } else {
-        throw new Error('Processing failed with errors')
-      }
-
-    } catch (err) {
-      console.error('Processing error:', err)
-      setError(err instanceof Error ? err.message : 'Failed to process results')
-    } finally {
-      setIsProcessing(false)
-    }
-  }
-
-  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
-
-    const tagOptions = WORKFLOW_TAGS.map((t, i) => `${i+1}. ${t.label}`).join('\n')
-    const selection = prompt(`Select tag for this file:\n${tagOptions}`)
-    
-    const tagIndex = parseInt(selection || '0') - 1
-    if (tagIndex >= 0 && tagIndex < WORKFLOW_TAGS.length) {
-      handleFileUpload(file, WORKFLOW_TAGS[tagIndex].value)
-    }
-    
-    e.target.value = ''
-  }
-
-  return (
-    <div className="space-y-4">
-      {/* Error Display */}
-      {error && (
-        <div className="bg-red-50 border border-red-200 rounded-lg p-3">
-          <div className="flex items-center text-red-800">
-            <svg className="h-4 w-4 mr-2" fill="currentColor" viewBox="0 0 20 20">
-              <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
-            </svg>
-            <span className="text-sm">{error}</span>
-          </div>
-        </div>
-      )}
-
-      {/* File Upload Area */}
-      <div className="border-2 border-dashed border-gray-300 rounded-lg p-4">
-        <input
-          type="file"
-          id={`file-upload-${testGroupId}`}
-          className="hidden"
-          accept="image/*,.pdf"
-          onChange={handleFileSelect}
-        />
-        <label
-          htmlFor={`file-upload-${testGroupId}`}
-          className="flex flex-col items-center cursor-pointer"
-        >
-          <svg className="h-6 w-6 text-gray-400 mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-          </svg>
-          <span className="text-sm text-gray-600">Upload files for AI processing</span>
-          <span className="text-xs text-gray-500">Images or PDFs</span>
-        </label>
-      </div>
-
-      {/* Uploaded Files */}
-      {attachments.length > 0 && (
-        <div className="space-y-2">
-          {attachments.map(attachment => (
-            <div
-              key={attachment.id}
-              className="flex items-center justify-between bg-gray-50 p-2 rounded"
-            >
-              <div className="flex items-center space-x-2">
-                <svg className="h-4 w-4 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                </svg>
-                <span className="text-sm">{attachment.file.name}</span>
-                <span className="text-xs bg-gray-200 px-2 py-1 rounded">
-                  {WORKFLOW_TAGS.find(t => t.value === attachment.tag)?.label}
-                </span>
-              </div>
-              {attachment.uploaded ? (
-                <svg className="h-4 w-4 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                </svg>
-              ) : (
-                <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-600"></div>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* Process Button */}
-      <div className="flex justify-end">
-        <button
-          onClick={processAIResults}
-          disabled={attachments.length === 0 || isProcessing}
-          className={`px-4 py-2 rounded font-medium transition-colors ${
-            attachments.length > 0 && !isProcessing
-              ? 'bg-blue-600 text-white hover:bg-blue-700'
-              : 'bg-gray-300 text-gray-500 cursor-not-allowed'
-          }`}
-        >
-          {isProcessing ? 'Processing...' : 'Process with AI'}
-        </button>
-      </div>
-    </div>
-  )
-}
-
-// Test Group Result Entry Component
-const TestGroupResultEntry: React.FC<{
-  testGroup: TestGroupResult
-  orderId: string
-  entryMode: 'manual' | 'ai'
-  onResultProcessed: (resultId: string) => void
-}> = ({ testGroup, orderId, entryMode, onResultProcessed }) => {
-  const [results, setResults] = useState<Record<string, string>>({})
-  const [isSubmitting, setIsSubmitting] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-
-  // Initialize with existing results
-  useEffect(() => {
-    const initialResults: Record<string, string> = {}
-    testGroup.analytes.forEach(analyte => {
-      if (analyte.existing_result) {
-        initialResults[analyte.id] = analyte.existing_result.value
-      }
+      })
     })
-    setResults(initialResults)
-  }, [testGroup])
+    setEntries(next)
+  }, [order])
 
-  const handleSubmitResults = async () => {
-    const validResults = Object.entries(results).filter(([_, value]) => value.trim())
-    
-    if (validResults.length === 0) {
-      setError('Please enter at least one result value')
+  // ───────────────────────────────────────────────────────────────────────────
+  // BLOCK 3B: Derived data per test group (pending vs completed, progress)
+
+  const groups = useMemo(() => {
+    return order.test_groups.map(tg => {
+      const pending = tg.analytes.filter(a => !isCompleted(a))
+      const completed = tg.analytes.filter(a => isCompleted(a))
+      const progress = {
+        total: tg.analytes.length,
+        completed: completed.length,
+        pending: pending.length,
+        percent: tg.analytes.length
+          ? Math.round((completed.length / tg.analytes.length) * 100)
+          : 0,
+      }
+      return { tg, pending, completed, progress }
+    })
+  }, [order])
+
+  const totalPendingAnalytes = useMemo(
+    () => groups.reduce((acc, g) => acc + g.progress.pending, 0),
+    [groups]
+  )
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // BLOCK 3C: Local field updates
+
+  const updateEntry = (analyteId: string, patch: Partial<Entry>) => {
+    setEntries(prev => ({ ...prev, [analyteId]: { ...prev[analyteId], ...patch } }))
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // BLOCK 3D: Persist (Save Draft / Submit)
+
+  const persist = async (mode: 'draft' | 'submit') => {
+    const activeEntries = Object.values(entries).filter(e => `${e.value}`.trim() !== '')
+    if (activeEntries.length === 0) {
+      setToast('Please enter at least one result value.')
       return
     }
 
-    setIsSubmitting(true)
-    setError(null)
+    mode === 'draft' ? setSaving(true) : setSubmitting(true)
+    setToast(null)
 
     try {
-      const currentUser = await supabase.auth.getUser();
-      const userLabId = currentUser.data.user?.user_metadata?.lab_id;
+      // Group entries by test group
+      const byGroup = activeEntries.reduce<Record<string, Entry[]>>((acc, e) => {
+        acc[e.test_group_id] = acc[e.test_group_id] || []
+        acc[e.test_group_id].push(e)
+        return acc
+      }, {})
 
-      // Create result with proper schema structure for both sources
-      const resultData = {
-        order_id: orderId,
-        patient_id: '', // This should be passed from parent
-        patient_name: '', // This should be passed from parent
-        test_name: testGroup.test_group_name,
-        status: 'pending_verification',
-        entered_by: currentUser.data.user?.email || 'Unknown User',
-        entered_date: new Date().toISOString().split('T')[0],
-        test_group_id: testGroup.test_group_id,
-        lab_id: userLabId,
-        ...(testGroup.order_test_group_id && { order_test_group_id: testGroup.order_test_group_id }),
-        ...(testGroup.order_test_id && { order_test_id: testGroup.order_test_id })
+      let firstSavedResultId: string | undefined
+
+      for (const tgId of Object.keys(byGroup)) {
+        const list = byGroup[tgId]
+
+        // Pull the display name of test group for results.test_name
+        const tgMeta = order.test_groups.find(t => t.test_group_id === tgId)
+        const testGroupName = tgMeta?.test_group_name || 'Unknown Test'
+
+        // Prepare results row
+        const resultRow = {
+          order_id: order.id,
+          patient_id: order.patient_id,
+          patient_name: order.patient_name,
+          test_name: testGroupName,
+          status: mode === 'draft' ? 'entered' : 'pending_verification',
+          entered_by: user?.user_metadata?.full_name || user?.email || 'Unknown User',
+          entered_date: new Date().toISOString().split('T')[0],
+          test_group_id: tgId,
+          lab_id: order.lab_id,
+          // keep links to originating order_test_group/order_test when present
+          ...(tgMeta?.order_test_group_id && { order_test_group_id: tgMeta.order_test_group_id }),
+          ...(tgMeta?.order_test_id && { order_test_id: tgMeta.order_test_id }),
+        }
+
+        const { data: savedResult, error: insertErr } = await supabase
+          .from('results')
+          .insert(resultRow)
+          .select()
+          .single()
+
+        if (insertErr) throw insertErr
+        if (!firstSavedResultId) firstSavedResultId = savedResult.id
+
+        // Build values + compute flags (if user didn’t pick)
+        const forFlag = list.map(v => ({
+          parameter: v.analyte_name,
+          value: v.value,
+          unit: v.unit,
+          reference_range: v.reference,
+          flag: v.flag || undefined,
+        }))
+        const withFlags = calculateFlagsForResults(forFlag)
+
+        const values = list.map((v, i) => ({
+          result_id: savedResult.id,
+          order_id: order.id,
+          lab_id: order.lab_id,
+          test_group_id: tgId,
+          analyte_id: v.analyte_id,
+          analyte_name: v.analyte_name,
+          parameter: v.analyte_name,
+          value: v.value,
+          unit: v.unit || '',
+          reference_range: v.reference || '',
+          flag: (v.flag || withFlags[i]?.flag || '') || null,
+          ...(v.order_test_group_id && { order_test_group_id: v.order_test_group_id }),
+          ...(v.order_test_id && { order_test_id: v.order_test_id }),
+        }))
+
+        const { error: valuesErr } = await supabase.from('result_values').insert(values)
+        if (valuesErr) throw valuesErr
       }
 
-      const { data: savedResult, error } = await supabase
-        .from('results')
-        .insert(resultData)
-        .select()
-        .single()
-
-      if (error) throw error
-
-      // Insert result_values with proper relationships
-      const resultValuesData = validResults.map(([analyteId, value]) => {
-        const analyte = testGroup.analytes.find(a => a.id === analyteId)
-        return {
-          result_id: savedResult.id,
-          analyte_id: analyteId,
-          analyte_name: analyte?.name || '',
-          parameter: analyte?.name || '',
-          value: value.trim(),
-          unit: analyte?.units || '',
-          reference_range: analyte?.reference_range || '',
-          flag: null, // Will be calculated based on reference ranges
-          order_id: orderId,
-          test_group_id: testGroup.test_group_id,
-          lab_id: userLabId,
-          ...(testGroup.order_test_group_id && { order_test_group_id: testGroup.order_test_group_id }),
-          ...(testGroup.order_test_id && { order_test_id: testGroup.order_test_id })
-        }
+      setToast(mode === 'draft' ? 'Draft saved successfully.' : 'Results submitted successfully.')
+      // Clear the entered rows we just saved (local UX), parent will reload and hide them permanently
+      const submittedIds = new Set(activeEntries.map(e => e.analyte_id))
+      setEntries(prev => {
+        const next = { ...prev }
+        submittedIds.forEach(id => delete next[id])
+        return next
       })
 
-      const { error: valuesError } = await supabase
-        .from('result_values')
-        .insert(resultValuesData)
-
-      if (valuesError) throw valuesError
-
-      // Notify parent component
-      onResultProcessed(savedResult.id)
-
-      // Clear form
-      setResults({})
-      
-    } catch (error) {
-      console.error('Error saving results:', error)
-      setError(error instanceof Error ? error.message : 'Failed to save results')
+      // Notify parent to reload (so completed analytes disappear)
+      if (firstSavedResultId) onResultProcessed(firstSavedResultId)
+    } catch (err) {
+      console.error('Persist error:', err)
+      setToast('Something went wrong. Please try again.')
     } finally {
-      setIsSubmitting(false)
+      mode === 'draft' ? setSaving(false) : setSubmitting(false)
+      // auto-hide toast
+      setTimeout(() => setToast(null), 4000)
     }
   }
 
-  const completedCount = testGroup.analytes.filter(a => 
-    a.existing_result || results[a.id]?.trim()
-  ).length
-
-  return (
-    <div className="border border-gray-200 rounded-lg p-4">
-      <div className="flex items-center justify-between mb-4">
-        <h4 className="text-lg font-medium">{testGroup.test_group_name}</h4>
-        <div className="flex items-center space-x-3">
-          <span className="text-sm text-gray-500">
-            {completedCount}/{testGroup.analytes.length} completed
-          </span>
-          <div className="w-16 bg-gray-200 rounded-full h-2">
-            <div 
-              className="bg-blue-600 h-2 rounded-full transition-all"
-              style={{ width: `${(completedCount / testGroup.analytes.length) * 100}%` }}
-            />
-          </div>
-        </div>
-      </div>
-
-      {error && (
-        <div className="bg-red-50 border border-red-200 rounded-lg p-3 mb-4">
-          <div className="flex items-center text-red-800">
-            <svg className="h-4 w-4 mr-2" fill="currentColor" viewBox="0 0 20 20">
-              <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
-            </svg>
-            <span className="text-sm">{error}</span>
-          </div>
-        </div>
-      )}
-
-      {entryMode === 'manual' ? (
-        <ManualResultEntry
-          analytes={testGroup.analytes}
-          results={results}
-          onResultChange={setResults}
-        />
-      ) : (
-        <AIResultEntry
-          testGroupId={testGroup.test_group_id}
-          analytes={testGroup.analytes}
-          orderId={orderId}
-          onResultProcessed={onResultProcessed}
-        />
-      )}
-
-      {entryMode === 'manual' && (
-        <div className="mt-4 flex justify-end">
-          <button
-            onClick={handleSubmitResults}
-            disabled={isSubmitting || Object.values(results).every(v => !v?.trim())}
-            className={`px-4 py-2 rounded font-medium transition-colors ${
-              !isSubmitting && Object.values(results).some(v => v?.trim())
-                ? 'bg-blue-600 text-white hover:bg-blue-700'
-                : 'bg-gray-300 text-gray-500 cursor-not-allowed'
-            }`}
-          >
-            {isSubmitting ? 'Saving...' : `Save Results (${Object.values(results).filter(v => v?.trim()).length})`}
-          </button>
-        </div>
-      )}
-    </div>
-  )
-}
-
-// Main ResultIntake Component
-export function ResultIntake({ order, onResultProcessed }: ResultIntakeProps) {
-  const [activeEntryMode, setActiveEntryMode] = useState<'manual' | 'ai'>('manual')
-  const [selectedTestGroup, setSelectedTestGroup] = useState<string>()
-
-  // Validate order structure
-  if (!order.test_groups || order.test_groups.length === 0) {
-    return (
-      <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
-        <div className="flex items-center text-yellow-800">
-          <svg className="h-5 w-5 mr-2" fill="currentColor" viewBox="0 0 20 20">
-            <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
-          </svg>
-          <div>
-            <p className="font-semibold">No Test Groups Found</p>
-            <p className="text-sm">This order doesn't have any test groups configured for result entry.</p>
-          </div>
-        </div>
-      </div>
-    )
-  }
+  // ───────────────────────────────────────────────────────────────────────────
+  // BLOCK 4: Render
 
   return (
     <div className="space-y-6">
-      {/* Order Information */}
-      <div className="bg-gray-50 rounded-lg p-4">
-        <h3 className="font-semibold mb-3">Order Information</h3>
-        <div className="grid grid-cols-2 gap-4 text-sm">
-          <div>
-            <span className="text-gray-600">Order ID:</span>
-            <span className="ml-2 font-mono">{order.id.slice(0, 8)}</span>
-          </div>
-          <div>
-            <span className="text-gray-600">Patient:</span>
-            <span className="ml-2">{order.patient_name}</span>
-          </div>
-          <div>
-            <span className="text-gray-600">Test Groups:</span>
-            <span className="ml-2">{order.test_groups.length}</span>
-          </div>
-          <div>
-            <span className="text-gray-600">Sample ID:</span>
-            <span className="ml-2">{order.sample_id || 'Not collected'}</span>
-          </div>
+      {/* Controls */}
+      <div className="flex items-center justify-between flex-wrap gap-3">
+        <div className="text-sm text-gray-600">
+          Pending analytes: <span className="font-semibold">{totalPendingAnalytes}</span>
         </div>
+        <label className="inline-flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            className="h-4 w-4 rounded border-gray-300"
+            checked={showCompleted}
+            onChange={(e) => setShowCompleted(e.target.checked)}
+          />
+          Show completed analytes (read-only)
+        </label>
       </div>
 
-      {/* Entry Mode Toggle */}
-      <div className="flex items-center space-x-4">
-        <h3 className="text-lg font-semibold">Result Entry</h3>
-        <div className="flex bg-gray-100 rounded-lg p-1">
-          <button
-            onClick={() => setActiveEntryMode('manual')}
-            className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
-              activeEntryMode === 'manual'
-                ? 'bg-white text-blue-600 shadow-sm'
-                : 'text-gray-600 hover:text-gray-900'
-            }`}
-          >
-            Manual Entry
-          </button>
-          <button
-            onClick={() => setActiveEntryMode('ai')}
-            className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
-              activeEntryMode === 'ai'
-                ? 'bg-white text-blue-600 shadow-sm'
-                : 'text-gray-600 hover:text-gray-900'
-            }`}
-          >
-            AI Upload
-          </button>
-        </div>
-      </div>
+      {/* Groups */}
+      {groups.map(({ tg, pending, completed, progress }) => {
+        // If a group is fully completed and user is not showing completed → skip
+        if (!showCompleted && pending.length === 0) return null
 
-      {/* Test Group Selection */}
-      {order.test_groups.length > 1 && (
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-2">
-            Select Test Group
-          </label>
-          <select
-            value={selectedTestGroup || ''}
-            onChange={(e) => setSelectedTestGroup(e.target.value)}
-            className="w-full border border-gray-300 rounded-md px-3 py-2 focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-          >
-            <option value="">All Test Groups</option>
-            {order.test_groups.map(tg => (
-              <option key={tg.test_group_id} value={tg.test_group_id}>
-                {tg.test_group_name} ({tg.analytes.length} analytes)
-              </option>
-            ))}
-          </select>
+        const rows = showCompleted ? [...pending, ...completed] : pending
+
+        return (
+          <div key={tg.test_group_id} className="border rounded-lg">
+            {/* Group header */}
+            <div className="px-4 py-3 border-b bg-gray-50 flex items-center justify-between">
+              <div>
+                <h3 className="text-base font-semibold">{tg.test_group_name}</h3>
+                <p className="text-xs text-gray-500">
+                  {progress.completed}/{progress.total} completed
+                </p>
+              </div>
+              <div className="w-32 bg-gray-200 rounded-full h-2 overflow-hidden">
+                <div
+                  className="bg-blue-600 h-2"
+                  style={{ width: `${progress.percent}%` }}
+                />
+              </div>
+            </div>
+
+            {/* Table (mobile-friendly) */}
+            <div className="overflow-x-auto">
+              <table className="min-w-full divide-y divide-gray-200">
+                <thead className="bg-gray-50">
+                  <tr>
+                    <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Parameter</th>
+                    <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase w-36">Value</th>
+                    <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase w-24">Unit</th>
+                    <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase w-40">Reference</th>
+                    <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase w-28">Flag</th>
+                  </tr>
+                </thead>
+                <tbody className="bg-white divide-y divide-gray-100">
+                  {rows.map(analyte => {
+                    const completedRow = isCompleted(analyte)
+                    const entry = entries[analyte.id]
+
+                    return (
+                      <tr key={analyte.id} className={completedRow ? 'bg-green-50/40' : ''}>
+                        {/* Parameter */}
+                        <td className="px-3 py-2 align-top">
+                          <div className="text-sm font-medium text-gray-900">{analyte.name}</div>
+                          {analyte.code && (
+                            <div className="text-xs text-gray-500">({analyte.code})</div>
+                          )}
+                          {completedRow && analyte.existing_result?.value != null && (
+                            <div className="mt-1 inline-flex items-center text-xs text-green-700">
+                              <CheckCircle className="h-3.5 w-3.5 mr-1" />
+                              Current: {analyte.existing_result.value}
+                            </div>
+                          )}
+                        </td>
+
+                        {/* Value */}
+                        <td className="px-3 py-2">
+                          {completedRow ? (
+                            <input
+                              disabled
+                              value={analyte.existing_result?.value ?? ''}
+                              className="w-full px-2 py-1 bg-gray-100 border border-gray-200 rounded text-gray-600"
+                            />
+                          ) : (
+                            <input
+                              value={entry?.value || ''}
+                              onChange={(e) => updateEntry(analyte.id, { value: e.target.value })}
+                              placeholder="Enter value"
+                              className="w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
+                            />
+                          )}
+                        </td>
+
+                        {/* Unit */}
+                        <td className="px-3 py-2">
+                          {completedRow ? (
+                            <input
+                              disabled
+                              value={analyte.existing_result?.unit ?? (analyte.units || analyte.unit || '')}
+                              className="w-full px-2 py-1 bg-gray-100 border border-gray-200 rounded text-gray-600"
+                            />
+                          ) : (
+                            <input
+                              value={entry?.unit || ''}
+                              onChange={(e) => updateEntry(analyte.id, { unit: e.target.value })}
+                              placeholder="Unit"
+                              className="w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
+                            />
+                          )}
+                        </td>
+
+                        {/* Reference */}
+                        <td className="px-3 py-2">
+                          {completedRow ? (
+                            <input
+                              disabled
+                              value={analyte.existing_result?.reference_range ?? (analyte.reference_range || '')}
+                              className="w-full px-2 py-1 bg-gray-100 border border-gray-200 rounded text-gray-600"
+                            />
+                          ) : (
+                            <input
+                              value={entry?.reference || ''}
+                              onChange={(e) => updateEntry(analyte.id, { reference: e.target.value })}
+                              placeholder="Reference range"
+                              className="w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
+                            />
+                          )}
+                        </td>
+
+                        {/* Flag */}
+                        <td className="px-3 py-2">
+                          {completedRow ? (
+                            <input
+                              disabled
+                              value={analyte.existing_result?.flag ?? ''}
+                              className="w-full px-2 py-1 bg-gray-100 border border-gray-200 rounded text-gray-600"
+                            />
+                          ) : (
+                            <select
+                              value={entry?.flag ?? ''}
+                              onChange={(e) => updateEntry(analyte.id, { flag: e.target.value as FlagCode })}
+                              className="w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
+                            >
+                              {flagOptions.map(opt => (
+                                <option key={opt.value} value={opt.value}>{opt.label}</option>
+                              ))}
+                            </select>
+                          )}
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )
+      })}
+
+      {/* Empty state */}
+      {totalPendingAnalytes === 0 && !showCompleted && (
+        <div className="p-4 rounded border border-green-200 bg-green-50 text-green-800 text-sm flex items-start">
+          <CheckCircle className="h-4 w-4 mt-0.5 mr-2" />
+          All analytes for this order already have results. Use the toggle above if you want to view them.
         </div>
       )}
 
-      {/* Grouped Results Display */}
-      <div className="space-y-6">
-        {order.test_groups
-          .filter(tg => !selectedTestGroup || tg.test_group_id === selectedTestGroup)
-          .map(testGroup => (
-            <TestGroupResultEntry
-              key={testGroup.test_group_id}
-              testGroup={testGroup}
-              orderId={order.id}
-              entryMode={activeEntryMode}
-              onResultProcessed={onResultProcessed || (() => {})}
-            />
-          ))}
+      {/* Toast */}
+      {toast && (
+        <div
+          className={`p-3 rounded text-sm flex items-start ${
+            toast?.toLowerCase().includes('wrong') || toast?.toLowerCase().includes('please')
+              ? 'bg-red-50 border border-red-200 text-red-700'
+              : 'bg-green-50 border border-green-200 text-green-700'
+          }`}
+        >
+          {toast?.toLowerCase().includes('wrong') || toast?.toLowerCase().includes('please') ? (
+            <AlertTriangle className="h-4 w-4 mt-0.5 mr-2" />
+          ) : (
+            <CheckCircle className="h-4 w-4 mt-0.5 mr-2" />
+          )}
+          {toast}
+        </div>
+      )}
+
+      {/* Actions */}
+      <div className="flex justify-end gap-3">
+        <button
+          onClick={() => persist('draft')}
+          disabled={saving || submitting}
+          className="px-4 py-2 border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-60"
+        >
+          {saving ? 'Saving…' : 'Save Draft'}
+        </button>
+        <button
+          onClick={() => persist('submit')}
+          disabled={submitting || saving}
+          className="px-5 py-2 rounded bg-green-600 text-white hover:bg-green-700 disabled:opacity-60"
+        >
+          {submitting ? 'Submitting…' : 'Submit Results'}
+        </button>
       </div>
     </div>
   )
