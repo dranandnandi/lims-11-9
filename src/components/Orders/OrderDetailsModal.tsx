@@ -4,6 +4,11 @@
 // - Auto-close after submit
 // - Hide already-submitted analytes from entry UI
 // - Block-structured for easier editing
+// - (ADDED) Attachments list + order_id on upload
+// - (ADDED) v_order_test_progress chips inside modal
+// - (ADDED) Submitted values (read-only) per test group
+// - (ADDED) Result Audit button/modal
+// - (ADDED) Duplicate-safe submit (reuse results row, upsert values)
 // ===========================================================
 
 import React, { useState } from "react";
@@ -15,7 +20,6 @@ import {
   Zap,
   CheckCircle,
   AlertTriangle,
-  Target,
   Layers,
   TestTube2,
   QrCode,
@@ -23,6 +27,8 @@ import {
   Clock,
   ArrowRight,
   Printer,
+  FileText as FileIcon,
+  Eye,
 } from "lucide-react";
 import QRCodeLib from "qrcode";
 import {
@@ -33,6 +39,8 @@ import {
 } from "../../utils/supabase";
 import { useAuth } from "../../contexts/AuthContext";
 import { calculateFlagsForResults } from "../../utils/flagCalculation";
+import { ResultAudit } from "./ResultAudit"; // expects named export
+import AIProcessingProgress, { AIStep } from "./AIProcessingProgress"; // adjust path if needed
 
 // ===========================================================
 // #region Types
@@ -185,9 +193,7 @@ const getNextSteps = (currentStatus: string, order: any): NextStep[] => {
       return [
         {
           action: "Collect Sample",
-          description: `Collect ${
-            order.color_name || "assigned"
-          } tube sample from patient ${order.patient_name}`,
+          description: `Collect ${order.color_name || "assigned"} tube sample from patient ${order.patient_name}`,
           urgent: true,
           priority: "high",
           assignedTo: "Sample Collection Team",
@@ -259,15 +265,11 @@ const getAvailableStatusActions = (
 ): StatusAction[] => {
   switch (currentStatus) {
     case "Order Created":
-      return [
-        { status: "Sample Collection", label: "Mark Sample Collected", primary: true },
-      ];
+      return [{ status: "Sample Collection", label: "Mark Sample Collected", primary: true }];
     case "Sample Collection":
       return [{ status: "In Progress", label: "Start Processing", primary: true }];
     case "In Progress":
-      return [
-        { status: "Pending Approval", label: "Submit for Approval", primary: true },
-      ];
+      return [{ status: "Pending Approval", label: "Submit for Approval", primary: true }];
     case "Pending Approval":
       return [
         { status: "Completed", label: "Approve Results", primary: true },
@@ -305,6 +307,52 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
   const [ocrResults, setOcrResults] = useState<any>(null);
   const [ocrError, setOcrError] = useState<string | null>(null);
 
+  // --- AI console state ---
+  type AiStep = {
+    id: string;
+    label: string;
+    status: "todo" | "doing" | "done" | "error";
+    detail?: string;
+    ts?: string;
+  };
+
+  const [aiPhase, setAiPhase] = useState<"idle"|"running"|"done"|"error">("idle");
+  const [aiSteps, setAiSteps] = useState<AiStep[]>([]);
+  const [aiProgress, setAiProgress] = useState(0);
+  const [aiMatchedCount, setAiMatchedCount] = useState(0);
+  const aiLogRef = React.useRef<HTMLDivElement>(null);
+
+  React.useEffect(() => {
+    if (aiPhase === "running" && aiLogRef.current) {
+      aiLogRef.current.scrollTop = aiLogRef.current.scrollHeight;
+    }
+  }, [aiSteps, aiPhase]);
+
+  const aiStart = () => {
+    setAiPhase("running");
+    setAiProgress(4);
+    setAiMatchedCount(0);
+    setAiSteps([
+      { id: "prep",   label: "Preparing runtime",              status: "doing", ts: new Date().toISOString() },
+      { id: "attach", label: "Validating uploaded attachment", status: "todo"  },
+      { id: "vision", label: "Extracting text (Vision OCR)",   status: "todo"  },
+      { id: "nlp",    label: "Parsing & normalizing (Gemini)", status: "todo"  },
+      { id: "match",  label: "Matching to analytes catalog",   status: "todo"  },
+      { id: "fill",   label: "Autofilling result grid",        status: "todo"  },
+      { id: "final",  label: "Finalizing",                     status: "todo"  },
+    ]);
+  };
+
+  const aiMark = (id: string, patch: Partial<AiStep>, bump = 12) => {
+    setAiSteps(prev => prev.map(s => s.id === id ? { ...s, ...patch, ts: new Date().toISOString() } : s));
+    setAiProgress(p => Math.min(100, p + bump));
+  };
+
+  const aiFail = (id: string, message: string) => {
+    aiMark(id, { status: "error", detail: message }, 0);
+    setAiPhase("error");
+  };
+
   // Result entry
   const [extractedValues, setExtractedValues] = useState<ExtractedValue[]>([]);
   const [manualValues, setManualValues] = useState<ExtractedValue[]>([]);
@@ -317,24 +365,24 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
   const [selectedTestGroup, setSelectedTestGroup] = useState<string>();
 
   // AI helpers
-  const [selectedAnalyteForAI, setSelectedAnalyteForAI] = useState<any | null>(
-    null
-  );
-  const [aiProcessingConfig, setAiProcessingConfig] = useState<{
-    type: string;
-    prompt?: string;
-  } | null>(null);
+  const [selectedAnalyteForAI, setSelectedAnalyteForAI] = useState<any | null>(null);
+  const [aiProcessingConfig, setAiProcessingConfig] = useState<{ type: string; prompt?: string } | null>(null);
 
   // UX states
   const [savingDraft, setSavingDraft] = useState(false);
   const [submittingResults, setSubmittingResults] = useState(false);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
-  const [activeEntryMode, setActiveEntryMode] = useState<"manual" | "ai">(
-    "manual"
-  );
+  const [activeEntryMode, setActiveEntryMode] = useState<"manual" | "ai">("manual");
 
   // QR
   const [qrCodeImage, setQrCodeImage] = useState<string>("");
+
+  // attachments
+  const [attachments, setAttachments] = React.useState<any[]>([]);
+  const [activeAttachment, setActiveAttachment] = React.useState<any | null>(null);
+  const [progressRows, setProgressRows] = useState<any[]>([]);
+  const [readonlyByTG, setReadonlyByTG] = useState<Record<string, any[]>>({});
+  const [showAudit, setShowAudit] = useState(false);
 
   // =========================================================
   // #endregion State
@@ -351,10 +399,24 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
     }
   }, [order.qr_code_data]);
 
+  React.useEffect(() => {
+    supabase
+      .from("attachments")
+      .select("id,file_url,file_type,original_filename,file_size,upload_timestamp")
+      .or(`order_id.eq.${order.id},and(related_table.eq.orders,related_id.eq.${order.id})`)
+      .order("upload_timestamp", { ascending: false })
+      .then(({ data }) => {
+        setAttachments(data || []);
+        if (!activeAttachment && data?.length) setActiveAttachment(data[0]);
+      });
+  }, [order.id]);
+
   // First-load data
   React.useEffect(() => {
     fetchAllAnalytes();
     fetchOrderAnalytes();
+    fetchProgressView();
+    fetchReadonlyResults();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -431,12 +493,8 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
             <div><strong>Sample ID:</strong> ${order.sample_id || "N/A"}</div>
             <div><strong>Patient:</strong> ${order.patient_name}</div>
             <div><strong>Order ID:</strong> ${order.id}</div>
-            <div><strong>Sample Tube:</strong> <span class="color-indicator" style="background-color:${
-              order.color_code
-            }"></span>${order.color_name || ""}</div>
-            <div><strong>Order Date:</strong> ${new Date(
-              order.order_date
-            ).toLocaleDateString()}</div>
+            <div><strong>Sample Tube:</strong> <span class="color-indicator" style="background-color:${order.color_code}"></span>${order.color_name || ""}</div>
+            <div><strong>Order Date:</strong> ${new Date(order.order_date).toLocaleDateString()}</div>
             <div><strong>Tests:</strong> ${order.tests.join(", ")}</div>
           </div>
         </div>
@@ -469,9 +527,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
 
   const fetchOrderAnalytes = async () => {
     try {
-      const { data: orderData, error: orderError } = await database.orders.getById(
-        order.id
-      );
+      const { data: orderData, error: orderError } = await database.orders.getById(order.id);
       if (orderError || !orderData) return;
 
       // Pull order + test-groups + existing results
@@ -560,27 +616,23 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
       if (error) throw error;
 
       const tgFromOTG =
-        data.order_test_groups?.filter((otg: any) => otg.test_groups).map(
-          (otg: any) => ({
-            test_group_id: otg.test_groups.id,
-            test_group_name: otg.test_groups.name,
-            order_test_group_id: otg.id,
-            order_test_id: null,
-            source: "order_test_groups" as const,
-            analytes:
-              otg.test_groups.test_group_analytes?.map((tga: any) => ({
-                ...tga.analytes,
-                code: otg.test_groups.code,
-                units: tga.analytes.unit,
-                existing_result:
-                  data.results
-                    ?.find((r: any) => r.order_test_group_id === otg.id)
-                    ?.result_values?.find(
-                      (rv: any) => rv.analyte_id === tga.analytes.id
-                    ) || null,
-              })) || [],
-          })
-        ) || [];
+        data.order_test_groups?.filter((otg: any) => otg.test_groups).map((otg: any) => ({
+          test_group_id: otg.test_groups.id,
+          test_group_name: otg.test_groups.name,
+          order_test_group_id: otg.id,
+          order_test_id: null,
+          source: "order_test_groups" as const,
+          analytes:
+            otg.test_groups.test_group_analytes?.map((tga: any) => ({
+              ...tga.analytes,
+              code: otg.test_groups.code,
+              units: tga.analytes.unit,
+              existing_result:
+                data.results
+                  ?.find((r: any) => r.order_test_group_id === otg.id)
+                  ?.result_values?.find((rv: any) => rv.analyte_id === tga.analytes.id) || null,
+            })) || [],
+        })) || [];
 
       const tgFromOT =
         data.order_tests
@@ -599,40 +651,30 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                 existing_result:
                   data.results
                     ?.find((r: any) => r.order_test_id === ot.id)
-                    ?.result_values?.find(
-                      (rv: any) => rv.analyte_id === tga.analytes.id
-                    ) || null,
+                    ?.result_values?.find((rv: any) => rv.analyte_id === tga.analytes.id) || null,
               })) || [],
           })) || [];
 
       // Merge by test_group_id and union analytes
-      const merged = [...tgFromOTG, ...tgFromOT].reduce(
-        (acc: TestGroupResult[], current: any) => {
-          const idx = acc.findIndex(
-            (tg) => tg.test_group_id === current.test_group_id
-          );
-          if (idx === -1) {
-            acc.push(current);
-          } else {
-            const existing = acc[idx];
-            const mergedAnalytes = [...existing.analytes];
-            current.analytes.forEach((a: any) => {
-              if (!mergedAnalytes.find((m) => m.id === a.id)) {
-                mergedAnalytes.push(a);
-              }
-            });
-            acc[idx] = {
-              ...existing,
-              analytes: mergedAnalytes,
-              order_test_group_id:
-                existing.order_test_group_id || current.order_test_group_id,
-              order_test_id: existing.order_test_id || current.order_test_id,
-            };
-          }
-          return acc;
-        },
-        []
-      );
+      const merged = [...tgFromOTG, ...tgFromOT].reduce((acc: TestGroupResult[], current: any) => {
+        const idx = acc.findIndex((tg) => tg.test_group_id === current.test_group_id);
+        if (idx === -1) {
+          acc.push(current);
+        } else {
+          const existing = acc[idx];
+          const mergedAnalytes = [...existing.analytes];
+          current.analytes.forEach((a: any) => {
+            if (!mergedAnalytes.find((m) => m.id === a.id)) mergedAnalytes.push(a);
+          });
+          acc[idx] = {
+            ...existing,
+            analytes: mergedAnalytes,
+            order_test_group_id: existing.order_test_group_id || current.order_test_group_id,
+            order_test_id: existing.order_test_id || current.order_test_id,
+          };
+        }
+        return acc;
+      }, []);
 
       setTestGroups(merged);
 
@@ -674,6 +716,81 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
     }
   };
 
+  // NEW: attachments list (accept both order_id and related_table/related_id)
+  const fetchAttachmentsForOrder = async () => {
+    try {
+      const q1 = await supabase
+        .from("attachments")
+        .select(
+          "id, original_filename, file_url, file_type, file_size, uploaded_by, upload_timestamp, description"
+        )
+        .eq("order_id", order.id)
+        .order("upload_timestamp", { ascending: false });
+
+      const q2 = await supabase
+        .from("attachments")
+        .select(
+          "id, original_filename, file_url, file_type, file_size, uploaded_by, upload_timestamp, description"
+        )
+        .eq("related_table", "orders")
+        .eq("related_id", order.id)
+        .order("upload_timestamp", { ascending: false });
+
+      const list = [...(q1.data || []), ...(q2.data || [])];
+      // de-dup on id
+      const dedup = Object.values(
+        list.reduce((m: any, a: any) => ((m[a.id] = a), m), {})
+      );
+      setAttachments(dedup as any[]);
+    } catch (e) {
+      console.error("Error loading attachments", e);
+    }
+  };
+
+  // NEW: v_order_test_progress rows
+  const fetchProgressView = async () => {
+    try {
+      const { data, error } = await supabase
+        .from("v_order_test_progress")
+        .select(
+          "order_test_id, order_id, test_group_id, test_group_name, expected_analytes, entered_analytes, total_values, has_results, is_verified, panel_status"
+        )
+        .eq("order_id", order.id);
+      if (!error) setProgressRows(data || []);
+    } catch (e) {
+      console.error("Error loading v_order_test_progress", e);
+    }
+  };
+
+  // NEW: read-only submitted values (grouped by test_group_id)
+  const fetchReadonlyResults = async () => {
+    try {
+      const { data, error } = await supabase
+        .from("results")
+        .select(
+          `
+          id, order_id, test_group_id, order_test_group_id, order_test_id, test_name, created_at, status,
+          result_values ( id, analyte_name, value, unit, reference_range, flag )
+        `
+        )
+        .eq("order_id", order.id)
+        .order("created_at", { ascending: false });
+      if (error) return;
+
+      const map: Record<string, any[]> = {};
+      (data || []).forEach((r: any) => {
+        const key = r.test_group_id || r.order_test_group_id || r.order_test_id || "unknown";
+        const arr = r.result_values || [];
+        if (!map[key]) map[key] = [];
+        // keep newest first; if same analyte appears, latest stays at top
+        map[key] = [...arr, ...(map[key] || [])];
+      });
+      setReadonlyByTG(map);
+    } catch (e) {
+      console.error("Error loading readonly results", e);
+    }
+  };
+
   // =========================================================
   // #endregion Data fetchers
   // =========================================================
@@ -686,12 +803,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
     setIsUploading(true);
     setOcrError(null);
     try {
-      const filePath = generateFilePath(
-        file.name,
-        order.patient_id,
-        undefined,
-        "order-results"
-      );
+      const filePath = generateFilePath(file.name, order.patient_id, undefined, "order-results");
       const uploadResult = await uploadFile(file, filePath);
       const currentLabId = await database.getCurrentUserLabId();
 
@@ -699,10 +811,11 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
         .from("attachments")
         .insert([
           {
-            patient_id: order.patient_id,
-            lab_id: currentLabId,
+            order_id: order.id,
             related_table: "orders",
             related_id: order.id,
+            patient_id: order.patient_id,
+            lab_id: currentLabId,
             file_url: uploadResult.publicUrl,
             file_path: uploadResult.path,
             original_filename: file.name,
@@ -720,6 +833,11 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
       if (error) throw new Error(error.message);
       setAttachmentId(attachment.id);
       setUploadedFile(file);
+      // refresh visible list
+      setAttachments(prev => [attachment, ...prev]);
+      if (!activeAttachment) setActiveAttachment(attachment);
+      
+      mark("upload", "ok", { name: file.name });
     } catch (err) {
       console.error("Error uploading file:", err);
       setOcrError("Failed to upload file. Please try again.");
@@ -741,125 +859,114 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
     });
   };
 
-  const handleRunAIProcessing = async (analyteConfig?: {
-    type: string;
-    prompt?: string;
-  }) => {
-    if (!attachmentId) {
-      setOcrError("Please upload a file first.");
-      return;
-    }
-
-    const processingType = analyteConfig?.type || aiProcessingConfig?.type || "ocr_report";
-    const customPrompt = analyteConfig?.prompt || aiProcessingConfig?.prompt;
-
+  const handleRunAIProcessing = async (analyteConfig?: { type: string; prompt?: string }) => {
+    aiStart();
     setIsOCRProcessing(true);
     setOcrError(null);
 
-    // Only extract missing fields (faster, safer)
-    const analytesToExtract = manualValues
-      .filter((v) => v.value.trim() === "")
-      .map((v) => v.parameter);
-
     try {
-      const visionResponse = await supabase.functions.invoke("vision-ocr", {
-        body: {
-          attachmentId,
-          documentType:
-            processingType === "ocr_report" ? "printed-report" : undefined,
-          testType:
-            processingType === "vision_card"
-              ? "test-card"
-              : processingType === "vision_color"
-              ? "color-analysis"
-              : undefined,
-          aiProcessingType: processingType,
-          analysisType:
-            processingType === "ocr_report"
-              ? "text"
-              : processingType === "vision_card"
-              ? "objects"
-              : processingType === "vision_color"
-              ? "colors"
-              : "all",
-        },
+      aiMark("attach", { status: "doing" });
+      if (!attachmentId) { aiFail("attach","No attachment. Upload a report/image first."); setIsOCRProcessing(false); return; }
+      aiMark("attach", { status: "done", detail: "Attachment available" });
+
+      aiMark("vision", { status: "doing" });
+      const processingType = analyteConfig?.type || aiProcessingConfig?.type || "ocr_report";
+      const customPrompt   = analyteConfig?.prompt || aiProcessingConfig?.prompt;
+
+      const visionResponse = await supabase.functions.invoke("vision-ocr", { 
+        body: { 
+          attachmentId, 
+          aiProcessingType: processingType, 
+          analysisType: processingType==="ocr_report"?"text":"all" 
+        }
       });
       if (visionResponse.error) throw new Error(visionResponse.error.message);
-      const visionData = visionResponse.data;
+      aiMark("vision", { status: "done", detail: (visionResponse.data?.fullText || "").slice(0,80) + "…" });
 
+      aiMark("nlp", { status: "doing" });
+      const analytesToExtract = manualValues.filter(v => v.value.trim()==="").map(v => v.parameter);
       const geminiResponse = await supabase.functions.invoke("gemini-nlp", {
         body: {
-          rawText: visionData.fullText,
-          visionResults: visionData,
-          originalBase64Image: visionData.originalBase64Image,
-          documentType:
-            processingType === "ocr_report" ? "printed-report" : undefined,
-          testType:
-            processingType === "vision_card"
-              ? "test-card"
-              : processingType === "vision_color"
-              ? "color-analysis"
-              : undefined,
+          rawText: visionResponse.data?.fullText,
+          visionResults: visionResponse.data,
+          originalBase64Image: visionResponse.data?.originalBase64Image,
           aiProcessingType: processingType,
           aiPromptOverride: customPrompt,
           allAnalytes,
-          analytesToExtract: analytesToExtract.length
-            ? analytesToExtract
-            : undefined,
+          analytesToExtract: analytesToExtract.length ? analytesToExtract : undefined,
         },
         headers: { "x-attachment-id": attachmentId, "x-order-id": order.id },
       });
       if (geminiResponse.error) throw new Error(geminiResponse.error.message);
-      const result = geminiResponse.data;
+      aiMark("nlp", { status: "done", detail: "Tokens parsed" });
 
-      // Two possible shapes: keyed object (fast fill) or structured array
-      if (
-        analytesToExtract.length &&
-        result &&
-        typeof result === "object" &&
-        !Array.isArray(result) &&
-        !result.extractedParameters
-      ) {
-        setOcrResults(result);
-        setManualValues((prev) => {
-          const updated = [...prev];
-          Object.keys(result).forEach((paramName) => {
-            const idx = updated.findIndex((v) => v.parameter === paramName);
-            if (idx !== -1) updated[idx] = { ...updated[idx], value: result[paramName] };
+      aiMark("match", { status: "doing" });
+      const result = geminiResponse.data;
+      let matchedCount = 0;
+
+      // your existing shape-handling remains
+      const foundCount =
+        Array.isArray(result?.extractedParameters) ? result.extractedParameters.length :
+        (result && typeof result === "object" && !Array.isArray(result)) ? Object.keys(result).length : 0;
+
+      if (foundCount > 0) {
+        if (
+          analytesToExtract.length &&
+          result &&
+          typeof result === "object" &&
+          !Array.isArray(result) &&
+          !result.extractedParameters
+        ) {
+          setOcrResults(result);
+          setManualValues((prev) => {
+            const updated = [...prev];
+            Object.keys(result).forEach((paramName) => {
+              const idx = updated.findIndex((v) => v.parameter === paramName);
+              if (idx !== -1) updated[idx] = { ...updated[idx], value: result[paramName] };
+            });
+            return updated;
           });
-          return updated;
-        });
-        setExtractedValues([]);
-      } else if (Array.isArray(result?.extractedParameters)) {
-        const extractedParams = result.extractedParameters.map((p: any) => ({
-          parameter: p.parameter,
-          value: p.value,
-          unit: p.unit || "",
-          reference: p.reference_range || "",
-          flag: p.flag || undefined,
-          matched: !!p.matched,
-          analyte_id: p.analyte_id || null,
-          confidence: p.confidence || 0.95,
-        }));
-        setExtractedValues(extractedParams);
-        setOcrResults(result);
-        setManualValues((prev) => {
-          const updated = [...prev];
-          extractedParams.forEach((ep: ExtractedValue) => {
-            const idx = updated.findIndex((v) => v.parameter === ep.parameter);
-            if (idx !== -1) updated[idx] = { ...updated[idx], value: ep.value, flag: ep.flag };
+          setExtractedValues([]);
+          matchedCount = foundCount;
+        } else if (Array.isArray(result?.extractedParameters)) {
+          const extractedParams = result.extractedParameters.map((p: any) => ({
+            parameter: p.parameter,
+            value: p.value,
+            unit: p.unit || "",
+            reference: p.reference_range || "",
+            flag: p.flag || undefined,
+            matched: !!p.matched,
+            analyte_id: p.analyte_id || null,
+            confidence: p.confidence || 0.95,
+          }));
+          setExtractedValues(extractedParams);
+          setOcrResults(result);
+          setManualValues((prev) => {
+            const updated = [...prev];
+            extractedParams.forEach((ep: ExtractedValue) => {
+              const idx = updated.findIndex((v) => v.parameter === ep.parameter);
+              if (idx !== -1) updated[idx] = { ...updated[idx], value: ep.value, flag: ep.flag };
+            });
+            return updated;
           });
-          return updated;
-        });
-      } else if (result?.rawText) {
-        setOcrError(
-          "OCR extracted text but could not parse structured data. Please enter results manually."
-        );
-      } else {
-        setOcrError("No structured data could be extracted from the document.");
+          matchedCount = result.extractedParameters.filter((p: any) => p?.matched).length;
+        }
       }
-    } catch (err) {
-      console.error("Error running AI processing:", err);
+
+      setAiMatchedCount(matchedCount);
+      aiMark("match", { status: "done", detail: `Matched ${matchedCount} analyte(s)` });
+
+      aiMark("fill", { status: "doing" });
+      // after you update state:
+      aiMark("fill", { status: "done", detail: "Values placed into grid" });
+
+      aiMark("final", { status: "done" });
+      setAiPhase("done");
+      setAiProgress(100);
+
+      if (!matchedCount) setOcrError("OCR parsed text but no analytes matched your catalogue.");
+    } catch (err: any) {
+      aiFail("final", err?.message || "Unknown error");
       setOcrError("Failed to process document. Please try again.");
     } finally {
       setIsOCRProcessing(false);
@@ -965,9 +1072,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
     );
 
     // Remove from manualValues list (they disappear from the entry table)
-    setManualValues((prev) =>
-      prev.filter((v) => !submitted.some((s) => s.parameter === v.parameter))
-    );
+    setManualValues((prev) => prev.filter((v) => !submitted.some((s) => s.parameter === v.parameter)));
   };
 
   // =========================================================
@@ -978,14 +1083,8 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
   // #region Draft & Submit handlers
   // =========================================================
 
-  const handleManualValueChange = (
-    index: number,
-    field: keyof ExtractedValue,
-    value: string
-  ) => {
-    setManualValues((prev) =>
-      prev.map((item, i) => (i === index ? { ...item, [field]: value } : item))
-    );
+  const handleManualValueChange = (index: number, field: keyof ExtractedValue, value: string) => {
+    setManualValues((prev) => prev.map((item, i) => (i === index ? { ...item, [field]: value } : item)));
   };
 
   const handleSaveDraft = async () => {
@@ -1014,17 +1113,13 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
         patient_id: order.patient_id,
         test_name: order.tests.join(", "),
         status: "Entered" as const,
-        entered_by:
-          user?.user_metadata?.full_name || user?.email || "Unknown User",
+        entered_by: user?.user_metadata?.full_name || user?.email || "Unknown User",
         entered_date: new Date().toISOString().split("T")[0],
         values: valuesWithFlags,
       };
 
       if (existingResultId) {
-        const { error } = await database.results.update(
-          existingResultId,
-          resultData
-        );
+        const { error } = await database.results.update(existingResultId, resultData);
         if (error) throw new Error(error.message);
       } else {
         const { data, error } = await database.results.create(resultData);
@@ -1043,6 +1138,18 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
     }
   };
 
+  // Helper to locate an existing results row for a panel, based on strongest key available
+  const findExistingResultsRowId = async (tg: TestGroupResult) => {
+    const q = supabase.from("results").select("id").eq("order_id", order.id);
+    if (tg.order_test_group_id) (q as any).eq("order_test_group_id", tg.order_test_group_id);
+    else if (tg.order_test_id) (q as any).eq("order_test_id", tg.order_test_id);
+    else (q as any).eq("test_group_id", tg.test_group_id);
+
+    const { data, error } = (await (q as any).limit(1)) as { data: { id: string }[] | null; error: any };
+    if (error) return null;
+    return data && data[0] ? data[0].id : null;
+  };
+
   const handleSubmitResults = async () => {
     const validResults = manualValues.filter((v) => v.value.trim() !== "");
     if (!validResults.length) {
@@ -1057,44 +1164,55 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
       const currentUser = await supabase.auth.getUser();
       const userLabId = await database.getCurrentUserLabId();
 
-      // Save per test-group to results + result_values
       for (const testGroup of testGroups) {
-        // Only the analytes that are still in manualValues (i.e., editable)
-        const testGroupResults = validResults.filter((v) =>
-          testGroup.analytes.some((a) => a.name === v.parameter)
-        );
+        // Save only for analytes that are still editable and belong to this TG
+        const testGroupResults = validResults.filter((v) => testGroup.analytes.some((a) => a.name === v.parameter));
         if (testGroupResults.length === 0) continue;
 
-        const resultData = {
-          order_id: order.id,
-          patient_id: order.patient_id,
-          patient_name: order.patient_name,
-          test_name: testGroup.test_group_name,
-          status: "pending_verification",
-          entered_by: currentUser.data.user?.email || "Unknown User",
-          entered_date: new Date().toISOString().split("T")[0],
-          test_group_id: testGroup.test_group_id,
-          lab_id: userLabId,
-          extracted_by_ai: !!attachmentId,
-          ai_confidence: ocrResults?.metadata?.ocrConfidence || null,
-          attachment_id: attachmentId || null,
-          ...(testGroup.order_test_group_id && {
-            order_test_group_id: testGroup.order_test_group_id,
-          }),
-          ...(testGroup.order_test_id && { order_test_id: testGroup.order_test_id }),
-        };
+        // ✅ Duplicate-safe: reuse results row if it already exists for this panel
+        let resultRowId = await findExistingResultsRowId(testGroup);
 
-        const { data: savedResult, error: resultError } = await supabase
-          .from("results")
-          .insert(resultData)
-          .select()
-          .single();
-        if (resultError) throw resultError;
+        if (!resultRowId) {
+          const resultData = {
+            order_id: order.id,
+            patient_id: order.patient_id,
+            patient_name: order.patient_name,
+            test_name: testGroup.test_group_name,
+            status: "pending_verification",
+            entered_by: currentUser.data.user?.email || "Unknown User",
+            entered_date: new Date().toISOString().split("T")[0],
+            test_group_id: testGroup.test_group_id,
+            lab_id: userLabId,
+            extracted_by_ai: !!attachmentId,
+            ai_confidence: ocrResults?.metadata?.ocrConfidence || null,
+            attachment_id: attachmentId || null,
+            ...(testGroup.order_test_group_id && { order_test_group_id: testGroup.order_test_group_id }),
+            ...(testGroup.order_test_id && { order_test_id: testGroup.order_test_id }),
+          };
+
+          const { data: savedResult, error: resultError } = await supabase
+            .from("results")
+            .insert(resultData)
+            .select()
+            .single();
+          if (resultError) throw resultError;
+          resultRowId = savedResult.id;
+        }
+
+        // Upsert result_values for only the analytes we are saving now:
+        const names = testGroupResults.map((r) => r.parameter);
+
+        // Delete previous entries for these analytes on this result row
+        await supabase
+          .from("result_values")
+          .delete()
+          .eq("result_id", resultRowId)
+          .in("analyte_name", names);
 
         const resultValuesData = testGroupResults.map((r) => {
           const analyte = testGroup.analytes.find((a) => a.name === r.parameter);
           return {
-            result_id: savedResult.id,
+            result_id: resultRowId!,
             analyte_id: analyte?.id,
             analyte_name: r.parameter,
             parameter: r.parameter,
@@ -1105,21 +1223,21 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
             order_id: order.id,
             test_group_id: testGroup.test_group_id,
             lab_id: userLabId,
-            ...(testGroup.order_test_group_id && {
-              order_test_group_id: testGroup.order_test_group_id,
-            }),
+            ...(testGroup.order_test_group_id && { order_test_group_id: testGroup.order_test_group_id }),
             ...(testGroup.order_test_id && { order_test_id: testGroup.order_test_id }),
           };
         });
 
-        const { error: valuesError } = await supabase
-          .from("result_values")
-          .insert(resultValuesData);
+        const { error: valuesError } = await supabase.from("result_values").insert(resultValuesData);
         if (valuesError) throw valuesError;
       }
 
       // Local immediate UX: hide submitted analytes now
       markAnalytesAsSubmitted(validResults);
+
+      // refresh read-only view + progress
+      fetchReadonlyResults();
+      fetchProgressView();
 
       setSaveMessage("Successfully saved test results!");
 
@@ -1167,12 +1285,8 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
               </div>
             </div>
             <div>
-              <div className="text-sm font-medium text-gray-900">
-                {uploadedFile.name}
-              </div>
-              <div className="text-xs text-gray-500">
-                {(uploadedFile.size / 1024 / 1024).toFixed(2)} MB
-              </div>
+              <div className="text-sm font-medium text-gray-900">{uploadedFile.name}</div>
+              <div className="text-xs text-gray-500">{(uploadedFile.size / 1024 / 1024).toFixed(2)} MB</div>
               {aiProcessingConfig && (
                 <div className="text-xs text-purple-600 mt-1">
                   AI Type: {getAIProcessingTypeLabel(aiProcessingConfig.type)}
@@ -1217,9 +1331,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                 )}
               </button>
               <p className="text-xs text-gray-500 mt-2">
-                {aiProcessingConfig?.type === "ocr_report"
-                  ? "Supports JPG, PNG, PDF (max 10MB)"
-                  : "Supports JPG, PNG (max 10MB)"}
+                {aiProcessingConfig?.type === "ocr_report" ? "Supports JPG, PNG, PDF (max 10MB)" : "Supports JPG, PNG (max 10MB)"}
               </p>
               {aiProcessingConfig && (
                 <p className="text-xs text-purple-600 mt-1">
@@ -1245,10 +1357,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
     testGroup: TestGroupResult;
     entryMode: "manual" | "ai";
   }> = ({ testGroup, entryMode }) => {
-    const testGroupValues = manualValues.filter((v) =>
-      testGroup.analytes.some((a) => a.name === v.parameter)
-    );
-
+    const testGroupValues = manualValues.filter((v) => testGroup.analytes.some((a) => a.name === v.parameter));
     const completedCount = testGroupValues.filter((v) => v.value.trim()).length;
 
     return (
@@ -1263,11 +1372,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
               <div
                 className="bg-blue-600 h-2 rounded-full transition-all"
                 style={{
-                  width: `${
-                    testGroupValues.length
-                      ? (completedCount / testGroupValues.length) * 100
-                      : 0
-                  }%`,
+                  width: `${testGroupValues.length ? (completedCount / testGroupValues.length) * 100 : 0}%`,
                 }}
               />
             </div>
@@ -1276,18 +1381,14 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
 
         {entryMode === "ai" && (
           <div className="mb-4 p-3 bg-purple-50 border border-purple-200 rounded-lg">
-            <h5 className="text-sm font-medium text-purple-900 mb-2">
-              AI Processing for {testGroup.test_group_name}
-            </h5>
+            <h5 className="text-sm font-medium text-purple-900 mb-2">AI Processing for {testGroup.test_group_name}</h5>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               {testGroup.analytes.map((analyte) => (
                 <div
                   key={analyte.id}
                   onClick={() => handleSelectAnalyteForAI(analyte)}
                   className={`p-2 border rounded cursor-pointer transition-all ${
-                    selectedAnalyteForAI?.id === analyte.id
-                      ? "border-purple-500 bg-purple-100"
-                      : "border-gray-200 hover:border-gray-300"
+                    selectedAnalyteForAI?.id === analyte.id ? "border-purple-500 bg-purple-100" : "border-gray-200 hover:border-gray-300"
                   }`}
                 >
                   <div className="text-sm font-medium">{analyte.name}</div>
@@ -1296,9 +1397,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                       (analyte as any).ai_processing_type || "none"
                     )}`}
                   >
-                    {getAIProcessingTypeLabel(
-                      (analyte as any).ai_processing_type || "none"
-                    )}
+                    {getAIProcessingTypeLabel((analyte as any).ai_processing_type || "none")}
                   </span>
                 </div>
               ))}
@@ -1310,51 +1409,29 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
           <table className="min-w-full divide-y divide-gray-200">
             <thead className="bg-gray-50">
               <tr>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
-                  Parameter
-                </th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
-                  Value
-                </th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
-                  Unit
-                </th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
-                  Reference Range
-                </th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
-                  Flag
-                </th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Parameter</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Value</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Unit</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Reference Range</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Flag</th>
               </tr>
             </thead>
             <tbody className="bg-white divide-y divide-gray-200">
               {testGroupValues.map((value, index) => {
-                const globalIndex = manualValues.findIndex(
-                  (v) => v.parameter === value.parameter
-                );
-                const analyte = testGroup.analytes.find(
-                  (a) => a.name === value.parameter
-                );
+                const globalIndex = manualValues.findIndex((v) => v.parameter === value.parameter);
+                const analyte = testGroup.analytes.find((a) => a.name === value.parameter);
 
                 return (
                   <tr key={index} className="hover:bg-gray-50">
                     <td className="px-4 py-3 text-sm font-medium text-gray-900">
                       <div className="whitespace-nowrap">{value.parameter}</div>
-                      <div className="text-xs text-gray-500">
-                        ({analyte?.code})
-                      </div>
+                      <div className="text-xs text-gray-500">({analyte?.code})</div>
                     </td>
                     <td className="px-4 py-3 min-w-[140px]">
                       <input
                         type="text"
                         value={value.value}
-                        onChange={(e) =>
-                          handleManualValueChange(
-                            globalIndex,
-                            "value",
-                            e.target.value
-                          )
-                        }
+                        onChange={(e) => handleManualValueChange(globalIndex, "value", e.target.value)}
                         className="w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
                         placeholder="Enter value"
                       />
@@ -1363,13 +1440,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                       <input
                         type="text"
                         value={value.unit}
-                        onChange={(e) =>
-                          handleManualValueChange(
-                            globalIndex,
-                            "unit",
-                            e.target.value
-                          )
-                        }
+                        onChange={(e) => handleManualValueChange(globalIndex, "unit", e.target.value)}
                         className="w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
                         placeholder="Unit"
                       />
@@ -1378,13 +1449,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                       <input
                         type="text"
                         value={value.reference}
-                        onChange={(e) =>
-                          handleManualValueChange(
-                            globalIndex,
-                            "reference",
-                            e.target.value
-                          )
-                        }
+                        onChange={(e) => handleManualValueChange(globalIndex, "reference", e.target.value)}
                         className="w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
                         placeholder="Reference range"
                       />
@@ -1392,13 +1457,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                     <td className="px-4 py-3 min-w-[120px]">
                       <select
                         value={value.flag || ""}
-                        onChange={(e) =>
-                          handleManualValueChange(
-                            globalIndex,
-                            "flag",
-                            e.target.value
-                          )
-                        }
+                        onChange={(e) => handleManualValueChange(globalIndex, "flag", e.target.value)}
                         className="w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
                       >
                         {FLAG_OPTIONS.map((option) => (
@@ -1412,15 +1471,10 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                 );
               })}
 
-              {/* When everything is submitted/hidden */}
               {testGroupValues.length === 0 && (
                 <tr>
-                  <td
-                    colSpan={5}
-                    className="px-4 py-6 text-sm text-gray-500 text-center"
-                  >
-                    All analytes for this test group are already submitted or
-                    verified.
+                  <td colSpan={5} className="px-4 py-6 text-sm text-gray-500 text-center">
+                    All analytes for this test group are already submitted or verified.
                   </td>
                 </tr>
               )}
@@ -1435,6 +1489,16 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
   // #endregion Small render helpers
   // =========================================================
 
+  // Helpers to render progress chips and submitted values
+  const statusChipColor = (panel_status: string) =>
+    ({
+      "Not started": "bg-gray-100 text-gray-800",
+      "In progress": "bg-blue-100 text-blue-800",
+      Partial: "bg-amber-100 text-amber-800",
+      Complete: "bg-green-100 text-green-800",
+      Verified: "bg-emerald-100 text-emerald-800",
+    } as any)[panel_status] || "bg-gray-100 text-gray-800";
+
   // =========================================================
   // #region Render
   // =========================================================
@@ -1445,17 +1509,10 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
         {/* Header */}
         <div className="flex items-center justify-between p-4 sm:p-6 border-b border-gray-200 sticky top-0 bg-white z-10">
           <div className="min-w-0">
-            <h2 className="text-base sm:text-xl font-semibold text-gray-900 truncate">
-              Order Details
-            </h2>
-            <p className="text-xs sm:text-sm text-gray-600 mt-1">
-              Order ID: {order.id}
-            </p>
+            <h2 className="text-base sm:text-xl font-semibold text-gray-900 truncate">Order Details</h2>
+            <p className="text-xs sm:text-sm text-gray-600 mt-1">Order ID: {order.id}</p>
           </div>
-          <button
-            onClick={onClose}
-            className="text-gray-400 hover:text-gray-500 p-1 rounded"
-          >
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-500 p-1 rounded">
             <X className="h-6 w-6" />
           </button>
         </div>
@@ -1466,9 +1523,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
             <button
               onClick={() => setActiveTab("details")}
               className={`py-3 sm:py-4 text-sm font-medium border-b-2 transition-colors ${
-                activeTab === "details"
-                  ? "border-blue-500 text-blue-600"
-                  : "border-transparent text-gray-500 hover:text-gray-700"
+                activeTab === "details" ? "border-blue-500 text-blue-600" : "border-transparent text-gray-500 hover:text-gray-700"
               }`}
             >
               Order Details
@@ -1476,9 +1531,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
             <button
               onClick={() => setActiveTab("results")}
               className={`py-3 sm:py-4 text-sm font-medium border-b-2 transition-colors ${
-                activeTab === "results"
-                  ? "border-blue-500 text-blue-600"
-                  : "border-transparent text-gray-500 hover:text-gray-700"
+                activeTab === "results" ? "border-blue-500 text-blue-600" : "border-transparent text-gray-500 hover:text-gray-700"
               }`}
             >
               AI Result Entry
@@ -1492,26 +1545,83 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
             <div className="space-y-6">
               {/* Quick Status */}
               <div className="bg-white border border-gray-200 rounded-lg p-4 sm:p-6">
-                <h3 className="text-lg font-semibold text-gray-900 mb-3 sm:mb-4">
-                  Quick Status Updates
-                </h3>
-                <div className="flex flex-wrap gap-2 sm:gap-3">
-                  {getAvailableStatusActions(order.status, order).map(
-                    (action) => (
-                      <button
-                        key={action.status}
-                        onClick={() => onUpdateStatus(order.id, action.status)}
-                        className={`px-3 sm:px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-                          action.primary
-                            ? "bg-blue-600 text-white hover:bg-blue-700"
-                            : "bg-gray-100 text-gray-700 hover:bg-gray-200"
-                        }`}
-                      >
-                        {action.label}
-                      </button>
-                    )
-                  )}
+                <div className="flex items-center justify-between">
+                  <h3 className="text-lg font-semibold text-gray-900">Quick Status Updates</h3>
+                  <button
+                    onClick={() => setShowAudit(true)}
+                    className="inline-flex items-center text-sm px-3 py-1.5 rounded-lg bg-gray-100 hover:bg-gray-200"
+                  >
+                    <Eye className="h-4 w-4 mr-1" />
+                    Open Result Audit
+                  </button>
                 </div>
+                <div className="flex flex-wrap gap-2 sm:gap-3 mt-3">
+                  {getAvailableStatusActions(order.status, order).map((action) => (
+                    <button
+                      key={action.status}
+                      onClick={() => onUpdateStatus(order.id, action.status)}
+                      className={`px-3 sm:px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                        action.primary ? "bg-blue-600 text-white hover:bg-blue-700" : "bg-gray-100 text-gray-700 hover:bg-gray-200"
+                      }`}
+                    >
+                      {action.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Attachments */}
+              <div className="bg-white border border-gray-200 rounded-lg p-4 sm:p-6">
+                <h3 className="text-lg font-semibold text-gray-900 mb-3">Attachments</h3>
+
+                {attachments.length === 0 ? (
+                  <div className="text-sm text-gray-500">No attachments.</div>
+                ) : (
+                  <>
+                    <div className="flex gap-2 overflow-x-auto pb-2">
+                      {attachments.map(a => (
+                        <button
+                          key={a.id}
+                          onClick={() => setActiveAttachment(a)}
+                          className={`px-3 py-2 rounded-lg border text-left whitespace-nowrap ${
+                            activeAttachment?.id === a.id ? "border-blue-500 ring-2 ring-blue-200" : "border-gray-200"
+                          }`}
+                          title={a.original_filename}
+                        >
+                          <div className="text-sm font-medium truncate max-w-[220px]">{a.original_filename}</div>
+                          <div className="text-xs text-gray-500">
+                            {(Number(a.file_size || 0) / 1048576).toFixed(2)} MB • {a.file_type || "file"}
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+
+                    <div className="mt-3 border rounded-lg bg-gray-50 h-[420px] flex items-center justify-center overflow-hidden">
+                      {!activeAttachment ? (
+                        <div className="text-sm text-gray-500">Select an attachment to preview</div>
+                      ) : activeAttachment.file_type?.startsWith("image/") ? (
+                        <img
+                          src={activeAttachment.file_url}
+                          alt={activeAttachment.original_filename}
+                          className="max-h-[400px] max-w-full object-contain"
+                        />
+                      ) : activeAttachment.file_type === "application/pdf" ? (
+                        <iframe
+                          src={`${activeAttachment.file_url}#view=FitH`}
+                          className="w-full h-[420px]"
+                          title={activeAttachment.original_filename}
+                        />
+                      ) : (
+                        <div className="text-sm text-gray-600">
+                          Preview not available.{" "}
+                          <a href={activeAttachment.file_url} target="_blank" rel="noreferrer" className="text-blue-600 underline">
+                            Open
+                          </a>
+                        </div>
+                      )}
+                    </div>
+                  </>
+                )}
               </div>
 
               {/* Order Summary */}
@@ -1519,36 +1629,24 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                   <div>
                     <div className="text-blue-600 font-medium">Patient</div>
-                    <div className="text-blue-900 font-semibold">
-                      {order.patient_name}
-                    </div>
+                    <div className="text-blue-900 font-semibold">{order.patient_name}</div>
                     <div className="text-blue-700 text-sm">{order.patient_id}</div>
                   </div>
                   <div>
                     <div className="text-blue-600 font-medium">Status</div>
-                    <span
-                      className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(
-                        order.status
-                      )}`}
-                    >
+                    <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(order.status)}`}>
                       {order.status}
                     </span>
                   </div>
                   <div>
                     <div className="text-blue-600 font-medium">Priority</div>
-                    <span
-                      className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getPriorityColor(
-                        order.priority
-                      )}`}
-                    >
+                    <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getPriorityColor(order.priority)}`}>
                       {order.priority}
                     </span>
                   </div>
                   <div>
                     <div className="text-blue-600 font-medium">Amount</div>
-                    <div className="text-blue-900 font-semibold">
-                      ₹{order.total_amount.toLocaleString()}
-                    </div>
+                    <div className="text-blue-900 font-semibold">₹{order.total_amount.toLocaleString()}</div>
                   </div>
                 </div>
               </div>
@@ -1569,15 +1667,9 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                         title={`Sample Color: ${order.color_name}`}
                       />
                       <div>
-                        <div className="text-sm font-medium text-gray-700">
-                          Sample ID
-                        </div>
-                        <div className="text-lg font-bold text-green-900">
-                          {order.sample_id}
-                        </div>
-                        <div className="text-sm text-green-700">
-                          {order.color_name} Tube
-                        </div>
+                        <div className="text-sm font-medium text-gray-700">Sample ID</div>
+                        <div className="text-lg font-bold text-green-900">{order.sample_id}</div>
+                        <div className="text-sm text-green-700">{order.color_name} Tube</div>
                       </div>
                     </div>
 
@@ -1603,20 +1695,14 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                           <div className="bg-white border-2 border-green-300 rounded-lg p-4 text-center">
                             <div className="mb-2">
                               {qrCodeImage ? (
-                                <img
-                                  src={qrCodeImage}
-                                  alt="Sample QR Code"
-                                  className="w-32 h-32 mx-auto border border-gray-300 rounded"
-                                />
+                                <img src={qrCodeImage} alt="Sample QR Code" className="w-32 h-32 mx-auto border border-gray-300 rounded" />
                               ) : (
                                 <div className="w-32 h-32 mx-auto border border-gray-300 rounded bg-gray-100 flex items-center justify-center">
                                   <QrCode className="h-8 w-8 text-gray-400" />
                                 </div>
                               )}
                             </div>
-                            <div className="text-xs text-gray-600">
-                              Scan to access sample information
-                            </div>
+                            <div className="text-xs text-gray-600">Scan to access sample information</div>
                           </div>
                         </div>
                       ) : (
@@ -1629,23 +1715,15 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
 
                     {/* Collection Status */}
                     <div>
-                      <div className="text-sm font-medium text-gray-700 mb-2">
-                        Collection Status
-                      </div>
+                      <div className="text-sm font-medium text-gray-700 mb-2">Collection Status</div>
                       {order.sample_collected_at ? (
                         <div className="bg-green-100 border border-green-300 rounded-lg p-3">
                           <div className="flex items-center text-green-800 mb-1">
                             <CheckCircle className="h-4 w-4 mr-1" />
                             <span className="font-medium">Collected</span>
                           </div>
-                          <div className="text-xs text-green-700">
-                            {new Date(order.sample_collected_at).toLocaleString()}
-                          </div>
-                          {order.sample_collected_by && (
-                            <div className="text-xs text-green-700">
-                              By: {order.sample_collected_by}
-                            </div>
-                          )}
+                          <div className="text-xs text-green-700">{new Date(order.sample_collected_at).toLocaleString()}</div>
+                          {order.sample_collected_by && <div className="text-xs text-green-700">By: {order.sample_collected_by}</div>}
                         </div>
                       ) : (
                         <div className="bg-yellow-100 border border-yellow-300 rounded-lg p-3">
@@ -1653,9 +1731,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                             <Clock className="h-4 w-4 mr-1" />
                             <span className="font-medium">Pending Collection</span>
                           </div>
-                          <div className="text-xs text-yellow-700">
-                            Sample needs to be collected from patient
-                          </div>
+                          <div className="text-xs text-yellow-700">Sample needs to be collected from patient</div>
                         </div>
                       )}
                     </div>
@@ -1663,11 +1739,28 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                 </div>
               )}
 
-              {/* Tests Ordered */}
+              {/* Tests Ordered + Panel Progress Chips */}
               <div className="bg-white border border-gray-200 rounded-lg p-4 sm:p-6">
-                <h3 className="text-lg font-semibold text-gray-900 mb-4">
-                  Tests Ordered
-                </h3>
+                <h3 className="text-lg font-semibold text-gray-900 mb-4">Tests Ordered</h3>
+
+                {progressRows.length > 0 && (
+                  <div className="mb-3">
+                    <div className="flex flex-wrap gap-2">
+                      {progressRows.map((r) => (
+                        <span
+                          key={r.order_test_id || r.test_group_id}
+                          className={`inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium border ${statusChipColor(
+                            r.panel_status
+                          )}`}
+                          title={r.test_group_name}
+                        >
+                          {r.test_group_name}: {r.entered_analytes}/{r.expected_analytes} • {r.panel_status}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   {order.tests.map((test, index) => (
                     <div key={index} className="bg-gray-50 rounded-lg p-4">
@@ -1675,6 +1768,56 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                     </div>
                   ))}
                 </div>
+              </div>
+
+              {/* Submitted Values (read-only) */}
+              <div className="bg-white border border-gray-200 rounded-lg p-4 sm:p-6">
+                <div className="flex items-center justify-between mb-2">
+                  <h3 className="text-lg font-semibold text-gray-900">Submitted Values (read-only)</h3>
+                </div>
+
+                {testGroups.length === 0 ? (
+                  <div className="text-sm text-gray-500">No test groups configured.</div>
+                ) : (
+                  <div className="space-y-4">
+                    {testGroups.map((tg) => {
+                      const key = tg.test_group_id || tg.order_test_group_id || tg.order_test_id;
+                      const rows = readonlyByTG[key as string] || [];
+                      if (!rows.length) return null;
+                      return (
+                        <div key={key} className="border rounded-lg">
+                          <div className="px-4 py-2 bg-gray-50 border-b font-medium">{tg.test_group_name}</div>
+                          <div className="overflow-x-auto">
+                            <table className="min-w-full divide-y divide-gray-200">
+                              <thead className="bg-gray-50">
+                                <tr>
+                                  <th className="px-4 py-2 text-left text-xs font-semibold text-gray-600">Parameter</th>
+                                  <th className="px-4 py-2 text-left text-xs font-semibold text-gray-600">Value</th>
+                                  <th className="px-4 py-2 text-left text-xs font-semibold text-gray-600">Unit</th>
+                                  <th className="px-4 py-2 text-left text-xs font-semibold text-gray-600">Reference</th>
+                                  <th className="px-4 py-2 text-left text-xs font-semibold text-gray-600">Flag</th>
+                                </tr>
+                              </thead>
+                              <tbody className="bg-white divide-y divide-gray-100">
+                                {rows.map((rv: any) => (
+                                  <tr key={rv.id}>
+                                    <td className="px-4 py-2 text-sm">{rv.analyte_name}</td>
+                                    <td className="px-4 py-2 text-sm">{rv.value}</td>
+                                    <td className="px-4 py-2 text-sm">{rv.unit}</td>
+                                    <td className="px-4 py-2 text-sm">{rv.reference_range}</td>
+                                    <td className="px-4 py-2 text-sm">
+                                      <span className={`px-1.5 py-0.5 rounded ${getFlagColor(rv.flag)}`}>{rv.flag || ""}</span>
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
 
               {/* Workflow + Next Steps */}
@@ -1685,51 +1828,26 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                     Workflow Progress
                   </h3>
                   <div className="space-y-4">
-                    {getWorkflowSteps(order.status, order).map(
-                      (step, index) => (
+                    {getWorkflowSteps(order.status, order).map((step, index) => (
+                      <div key={step.name} className="flex items-center space-x-3">
                         <div
-                          key={step.name}
-                          className="flex items-center space-x-3"
+                          className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-medium ${
+                            step.completed ? "bg-green-500 text-white" : step.current ? "bg-blue-500 text-white" : "bg-gray-200 text-gray-600"
+                          }`}
                         >
-                          <div
-                            className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-medium ${
-                              step.completed
-                                ? "bg-green-500 text-white"
-                                : step.current
-                                ? "bg-blue-500 text-white"
-                                : "bg-gray-200 text-gray-600"
-                            }`}
-                          >
-                            {step.completed ? (
-                              <CheckCircle className="h-4 w-4" />
-                            ) : (
-                              index + 1
-                            )}
-                          </div>
-                          <div className="flex-1">
-                            <div
-                              className={`font-medium ${
-                                step.current
-                                  ? "text-blue-900"
-                                  : step.completed
-                                  ? "text-green-900"
-                                  : "text-gray-600"
-                              }`}
-                            >
-                              {step.name}
-                            </div>
-                            <div className="text-sm text-gray-500">
-                              {step.description}
-                            </div>
-                            {step.timestamp && (
-                              <div className="text-xs text-gray-400">
-                                {new Date(step.timestamp).toLocaleString()}
-                              </div>
-                            )}
-                          </div>
+                          {step.completed ? <CheckCircle className="h-4 w-4" /> : index + 1}
                         </div>
-                      )
-                    )}
+                        <div className="flex-1">
+                          <div
+                            className={`font-medium ${step.current ? "text-blue-900" : step.completed ? "text-green-900" : "text-gray-600"}`}
+                          >
+                            {step.name}
+                          </div>
+                          <div className="text-sm text-gray-500">{step.description}</div>
+                          {step.timestamp && <div className="text-xs text-gray-400">{new Date(step.timestamp).toLocaleString()}</div>}
+                        </div>
+                      </div>
+                    ))}
                   </div>
                 </div>
 
@@ -1743,37 +1861,15 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                       <div
                         key={index}
                         className={`p-4 rounded-lg border-l-4 ${
-                          step.urgent
-                            ? "bg-red-50 border-red-400"
-                            : step.priority === "high"
-                            ? "bg-orange-50 border-orange-400"
-                            : "bg-blue-50 border-blue-400"
+                          step.urgent ? "bg-red-50 border-red-400" : step.priority === "high" ? "bg-orange-50 border-orange-400" : "bg-blue-50 border-blue-400"
                         }`}
                       >
-                        <div
-                          className={`font-medium ${
-                            step.urgent
-                              ? "text-red-900"
-                              : step.priority === "high"
-                              ? "text-orange-900"
-                              : "text-blue-900"
-                          }`}
-                        >
+                        <div className={`font-medium ${step.urgent ? "text-red-900" : step.priority === "high" ? "text-orange-900" : "text-blue-900"}`}>
                           {step.action}
                         </div>
-                        <div className="text-sm text-gray-600 mt-1">
-                          {step.description}
-                        </div>
-                        {step.assignedTo && (
-                          <div className="text-xs text-gray-500 mt-2">
-                            Assigned to: {step.assignedTo}
-                          </div>
-                        )}
-                        {step.deadline && (
-                          <div className="text-xs text-gray-500">
-                            Deadline: {new Date(step.deadline).toLocaleString()}
-                          </div>
-                        )}
+                        <div className="text-sm text-gray-600 mt-1">{step.description}</div>
+                        {step.assignedTo && <div className="text-xs text-gray-500 mt-2">Assigned to: {step.assignedTo}</div>}
+                        {step.deadline && <div className="text-xs text-gray-500">Deadline: {new Date(step.deadline).toLocaleString()}</div>}
                       </div>
                     ))}
                   </div>
@@ -1793,106 +1889,74 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                 <div className="space-y-4">
                   {renderFileUpload()}
 
-                  {uploadedFile && attachmentId && (
-                    <div className="space-y-3">
+                  {/* Sticky AI toolbar */}
+                  <div className="sticky top-[64px] z-10 -mx-4 sm:-mx-6 px-4 sm:px-6 py-2 bg-white/80 backdrop-blur border-b">
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm text-slate-600">AI assistant</span>
                       <button
                         onClick={() => handleRunAIProcessing()}
-                        disabled={isOCRProcessing}
-                        className="w-full flex items-center justify-center px-4 py-3 bg-gradient-to-r from-purple-600 to-blue-600 text-white rounded-lg hover:from-purple-700 hover:to-blue-700 disabled:from-gray-400 disabled:to-gray-400 disabled:cursor-not-allowed transition-colors"
+                        disabled={isOCRProcessing || !attachmentId}
+                        className="inline-flex items-center px-3 py-1.5 rounded-md bg-gradient-to-r from-purple-600 to-blue-600 text-white
+                                   disabled:from-gray-400 disabled:to-gray-400"
                       >
-                        {isOCRProcessing ? (
-                          <>
-                            <span className="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent mr-2" />
-                            Processing with AI...
-                          </>
-                        ) : (
-                          <>
-                            <Zap className="h-4 w-4 mr-2" />
-                            <Brain className="h-4 w-4 mr-2" />
-                            Process with AI{" "}
-                            {selectedAnalyteForAI ? `(${selectedAnalyteForAI.name})` : ""}
-                          </>
-                        )}
+                        {isOCRProcessing ? "Analysing…" : "Process with AI"}
                       </button>
+                    </div>
+                  </div>
 
-                      {isOCRProcessing && (
-                        <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
-                          <div className="text-sm text-blue-800 space-y-1">
-                            <div className="flex items-center">
-                              <Layers className="h-4 w-4 mr-2" />
-                              AI Processing Pipeline Active (
-                              {getAIProcessingTypeLabel(
-                                aiProcessingConfig?.type || "ocr_report"
-                              )}
-                              )
-                            </div>
+                  {/* Sliding AI console */}
+                  <div className={`transition-all duration-300 ${aiPhase === "idle" ? "max-h-0 opacity-0" : "max-h-[340px] opacity-100"} overflow-hidden mt-3`}>
+                    <div className="rounded-xl bg-slate-900 text-slate-100 p-4 font-mono text-xs shadow-inner border border-slate-800">
+                      <div className="flex items-center justify-between mb-2">
+                        <div className="flex items-center gap-2">
+                          <span className={`inline-flex h-2.5 w-2.5 rounded-full ${aiPhase === "running" ? "bg-cyan-400 animate-pulse" : aiPhase === "done" ? "bg-green-400" : "bg-red-400"}`} />
+                          <span className="uppercase tracking-wider">
+                            {aiPhase === "running" ? "Analysing…" : aiPhase === "done" ? "Completed" : aiPhase === "error" ? "Error" : ""}
+                          </span>
+                        </div>
+                        <div className="w-40 h-2 bg-slate-700 rounded-full overflow-hidden">
+                          <div className="h-full bg-cyan-400 transition-[width] duration-300" style={{ width: `${aiProgress}%` }} />
+                        </div>
+                      </div>
+
+                      <div ref={aiLogRef} className="space-y-2 max-h-64 overflow-auto pr-2">
+                        {aiSteps.map(s => (
+                          <div key={s.id} className="flex items-start gap-2">
+                            <span className={`mt-1 h-3 w-3 rounded-full
+                                              ${s.status === "done" ? "bg-green-400" :
+                                                s.status === "doing" ? "bg-cyan-400" :
+                                                s.status === "error" ? "bg-red-400" : "bg-slate-600"}`} />
                             <div>
-                              • Google Vision AI:{" "}
-                              {aiProcessingConfig?.type === "vision_card"
-                                ? "Analyzing test card objects..."
-                                : aiProcessingConfig?.type === "vision_color"
-                                ? "Analyzing colors and patterns..."
-                                : "Extracting text from document..."}
+                              <div className="text-[11px]">
+                                <span className="text-slate-300">{s.label}</span>
+                                {s.ts && <span className="text-slate-500"> • {new Date(s.ts).toLocaleTimeString()}</span>}
+                              </div>
+                              {s.detail && <div className="text-[11px] text-slate-400">{s.detail}</div>}
                             </div>
-                            <div>
-                              • Gemini NLP:{" "}
-                              {aiProcessingConfig?.prompt
-                                ? "Using custom prompt..."
-                                : "Using default analysis..."}
-                            </div>
-                            <div>• Database matching: Linking to analyte definitions...</div>
-                            <div>• Auto-filling result entry form...</div>
                           </div>
+                        ))}
+                      </div>
+
+                      {aiPhase !== "idle" && (
+                        <div className={`mt-3 p-2 rounded ${aiPhase === "done" && aiMatchedCount > 0
+                          ? "bg-green-700/30 text-green-200"
+                          : aiPhase === "done"
+                          ? "bg-yellow-700/30 text-yellow-200"
+                          : "bg-red-700/30 text-red-200"}`}>
+                          {aiPhase === "done" && aiMatchedCount > 0 && <>AI filled <b>{aiMatchedCount}</b> parameter{aiMatchedCount>1?"s":""}. Review & submit.</>}
+                          {aiPhase === "done" && aiMatchedCount === 0 && <>No parameters recognized. Please enter values manually.</>}
+                          {aiPhase === "error" && <>AI processing failed. Try again or enter manually.</>}
                         </div>
                       )}
                     </div>
-                  )}
+                  </div>
 
-                  {ocrError && (
-                    <div className="bg-red-50 border border-red-200 rounded-lg p-3">
-                      <div className="flex items-center">
-                        <AlertTriangle className="h-4 w-4 text-red-500 mr-2" />
-                        <span className="text-red-700 text-sm">{ocrError}</span>
-                      </div>
-                    </div>
-                  )}
-
-                  {ocrResults && extractedValues.length > 0 && (
-                    <div className="bg-green-50 border border-green-200 rounded-lg p-4">
-                      <div className="flex items-center mb-3">
-                        <CheckCircle className="h-5 w-5 text-green-500 mr-2" />
-                        <span className="text-green-700 text-sm font-medium">
-                          AI processing completed! (
-                          {getAIProcessingTypeLabel(aiProcessingConfig?.type || "ocr_report")}
-                          )
-                        </span>
-                      </div>
-                      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
-                        <div className="text-center">
-                          <div className="text-lg font-bold text-green-600">
-                            {extractedValues.length}
-                          </div>
-                          <div className="text-xs text-green-700">Parameters Found</div>
-                        </div>
-                        <div className="text-center">
-                          <div className="text-lg font-bold text-blue-600">
-                            {manualValues.length}
-                          </div>
-                          <div className="text-xs text-blue-700">Expected Count</div>
-                        </div>
-                        <div className="text-center">
-                          <div className="text-lg font-bold text-purple-600">
-                            {(extractedValues as any[]).filter((v) => (v as any).matched).length}
-                          </div>
-                          <div className="text-xs text-purple-700">DB Matched</div>
-                        </div>
-                        <div className="text-center">
-                          <div className="text-lg font-bold text-orange-600">
-                            {Math.round((ocrResults?.metadata?.ocrConfidence || 0.95) * 100)}%
-                          </div>
-                          <div className="text-xs text-orange-700">Confidence</div>
-                        </div>
-                      </div>
+                  {aiPhase === "done" && (
+                    <div className={`mt-4 p-3 rounded-lg ${aiMatchedCount>0 ? "bg-green-50 border border-green-200 text-green-800"
+                                                                             : "bg-yellow-50 border border-yellow-200 text-yellow-800"}`}>
+                      {aiMatchedCount>0
+                        ? <>AI filled <b>{aiMatchedCount}</b> parameters. Review & submit.</>
+                        : <>No parameters recognized. Please enter values manually.</>}
                     </div>
                   )}
                 </div>
@@ -1901,9 +1965,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
               {/* Test Group filter */}
               {testGroups.length > 1 && (
                 <div className="bg-white border border-gray-200 rounded-lg p-4">
-                  <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Select Test Group
-                  </label>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">Select Test Group</label>
                   <select
                     value={selectedTestGroup || ""}
                     onChange={(e) => setSelectedTestGroup(e.target.value)}
@@ -1912,7 +1974,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                     <option value="">All Test Groups</option>
                     {testGroups.map((tg) => (
                       <option key={tg.test_group_id} value={tg.test_group_id}>
-                        {tg.test_group_name} ({tg.analytes.filter(a => !a.existing_result).length} pending)
+                        {tg.test_group_name} ({tg.analytes.filter((a) => !a.existing_result).length} pending)
                       </option>
                     ))}
                   </select>
@@ -1927,9 +1989,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                     <button
                       onClick={() => setActiveEntryMode("manual")}
                       className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
-                        activeEntryMode === "manual"
-                          ? "bg-white text-blue-600 shadow-sm"
-                          : "text-gray-600 hover:text-gray-900"
+                        activeEntryMode === "manual" ? "bg-white text-blue-600 shadow-sm" : "text-gray-600 hover:text-gray-900"
                       }`}
                     >
                       Manual Entry
@@ -1937,9 +1997,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                     <button
                       onClick={() => setActiveEntryMode("ai")}
                       className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
-                        activeEntryMode === "ai"
-                          ? "bg-white text-blue-600 shadow-sm"
-                          : "text-gray-600 hover:text-gray-900"
+                        activeEntryMode === "ai" ? "bg-white text-blue-600 shadow-sm" : "text-gray-600 hover:text-gray-900"
                       }`}
                     >
                       AI Upload
@@ -1952,11 +2010,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
               <div className="bg-white border border-gray-200 rounded-lg p-4 sm:p-6">
                 <h3 className="text-lg font-semibold text-gray-900 mb-4">
                   Test Group Results{" "}
-                  {selectedTestGroup &&
-                    `- ${
-                      testGroups.find((tg) => tg.test_group_id === selectedTestGroup)
-                        ?.test_group_name
-                    }`}
+                  {selectedTestGroup && `- ${testGroups.find((tg) => tg.test_group_id === selectedTestGroup)?.test_group_name}`}
                 </h3>
 
                 {testGroups.length === 0 ? (
@@ -1965,10 +2019,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                       <AlertTriangle className="h-5 w-5 mr-2" />
                       <div>
                         <p className="font-semibold">No Test Groups Found</p>
-                        <p className="text-sm">
-                          This order doesn't have any test groups configured for result
-                          entry.
-                        </p>
+                        <p className="text-sm">This order doesn't have any test groups configured for result entry.</p>
                       </div>
                     </div>
                   </div>
@@ -1976,13 +2027,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                   <div className="space-y-4">
                     {testGroups
                       .filter((tg) => !selectedTestGroup || tg.test_group_id === selectedTestGroup)
-                      .map((tg) => (
-                        <TestGroupResultEntry
-                          key={tg.test_group_id}
-                          testGroup={tg}
-                          entryMode={activeEntryMode}
-                        />
-                      ))}
+                      .map((tg) => <TestGroupResultEntry key={tg.test_group_id} testGroup={tg} entryMode={activeEntryMode} />)}
                   </div>
                 )}
 
@@ -2044,11 +2089,16 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
         </div>
         {/* end body */}
       </div>
+
+      {/* Result Audit Modal */}
+      {showAudit && (
+        <ResultAudit
+          orderId={order.id}
+          onClose={() => setShowAudit(false)}
+        />
+      )}
     </div>
   );
-  // =========================================================
-  // #endregion Render
-  // =========================================================
 };
 
 export default OrderDetailsModal;
