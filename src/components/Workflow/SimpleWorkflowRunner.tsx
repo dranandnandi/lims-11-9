@@ -90,50 +90,49 @@ const SimpleWorkflowRunner: React.FC<SimpleWorkflowRunnerProps> = ({
       // Get final results from survey
       const surveyResults = sender.data
       
-      // Build exact request body as specified in requirements
-      const requestBody = {
-        workflowInstanceId: instanceId,
-        stepId: 'final_results',
-        orderId: orderId,
-        labId: null, // Should be retrieved from order context
-        testGroupId: testGroupId || null,
-        testCode: null, // Should be retrieved from order context  
-        userId: 'system', // Should be actual user ID from auth
-        results: {
-          patient_id: null, // Should come from order
-          patient_name: null, // Should come from order
-          sample_id: null, // Should come from order
-          review_status: 'submitted',
-          ...surveyResults,
-          test_name: workflowDefinition?.title || workflowDefinition?.meta?.title || 'Workflow Test',
-          measurements: extractMeasurements(surveyResults),
-          qc_data: extractQCData(surveyResults)
+      // Build workflow_results record for direct API submission
+      const workflowResult = {
+        workflow_instance_id: instanceId,
+        step_id: 'final_results',
+        status: 'done',
+        payload: {
+          orderId: orderId,
+          testGroupId: testGroupId || null,
+          results: {
+            patient_id: null, // Should come from order
+            patient_name: null, // Should come from order
+            sample_id: null, // Should come from order
+            review_status: 'submitted',
+            ...surveyResults,
+            test_name: workflowDefinition?.title || workflowDefinition?.meta?.title || 'Workflow Test',
+            measurements: extractMeasurements(surveyResults),
+            qc_data: extractQCData(surveyResults)
+          }
         }
       }
 
-      // Submit to backend using existing results/result_values tables
-      const response = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/process-workflow-result`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`
-        },
-        body: JSON.stringify(requestBody)
-      })
+      // Submit to Supabase REST API with correct conflict resolution using column names
+      const response = await fetch(
+        `${import.meta.env.VITE_SUPABASE_URL}/rest/v1/workflow_results?on_conflict=workflow_instance_id,step_id&select=*`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+            'apikey': import.meta.env.VITE_SUPABASE_ANON_KEY,
+            'Prefer': 'resolution=merge-duplicates,return=representation'
+          },
+          body: JSON.stringify([workflowResult])
+        }
+      )
 
       if (!response.ok) {
         const errorData = await response.json()
-        throw new Error(errorData.error || 'Failed to submit workflow results')
+        throw new Error(errorData.message || 'Failed to submit workflow results')
       }
 
       const result = await response.json()
       console.log('Workflow submitted successfully:', result)
-      
-      // Handle response based on status
-      if (result.status === 'warn') {
-        // Show warning but still mark as completed
-        setError(`Processed with warnings. Check audit for details.`)
-      }
       
       // Update local state
       setCompletionData(surveyResults)
@@ -264,3 +263,4 @@ const SimpleWorkflowRunner: React.FC<SimpleWorkflowRunnerProps> = ({
 }
 
 export default SimpleWorkflowRunner
+

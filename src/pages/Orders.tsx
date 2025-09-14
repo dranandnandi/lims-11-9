@@ -181,23 +181,27 @@ const Orders: React.FC = () => {
         status: r.panel_status,
       }));
 
-      // clamp per panel
-      const perPanel = panels.map((p) => ({
-        expected: p.expected,
-        enteredClamped: Math.min(p.entered, p.expected),
-        // approved = whole panel verified (view only tells us "any_verified")
-        verifiedWhole: (p.verified || p.status === "Verified") ? p.expected : 0,
-      }));
+      // Calculate totals correctly
+      const expectedTotal = panels.reduce((sum, p) => sum + p.expected, 0);
+      const enteredTotal = panels.reduce((sum, p) => sum + Math.min(p.entered, p.expected), 0);
+      
+      // ✅ Fix: Calculate approved analytes correctly
+      // Only count analytes from verified panels, not entire expected total
+      const approvedAnalytes = panels.reduce((sum, p) => {
+        if (p.verified || p.status === "Verified") {
+          return sum + Math.min(p.entered, p.expected); // Only count entered analytes that are verified
+        }
+        return sum;
+      }, 0);
 
-      const expectedTotal = perPanel.reduce((s, x) => s + x.expected, 0);
-      const enteredTotal  = perPanel.reduce((s, x) => s + x.enteredClamped, 0);
+      // ✅ Fix: Calculate pending and for-approval correctly
+      const pendingAnalytes = Math.max(expectedTotal - enteredTotal, 0); // Not entered yet
+      const forApprovalAnalytes = Math.max(enteredTotal - approvedAnalytes, 0); // Entered but not verified
 
-      // approved from verified panels
-      const approvedAnalytes = perPanel.reduce((s, x) => s + x.verifiedWhole, 0);
-
-      // analyte-level buckets
-      const pendingAnalytes     = Math.max(expectedTotal - enteredTotal, 0);      // not entered
-      const forApprovalAnalytes = Math.max(enteredTotal  - approvedAnalytes, 0);  // entered but not verified
+      // Debug logging for verification (can be removed later)
+      if (o.id && expectedTotal > 0) {
+        console.debug(`Order ${o.id.slice(-6)}: Expected=${expectedTotal}, Entered=${enteredTotal}, Approved=${approvedAnalytes}, Pending=${pendingAnalytes}, ForApproval=${forApprovalAnalytes}`);
+      }
 
       return {
         id: o.id,
@@ -495,27 +499,37 @@ const Orders: React.FC = () => {
 
                             <div className="flex-1">
                               <div className="text-sm text-gray-600 mb-1">Tests ({o.tests.length})</div>
-                              <div className="flex flex-wrap gap-2">
+                              <div className="flex flex-wrap gap-3">
                                 {o.panels.length > 0
                                   ? o.panels.map((p, i) => {
-                                      const color =
-                                        p.verified
-                                          ? "border-green-300 bg-green-50 text-green-800"
-                                          : p.status === "Complete"
-                                          ? "border-amber-300 bg-amber-50 text-amber-800"
-                                          : p.entered > 0
-                                          ? "border-blue-300 bg-blue-50 text-blue-800"
-                                          : "border-slate-300 bg-slate-50 text-slate-800";
+                                      const progress = p.expected > 0 ? (p.entered / p.expected) * 100 : 0;
+                                      
+                                      // Modern minimalistic colors based on progress
+                                      const getMinimalColor = (percent: number) => {
+                                        if (percent === 0) return "bg-gray-100 border-gray-300 text-gray-700";
+                                        if (percent < 40) return "bg-red-50 border-red-200 text-red-800";
+                                        if (percent < 70) return "bg-orange-50 border-orange-200 text-orange-800";
+                                        if (percent < 90) return "bg-yellow-50 border-yellow-200 text-yellow-800";
+                                        return "bg-green-50 border-green-200 text-green-800";
+                                      };
+
+                                      const colorClass = getMinimalColor(progress);
+
                                       return (
-                                        <span
+                                        <div
                                           key={`${p.name}-${i}`}
-                                          className={`inline-flex items-center rounded-full border px-3 py-1 text-sm ${color}`}
+                                          className={`border rounded-lg px-3 py-2 transition-all duration-300 ${colorClass}`}
                                         >
-                                          {p.name}
-                                          <span className="ml-2 text-xs opacity-80">
-                                            {p.entered}/{p.expected} • {p.verified ? "Verified" : p.status}
-                                          </span>
-                                        </span>
+                                          <div className="font-medium text-sm mb-1">{p.name}</div>
+                                          <div className="flex items-center justify-between text-xs">
+                                            <span className="font-mono">
+                                              {p.entered}/{p.expected} analytes
+                                            </span>
+                                            <span className="text-xs opacity-75">
+                                              {progress === 0 ? "Pending" : progress < 100 ? "Partial" : "Complete"}
+                                            </span>
+                                          </div>
+                                        </div>
                                       );
                                     })
                                   : o.tests.map((t, i) => (
@@ -553,26 +567,75 @@ const Orders: React.FC = () => {
                           </div>
                         </div>
 
-                        {/* Progress + legend */}
-                        <div className="mt-3 bg-blue-50 rounded-lg p-2">
-                          <div className="flex items-center justify-between text-sm mb-1">
-                            <span className="text-blue-700 font-medium">Progress</span>
-                            <span className="text-blue-700">{pct}% Complete</span>
+                        {/* Enhanced Progress + legend */}
+                        <div className="mt-3 bg-gradient-to-r from-blue-50 to-indigo-50 rounded-lg p-3 border border-blue-200">
+                          <div className="flex items-center justify-between text-sm mb-2">
+                            <span className="text-blue-800 font-semibold flex items-center">
+                              📊 Overall Progress
+                            </span>
+                            <span className="text-blue-800 font-bold text-base">
+                              {o.enteredTotal}/{o.expectedTotal} analytes
+                            </span>
                           </div>
-                          <div className="w-full bg-blue-200 rounded-full h-3">
-                            <div className="bg-blue-600 h-3 rounded-full" style={{ width: `${pct}%` }} />
+                          
+                          {/* Enhanced progress bar with dynamic colors and segments */}
+                          <div className="relative w-full bg-gray-200 rounded-full h-4 mb-3 overflow-hidden border">
+                            {/* Background gradient based on overall progress */}
+                            <div 
+                              className="absolute left-0 top-0 h-4 transition-all duration-700 rounded-full"
+                              style={{ 
+                                width: `${pct}%`,
+                                background: pct === 0 ? '#ef4444' : // red
+                                           pct < 25 ? `linear-gradient(90deg, #ef4444 0%, #f97316 100%)` : // red to orange
+                                           pct < 50 ? `linear-gradient(90deg, #f97316 0%, #eab308 100%)` : // orange to yellow  
+                                           pct < 75 ? `linear-gradient(90deg, #eab308 0%, #84cc16 100%)` : // yellow to lime
+                                           pct < 100 ? `linear-gradient(90deg, #84cc16 0%, #22c55e 100%)` : // lime to green
+                                           '#10b981', // emerald
+                                boxShadow: pct > 0 ? `0 0 12px ${pct < 50 ? '#ef444440' : '#22c55e40'}` : 'none'
+                              }}
+                            />
+                            
+                            {/* Approved segment overlay (darker green) */}
+                            <div 
+                              className="absolute left-0 top-0 h-4 bg-green-600 transition-all duration-500 rounded-full opacity-80"
+                              style={{ width: `${o.expectedTotal > 0 ? (o.approvedAnalytes / o.expectedTotal) * 100 : 0}%` }}
+                            />
+                            
+                            {/* Progress indicator line */}
+                            <div 
+                              className="absolute top-0 w-0.5 h-4 bg-white shadow-lg"
+                              style={{ left: `${pct}%` }}
+                            />
+                            
+                            {/* Sparkle effect for high progress */}
+                            {pct > 75 && (
+                              <div className="absolute inset-0 rounded-full opacity-30">
+                                <div className="absolute top-1 left-1/4 w-1 h-1 bg-white rounded-full animate-pulse" />
+                                <div className="absolute top-2 right-1/3 w-0.5 h-0.5 bg-white rounded-full animate-pulse delay-150" />
+                                <div className="absolute bottom-1 left-2/3 w-1 h-1 bg-white rounded-full animate-pulse delay-300" />
+                              </div>
+                            )}
                           </div>
-                          <div className="flex flex-wrap items-center gap-4 mt-2 text-sm">
-                            <span className="inline-flex items-center">
-                              <span className="inline-block w-3 h-3 bg-slate-400 rounded-sm mr-2" /> Pending: {o.pendingAnalytes}
-                            </span>
-                            <span className="inline-flex items-center">
-                              <span className="inline-block w-3 h-3 bg-amber-400 rounded-sm mr-2" /> For approval: {o.forApprovalAnalytes}
-                            </span>
-                            <span className="inline-flex items-center">
-                              <span className="inline-block w-3 h-3 bg-green-500 rounded-sm mr-2" /> Approved: {o.approvedAnalytes}
-                            </span>
-                            <span className="ml-auto text-gray-500">Total expected: {o.expectedTotal}</span>
+                          
+                          {/* Enhanced legend with better spacing and icons */}
+                          <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 text-sm">
+                            <div className="inline-flex items-center bg-white rounded-md px-2 py-1 border border-gray-200">
+                              <span className="inline-block w-3 h-3 bg-red-400 rounded-full mr-2 shadow-sm" /> 
+                              <span className="text-gray-700">Pending: <strong>{o.pendingAnalytes}</strong></span>
+                            </div>
+                            <div className="inline-flex items-center bg-white rounded-md px-2 py-1 border border-amber-200">
+                              <span className="inline-block w-3 h-3 bg-amber-500 rounded-full mr-2 shadow-sm" /> 
+                              <span className="text-amber-700">For approval: <strong>{o.forApprovalAnalytes}</strong></span>
+                            </div>
+                            <div className="inline-flex items-center bg-white rounded-md px-2 py-1 border border-green-200">
+                              <span className="inline-block w-3 h-3 bg-green-500 rounded-full mr-2 shadow-sm" /> 
+                              <span className="text-green-700">Approved: <strong>{o.approvedAnalytes}</strong></span>
+                            </div>
+                            <div className="inline-flex items-center bg-white rounded-md px-2 py-1 border border-blue-200 lg:justify-end">
+                              <span className={`font-bold ${pct < 25 ? 'text-red-600' : pct < 50 ? 'text-orange-600' : pct < 75 ? 'text-yellow-600' : pct < 100 ? 'text-lime-600' : 'text-green-600'}`}>
+                                {pct < 25 ? '🔴' : pct < 50 ? '🟠' : pct < 75 ? '🟡' : pct < 100 ? '🟢' : '✅'} Total: {o.expectedTotal}
+                              </span>
+                            </div>
                           </div>
                         </div>
                       </div>

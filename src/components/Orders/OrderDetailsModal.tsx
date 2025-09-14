@@ -41,6 +41,7 @@ import { useAuth } from "../../contexts/AuthContext";
 import { calculateFlagsForResults } from "../../utils/flagCalculation";
 import { ResultAudit } from "./ResultAudit"; // expects named export
 import AIProcessingProgress, { AIStep } from "./AIProcessingProgress"; // adjust path if needed
+import PopoutInput from "./PopoutInput";
 
 // ===========================================================
 // #region Types
@@ -357,6 +358,15 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
   const [extractedValues, setExtractedValues] = useState<ExtractedValue[]>([]);
   const [manualValues, setManualValues] = useState<ExtractedValue[]>([]);
   const [existingResultId, setExistingResultId] = useState<string | null>(null);
+
+  // Popout input state
+  const [popoutInput, setPopoutInput] = useState<{
+    isOpen: boolean;
+    field: { index: number; fieldName: keyof ExtractedValue };
+    title: string;
+    placeholder: string;
+    suggestions?: string[];
+  } | null>(null);
 
   // Catalog & order analytes/test-groups
   const [allAnalytes, setAllAnalytes] = useState<any[]>([]);
@@ -1083,8 +1093,37 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
   // #region Draft & Submit handlers
   // =========================================================
 
-  const handleManualValueChange = (index: number, field: keyof ExtractedValue, value: string) => {
+  const handleManualValueChange = React.useCallback((index: number, field: keyof ExtractedValue, value: string) => {
     setManualValues((prev) => prev.map((item, i) => (i === index ? { ...item, [field]: value } : item)));
+  }, []);
+
+  // Popout input helpers
+  const openPopoutInput = (
+    index: number, 
+    fieldName: keyof ExtractedValue, 
+    currentValue: string,
+    parameterName: string
+  ) => {
+    const suggestions = fieldName === 'unit' 
+      ? ['mg/dL', 'g/dL', 'mmol/L', 'IU/L', 'ng/mL', '%', 'cells/μL', 'K/uL', 'M/uL', 'fl', 'pg']
+      : fieldName === 'reference'
+      ? ['Normal', 'See lab reference', '0.5-1.2 mg/dL', '70-99 mg/dL', '4 - 11', '4.5 - 5.5', '11.5 - 14.5', '80 - 100', '27 - 31', '32 - 36']
+      : [];
+
+    setPopoutInput({
+      isOpen: true,
+      field: { index, fieldName },
+      title: `Enter ${fieldName} for ${parameterName}`,
+      placeholder: `Enter ${fieldName}...`,
+      suggestions
+    });
+  };
+
+  const handlePopoutSave = (value: string) => {
+    if (!popoutInput) return;
+    const { index, fieldName } = popoutInput.field;
+    handleManualValueChange(index, fieldName, value);
+    setPopoutInput(null);
   };
 
   const handleSaveDraft = async () => {
@@ -1357,8 +1396,21 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
     testGroup: TestGroupResult;
     entryMode: "manual" | "ai";
   }> = ({ testGroup, entryMode }) => {
-    const testGroupValues = manualValues.filter((v) => testGroup.analytes.some((a) => a.name === v.parameter));
-    const completedCount = testGroupValues.filter((v) => v.value.trim()).length;
+    // ✅ Memoize expensive calculations to prevent re-renders
+    const testGroupValues = React.useMemo(() => 
+      manualValues.filter((v) => testGroup.analytes.some((a) => a.name === v.parameter)),
+      [manualValues, testGroup.analytes]
+    );
+    
+    const completedCount = React.useMemo(() => 
+      testGroupValues.filter((v) => v.value.trim() !== "").length,
+      [testGroupValues]
+    );
+
+    const pendingCount = React.useMemo(() => 
+      testGroupValues.length - completedCount,
+      [testGroupValues.length, completedCount]
+    );
 
     return (
       <div className="border border-gray-200 rounded-lg p-4 mb-4">
@@ -1366,9 +1418,9 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
           <h4 className="text-lg font-medium">{testGroup.test_group_name}</h4>
           <div className="flex items-center space-x-3">
             <span className="text-sm text-gray-500">
-              {completedCount}/{testGroupValues.length} completed
+              {completedCount}/{testGroupValues.length} completed • {pendingCount} pending
             </span>
-            <div className="w-16 bg-gray-200 rounded-full h-2">
+            <div className="w-20 bg-gray-200 rounded-full h-2">
               <div
                 className="bg-blue-600 h-2 rounded-full transition-all"
                 style={{
@@ -1417,43 +1469,60 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
               </tr>
             </thead>
             <tbody className="bg-white divide-y divide-gray-200">
-              {testGroupValues.map((value, index) => {
+              {testGroupValues.map((value) => {
                 const globalIndex = manualValues.findIndex((v) => v.parameter === value.parameter);
                 const analyte = testGroup.analytes.find((a) => a.name === value.parameter);
 
                 return (
-                  <tr key={index} className="hover:bg-gray-50">
+                  <tr key={`${testGroup.test_group_id}-${value.parameter}`} className="hover:bg-gray-50">
                     <td className="px-4 py-3 text-sm font-medium text-gray-900">
                       <div className="whitespace-nowrap">{value.parameter}</div>
                       <div className="text-xs text-gray-500">({analyte?.code})</div>
                     </td>
+                    
+                    {/* ✅ Pop-out Value Input */}
                     <td className="px-4 py-3 min-w-[140px]">
-                      <input
-                        type="text"
-                        value={value.value}
-                        onChange={(e) => handleManualValueChange(globalIndex, "value", e.target.value)}
-                        className="w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
-                        placeholder="Enter value"
-                      />
+                      <button
+                        onClick={() => openPopoutInput(globalIndex, 'value', value.value, value.parameter)}
+                        className={`w-full px-3 py-2 border rounded-lg text-left transition-colors ${
+                          value.value.trim() 
+                            ? 'border-green-300 bg-green-50 hover:bg-green-100 text-green-800' 
+                            : 'border-gray-300 hover:border-blue-400 hover:bg-blue-50 text-gray-500'
+                        }`}
+                      >
+                        {value.value || 'Click to enter value...'}
+                      </button>
                     </td>
+
+                    {/* ✅ Pop-out Unit Input */}
                     <td className="px-4 py-3 min-w-[120px]">
-                      <input
-                        type="text"
-                        value={value.unit}
-                        onChange={(e) => handleManualValueChange(globalIndex, "unit", e.target.value)}
-                        className="w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
-                        placeholder="Unit"
-                      />
+                      <button
+                        onClick={() => openPopoutInput(globalIndex, 'unit', value.unit, value.parameter)}
+                        className={`w-full px-3 py-2 border rounded-lg text-left transition-colors ${
+                          value.unit.trim()
+                            ? 'border-blue-300 bg-blue-50 hover:bg-blue-100 text-blue-800'
+                            : 'border-gray-300 hover:border-blue-400 hover:bg-blue-50 text-gray-500'
+                        }`}
+                      >
+                        {value.unit || 'Unit...'}
+                      </button>
                     </td>
+
+                    {/* ✅ Pop-out Reference Input */}
                     <td className="px-4 py-3 min-w-[180px]">
-                      <input
-                        type="text"
-                        value={value.reference}
-                        onChange={(e) => handleManualValueChange(globalIndex, "reference", e.target.value)}
-                        className="w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
-                        placeholder="Reference range"
-                      />
+                      <button
+                        onClick={() => openPopoutInput(globalIndex, 'reference', value.reference, value.parameter)}
+                        className={`w-full px-3 py-2 border rounded-lg text-left transition-colors ${
+                          value.reference.trim()
+                            ? 'border-purple-300 bg-purple-50 hover:bg-purple-100 text-purple-800'
+                            : 'border-gray-300 hover:border-blue-400 hover:bg-blue-50 text-gray-500'
+                        }`}
+                      >
+                        {value.reference || 'Reference range...'}
+                      </button>
                     </td>
+
+                    {/* ✅ Keep Flag as Select (no pop-out needed) */}
                     <td className="px-4 py-3 min-w-[120px]">
                       <select
                         value={value.flag || ""}
@@ -2089,6 +2158,17 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
         </div>
         {/* end body */}
       </div>
+
+      {/* ✅ Pop-out Input Modal */}
+      <PopoutInput
+        isOpen={popoutInput?.isOpen || false}
+        onClose={() => setPopoutInput(null)}
+        onSave={handlePopoutSave}
+        initialValue={popoutInput?.field ? manualValues[popoutInput.field.index]?.[popoutInput.field.fieldName] || '' : ''}
+        placeholder={popoutInput?.placeholder || ''}
+        title={popoutInput?.title || ''}
+        suggestions={popoutInput?.suggestions}
+      />
 
       {/* Result Audit Modal */}
       {showAudit && (
