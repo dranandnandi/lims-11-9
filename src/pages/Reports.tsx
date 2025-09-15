@@ -23,6 +23,7 @@ import {
 } from 'lucide-react';
 import {
   format,
+  isValid,
   startOfDay,
   endOfDay,
   startOfWeek,
@@ -33,6 +34,16 @@ import {
 import { viewPDFReport } from '../utils/pdfService';
 import PDFProgressModal from '../components/PDFProgressModal';
 import { usePDFGeneration, isOrderReportReady } from '../hooks/usePDFGeneration';
+
+// Helper function to safely format dates
+const safeFormatDate = (dateValue: string | null | undefined, formatString: string = 'MMM d, yyyy'): string => {
+  if (!dateValue) return 'N/A';
+  
+  const date = new Date(dateValue);
+  if (!isValid(date)) return 'Invalid Date';
+  
+  return format(date, formatString);
+};
 
 type DateFilter = 'today' | 'yesterday' | 'week' | 'month' | 'all';
 type SortField = 'patient_name' | 'order_date' | 'verified_at' | 'test_name';
@@ -1009,7 +1020,7 @@ const Reports: React.FC = () => {
                       <div className="col-span-2">
                         <div className="text-sm">
                           <div className="font-medium text-gray-900">
-                            {format(new Date(group.order_date), 'MMM d, yyyy')}
+                            {safeFormatDate(group.order_date, 'MMM d, yyyy')}
                           </div>
                           <div className="text-gray-600">
                             Sample: {group.sample_ids.join(', ')}
@@ -1113,7 +1124,7 @@ const Reports: React.FC = () => {
                           <div className="flex items-center justify-between">
                             <span className="text-sm text-gray-600">Order Date:</span>
                             <span className="text-sm font-medium text-gray-900">
-                              {format(new Date(group.order_date), 'MMM d, yyyy')}
+                              {safeFormatDate(group.order_date, 'MMM d, yyyy')}
                             </span>
                           </div>
 
