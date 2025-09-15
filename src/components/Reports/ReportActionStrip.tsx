@@ -1,4 +1,3 @@
-import React from "react";
 import { Eye, Download, Printer, Mail, PhoneCall, CheckCircle2 } from "lucide-react";
 
 type Props = {

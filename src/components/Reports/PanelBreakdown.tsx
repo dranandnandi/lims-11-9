@@ -1,5 +1,3 @@
-import React from "react";
-
 type Panel = { name: string; expected: number; entered: number; verified: number; };
 export default function PanelBreakdown({ panels }: { panels: Panel[] }) {
   if (!panels?.length) return null;
