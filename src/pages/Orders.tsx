@@ -2,12 +2,13 @@
 import React, { useEffect, useMemo, useState } from "react";
 import {
   Plus, Search, Filter, Clock as ClockIcon, CheckCircle, AlertTriangle,
-  Eye, User, Calendar, TestTube, ChevronDown, ChevronUp, TrendingUp
+  Eye, User, Calendar, TestTube, ChevronDown, ChevronUp, TrendingUp, ToggleLeft, ToggleRight, X
 } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
-import { supabase } from "../utils/supabase";
+import { database, supabase } from "../utils/supabase";
 import OrderForm from "../components/Orders/OrderForm";
 import OrderDetailsModal from "../components/Orders/OrderDetailsModal";
+import EnhancedOrdersPage from "../components/Orders/EnhancedOrdersPage";
 
 /* ===========================
    Types
@@ -115,6 +116,15 @@ const Orders: React.FC = () => {
   const [statusFilter, setStatusFilter] = useState<"All" | OrderStatus>("All");
   const [showOrderForm, setShowOrderForm] = useState(false);
   const [selectedOrder, setSelectedOrder] = useState<CardOrder | null>(null);
+  const [viewMode, setViewMode] = useState<'standard' | 'enhanced'>('standard');
+
+  // Add test modal state
+  const [showAddTestModal, setShowAddTestModal] = useState(false);
+  const [selectedOrderId, setSelectedOrderId] = useState<string | null>(null);
+  const [availableTests, setAvailableTests] = useState<any[]>([]);
+  const [selectedTests, setSelectedTests] = useState<any[]>([]);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [isLoadingTests, setIsLoadingTests] = useState(false);
 
   // dashboard counters
   const [summary, setSummary] = useState({ allDone: 0, mostlyDone: 0, pending: 0, awaitingApproval: 0 });
@@ -122,6 +132,163 @@ const Orders: React.FC = () => {
   useEffect(() => {
     fetchOrders();
   }, []);
+
+  // Fetch tests and packages from database
+  const fetchTestsAndPackages = async () => {
+    setIsLoadingTests(true);
+    try {
+      const labId = await database.getCurrentUserLabId();
+      if (!labId) {
+        console.warn('No lab_id found for user - fetching all available tests for demo purposes');
+        // Continue anyway for demo/development purposes
+      }
+
+      // Use the centralized database API following project patterns (same as enhanced view)
+      const { data: testGroups, error: testGroupsError } = await database.testGroups.getAll();
+      if (testGroupsError) {
+        console.error('Error fetching test groups:', testGroupsError);
+        throw testGroupsError;
+      }
+
+      const { data: packages, error: packagesError } = await database.packages.getAll();
+      if (packagesError) {
+        console.error('Error fetching packages:', packagesError);
+        throw packagesError;
+      }
+
+      console.log('Fetched test groups:', testGroups?.length || 0);
+      console.log('Fetched packages:', packages?.length || 0);
+
+      // Transform test groups to match the expected format
+      const transformedTests = (testGroups || []).map(test => ({
+        id: test.id,
+        name: test.name,
+        price: test.price || 0,
+        category: test.category || 'Test',
+        sample: test.sample_type || 'Various',
+        code: test.code || '',
+        type: 'test'
+      }));
+
+      // Transform packages to match the expected format
+      const transformedPackages = (packages || []).map(pkg => ({
+        id: pkg.id,
+        name: pkg.name,
+        price: pkg.price || 0,
+        category: 'Package',
+        sample: 'Various',
+        description: pkg.description || '',
+        type: 'package'
+      }));
+
+      const allTests = [...transformedTests, ...transformedPackages];
+      console.log('Total available tests/packages:', allTests.length);
+      setAvailableTests(allTests);
+    } catch (error) {
+      console.error('Error fetching tests and packages:', error);
+      setAvailableTests([]);
+    } finally {
+      setIsLoadingTests(false);
+    }
+  };
+
+  useEffect(() => {
+    if (user) {
+      fetchTestsAndPackages();
+    }
+  }, [user]);
+
+  const filteredTests = availableTests.filter(test =>
+    test.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+    test.category.toLowerCase().includes(searchQuery.toLowerCase())
+  );
+
+  const toggleTestSelection = (test: any) => {
+    setSelectedTests(prev => {
+      const isSelected = prev.some(t => t.id === test.id);
+      if (isSelected) {
+        return prev.filter(t => t.id !== test.id);
+      } else {
+        return [...prev, test];
+      }
+    });
+  };
+
+  const getTotalPrice = () => {
+    return selectedTests.reduce((sum, test) => sum + test.price, 0);
+  };
+
+  const handleAddSelectedTests = async () => {
+    if (selectedTests.length === 0 || !selectedOrderId) return;
+    
+    try {
+      console.log('Adding tests to order:', selectedOrderId, selectedTests);
+      
+      // Find the current order to get existing data
+      const currentOrder = orders.find(order => order.id === selectedOrderId);
+      if (!currentOrder) {
+        alert('Order not found');
+        return;
+      }
+
+      // Create new test records for the order_tests table
+      const newOrderTests = selectedTests.map(test => ({
+        order_id: selectedOrderId,
+        test_name: test.name,
+        test_group_id: test.type === 'test' ? test.id : null
+      }));
+      
+      // Insert new tests into order_tests table
+      const { error: testsError } = await supabase
+        .from('order_tests')
+        .insert(newOrderTests);
+      
+      if (testsError) {
+        console.error('Error inserting order tests:', testsError);
+        alert('Failed to add tests. Please try again.');
+        return;
+      }
+      
+      // Calculate new total amount and update the order
+      const newTestsTotal = selectedTests.reduce((sum, test) => sum + test.price, 0);
+      const updatedTotalAmount = currentOrder.total_amount + newTestsTotal;
+      
+      // Update the order's total amount
+      const { error: updateError } = await supabase
+        .from('orders')
+        .update({ total_amount: updatedTotalAmount })
+        .eq('id', selectedOrderId);
+      
+      if (updateError) {
+        console.error('Error updating order total:', updateError);
+        alert('Tests added but failed to update total amount.');
+        return;
+      }
+      
+      console.log('Order updated successfully');
+      
+      // Reset modal state
+      setSelectedTests([]);
+      setSearchQuery('');
+      setShowAddTestModal(false);
+      setSelectedOrderId(null);
+      
+      // Refresh the orders data
+      await fetchOrders();
+      
+      // Show success message
+      alert(`Successfully added ${selectedTests.length} tests to the order! Total cost: ₹${newTestsTotal.toLocaleString()}`);
+      
+    } catch (error) {
+      console.error('Error adding tests:', error);
+      alert('Failed to add tests. Please try again.');
+    }
+  };
+
+  const handleAddTests = (orderId: string) => {
+    setSelectedOrderId(orderId);
+    setShowAddTestModal(true);
+  };
 
   // Read daily sequence (prefer order_number; fallback to tail of sample_id)
   const getDailySeq = (o: CardOrder) => {
@@ -259,6 +426,24 @@ const Orders: React.FC = () => {
     setSummary(s);
   };
 
+  // Transform orders for EnhancedOrdersPage
+  const transformedOrdersForEnhanced = useMemo(() => {
+    return orders.map(order => ({
+      id: order.id,
+      patient_id: order.patient_id,
+      patient_name: order.patient_name,
+      status: order.status,
+      total_amount: order.total_amount,
+      order_date: order.order_date,
+      created_at: order.order_date,
+      sample_id: order.sample_id,
+      tests: order.tests,
+      can_add_tests: !['Completed', 'Delivered'].includes(order.status),
+      visit_group_id: order.sample_id ? `sample-${order.sample_id}` : `${order.patient_id}-${order.order_date.slice(0, 10)}`,
+      order_type: 'initial' as const
+    }));
+  }, [orders]);
+
   /* ------------- filtering + grouping ------------- */
   const filtered = useMemo(() => {
     const q = search.toLowerCase();
@@ -302,24 +487,160 @@ const Orders: React.FC = () => {
       }));
   }, [filtered]);
 
-  const getPriorityBadge = (p: Priority) =>
-    ({
-      Normal: "bg-gray-100 text-gray-800",
-      Urgent: "bg-orange-100 text-orange-800",
-      STAT: "bg-red-100 text-red-800",
-    }[p] || "bg-gray-100 text-gray-800");
-
   const openDetails = (o: CardOrder) => setSelectedOrder(o);
 
+  // Enhanced view handlers
+  const handleAddOrder = async (orderData: any) => {
+    try {
+      console.log('Creating new order:', orderData);
+      console.log('Tests array:', orderData.tests, 'Length:', orderData.tests?.length);
+      console.log('Test objects structure:', orderData.tests?.[0]);
+      
+      // Create the order in the database
+      const { data: order, error: orderError } = await database.orders.create(orderData);
+      if (orderError) {
+        console.error('Error creating order:', orderError);
+        alert('Failed to create order. Please try again.');
+        return;
+      }
+      
+      console.log('Order created successfully:', order);
+      
+      // Refresh the orders list
+      await fetchOrders();
+      
+      // Close the form
+      setShowOrderForm(false);
+      
+      // Show success message
+      alert('Order created successfully!');
+    } catch (error) {
+      console.error('Error creating order:', error);
+      alert('Failed to create order. Please try again.');
+    }
+  };
+
+  const handleUpdateStatus = async (_orderId: string, _newStatus: string) => {
+    // Implementation for updating status
+    await fetchOrders();
+  };
+
+  const handleNewSession = () => {
+    setShowOrderForm(true);
+  };
+
+  const handleNewPatientVisit = () => {
+    setShowOrderForm(true);
+  };
+
+  // If enhanced view is selected, render EnhancedOrdersPage
+  if (viewMode === 'enhanced') {
+    return (
+      <div className="space-y-6">
+        {/* View Mode Toggle */}
+        <div className="flex items-center justify-between">
+          <div className="flex items-center space-x-4">
+            <h1 className="text-2xl sm:text-3xl font-bold text-gray-900">Test Orders</h1>
+            <div className="flex items-center space-x-2 bg-gray-100 rounded-lg p-1">
+              <button
+                onClick={() => setViewMode('standard')}
+                className={`flex items-center px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
+                  viewMode === 'standard' 
+                    ? 'bg-white text-blue-600 shadow-sm' 
+                    : 'text-gray-600 hover:text-gray-800'
+                }`}
+              >
+                <ToggleLeft className="h-4 w-4 mr-1" />
+                Standard View
+              </button>
+              <button
+                onClick={() => setViewMode('enhanced')}
+                className={`flex items-center px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
+                  viewMode === 'enhanced' 
+                    ? 'bg-white text-blue-600 shadow-sm' 
+                    : 'text-gray-600 hover:text-gray-800'
+                }`}
+              >
+                <ToggleRight className="h-4 w-4 mr-1" />
+                Patient Visits
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <EnhancedOrdersPage
+          orders={transformedOrdersForEnhanced}
+          onAddOrder={handleAddOrder}
+          onUpdateStatus={handleUpdateStatus}
+          onRefreshOrders={fetchOrders}
+          onNewSession={handleNewSession}
+          onNewPatientVisit={handleNewPatientVisit}
+        />
+
+        {/* Modals */}
+        {showOrderForm && (
+          <OrderForm 
+            onClose={() => setShowOrderForm(false)} 
+            onSubmit={handleAddOrder}
+          />
+        )}
+
+        {selectedOrder && (
+          <OrderDetailsModal
+            order={selectedOrder}
+            onClose={() => setSelectedOrder(null)}
+            onUpdateStatus={async () => {
+              await fetchOrders();
+              setSelectedOrder(null);
+            }}
+            onAfterSubmit={async () => {
+              await fetchOrders();
+              setSelectedOrder(null);
+            }}
+            onAfterSaveDraft={async () => {
+              await fetchOrders();
+            }}
+          />
+        )}
+      </div>
+    );
+  }
+
   /* ===========================
-     UI
+     Standard UI
   =========================== */
 
   return (
     <div className="space-y-6">
-      {/* Header */}
+      {/* Header with View Mode Toggle */}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <h1 className="text-2xl sm:text-3xl font-bold text-gray-900">Test Orders</h1>
+        <div className="flex items-center space-x-4">
+          <h1 className="text-2xl sm:text-3xl font-bold text-gray-900">Test Orders</h1>
+          <div className="flex items-center space-x-2 bg-gray-100 rounded-lg p-1">
+            <button
+              onClick={() => setViewMode('standard')}
+              className={`flex items-center px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
+                viewMode === 'standard' 
+                  ? 'bg-white text-blue-600 shadow-sm' 
+                  : 'text-gray-600 hover:text-gray-800'
+              }`}
+            >
+              <ToggleLeft className="h-4 w-4 mr-1" />
+              Standard View
+            </button>
+            <button
+              onClick={() => setViewMode('enhanced')}
+              className={`flex items-center px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
+                viewMode === 'enhanced' 
+                  ? 'bg-white text-blue-600 shadow-sm' 
+                  : 'text-gray-600 hover:text-gray-800'
+              }`}
+            >
+              <ToggleRight className="h-4 w-4 mr-1" />
+              Patient Visits
+            </button>
+          </div>
+        </div>
         <button
           onClick={() => setShowOrderForm(true)}
           className="inline-flex items-center px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
@@ -432,6 +753,8 @@ const Orders: React.FC = () => {
                 <div className="space-y-4">
                   {g.orders.map((o) => {
                     const pct = o.expectedTotal > 0 ? Math.round((o.enteredTotal / o.expectedTotal) * 100) : 0;
+                    const canAddTests = !['Completed', 'Delivered'].includes(o.status);
+                    
                     return (
                       <div
                         key={o.id}
@@ -553,17 +876,32 @@ const Orders: React.FC = () => {
                               </div>
                             </div>
 
-                            {/* View button opens modal only */}
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                openDetails(o);
-                              }}
-                              className="mt-3 inline-flex items-center px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700"
-                            >
-                              <Eye className="h-4 w-4 mr-1" />
-                              View Full Details
-                            </button>
+                            {/* Updated button section with Add Tests functionality */}
+                            <div className="mt-3 flex flex-col sm:flex-row gap-2">
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  openDetails(o);
+                                }}
+                                className="inline-flex items-center px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+                              >
+                                <Eye className="h-4 w-4 mr-1" />
+                                View Full Details
+                              </button>
+                              
+                              {canAddTests && (
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleAddTests(o.id);
+                                  }}
+                                  className="inline-flex items-center px-3 py-1.5 text-sm bg-green-600 text-white rounded-lg hover:bg-green-700"
+                                >
+                                  <Plus className="h-4 w-4 mr-1" />
+                                  Add Tests
+                                </button>
+                              )}
+                            </div>
                           </div>
                         </div>
 
@@ -683,7 +1021,10 @@ const Orders: React.FC = () => {
 
       {/* Modals */}
       {showOrderForm && (
-        <OrderForm onClose={() => setShowOrderForm(false)} onSubmit={() => setShowOrderForm(false)} />
+        <OrderForm 
+          onClose={() => setShowOrderForm(false)} 
+          onSubmit={handleAddOrder}
+        />
       )}
 
       {selectedOrder && (
@@ -702,6 +1043,148 @@ const Orders: React.FC = () => {
             await fetchOrders();
           }}
         />
+      )}
+
+      {/* Add Test Selection Modal */}
+      {showAddTestModal && selectedOrderId && (
+        <div className="fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-lg shadow-xl w-full max-w-4xl max-h-[90vh] overflow-hidden">
+            <div className="px-6 py-4 border-b border-gray-200 bg-blue-50">
+              <div className="flex items-center justify-between">
+                <h3 className="text-lg font-semibold text-gray-900">Add Tests to Order</h3>
+                <button
+                  onClick={() => {
+                    setShowAddTestModal(false);
+                    setSelectedOrderId(null);
+                    setSelectedTests([]);
+                    setSearchQuery('');
+                  }}
+                  className="text-gray-400 hover:text-gray-600"
+                >
+                  <X className="h-6 w-6" />
+                </button>
+              </div>
+              <p className="text-sm text-gray-600 mt-1">
+                Order ID: {selectedOrderId?.slice(-6)} • Select tests to add to this order
+              </p>
+            </div>
+
+            <div className="p-6 overflow-y-auto max-h-[60vh]">
+              {/* Search */}
+              <div className="mb-4">
+                <div className="relative">
+                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-400" />
+                  <input
+                    type="text"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    placeholder="Search tests and packages..."
+                    className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                  />
+                </div>
+              </div>
+
+              {/* Loading state */}
+              {isLoadingTests ? (
+                <div className="text-center py-8">
+                  <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto"></div>
+                  <p className="text-gray-600 mt-2">Loading tests...</p>
+                </div>
+              ) : (
+                /* Tests grid */
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 max-h-96 overflow-y-auto">
+                  {filteredTests.map((test) => {
+                    const isSelected = selectedTests.some(t => t.id === test.id);
+                    return (
+                      <div
+                        key={test.id}
+                        onClick={() => toggleTestSelection(test)}
+                        className={`p-3 border-2 rounded-lg cursor-pointer transition-all ${
+                          isSelected
+                            ? 'border-blue-500 bg-blue-50'
+                            : 'border-gray-200 hover:border-gray-300'
+                        }`}
+                      >
+                        <div className="flex items-start justify-between">
+                          <div className="flex-1">
+                            <h4 className="font-medium text-gray-900">{test.name}</h4>
+                            <p className="text-sm text-gray-600">
+                              {test.category} • {test.sample}
+                            </p>
+                            {test.code && (
+                              <p className="text-xs text-gray-500 font-mono">{test.code}</p>
+                            )}
+                          </div>
+                          <div className="text-right ml-3">
+                            <div className="font-bold text-green-600">₹{test.price.toLocaleString()}</div>
+                            {isSelected && (
+                              <div className="text-xs text-blue-600 font-medium">✓ Selected</div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {filteredTests.length === 0 && !isLoadingTests && (
+                <div className="text-center py-8">
+                  <TestTube className="h-12 w-12 text-gray-300 mx-auto mb-3" />
+                  <p className="text-gray-600">No tests found matching your search</p>
+                </div>
+              )}
+            </div>
+
+            {/* Selected tests summary and actions */}
+            {selectedTests.length > 0 && (
+              <div className="px-6 py-4 border-t border-gray-200 bg-gray-50">
+                <div className="flex items-center justify-between mb-3">
+                  <div>
+                    <p className="text-sm font-medium text-gray-900">
+                      {selectedTests.length} test{selectedTests.length !== 1 ? 's' : ''} selected
+                    </p>
+                    <p className="text-lg font-bold text-green-600">
+                      Total: ₹{getTotalPrice().toLocaleString()}
+                    </p>
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setSelectedTests([])}
+                      className="px-4 py-2 text-sm text-gray-600 bg-white border border-gray-300 rounded-lg hover:bg-gray-50"
+                    >
+                      Clear All
+                    </button>
+                    <button
+                      onClick={handleAddSelectedTests}
+                      className="px-4 py-2 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+                    >
+                      Add Selected Tests
+                    </button>
+                  </div>
+                </div>
+
+                {/* Selected tests list */}
+                <div className="flex flex-wrap gap-2">
+                  {selectedTests.map((test) => (
+                    <span
+                      key={test.id}
+                      className="inline-flex items-center px-2 py-1 text-xs bg-blue-100 text-blue-800 rounded-full"
+                    >
+                      {test.name}
+                      <button
+                        onClick={() => toggleTestSelection(test)}
+                        className="ml-1 text-blue-600 hover:text-blue-800"
+                      >
+                        ×
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
       )}
     </div>
   );

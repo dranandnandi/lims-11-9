@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This is a Laboratory Information Management System (LIMS) v2 built with React/TypeScript + Vite, featuring multi-lab support, AI-powered workflows, and comprehensive test result management. The system manages patients, orders, test results, billing, and workflow automation.
+This is a Laboratory Information Management System (LIMS) v2 built with React/TypeScript + Vite, featuring multi-lab support, AI-powered workflows, and comprehensive test result management. The system manages patients, orders, test results, billing, and workflow automation using a **patient-centric architecture** with advanced Survey.js-based workflows.
 
 ## Architecture Patterns
 
@@ -21,6 +21,7 @@ interface Attachment {
 - Users belong to labs (`users.lab_id`)
 - Lab-specific analyte configurations (`lab_analytes` overrides `analytes`)
 - All queries should filter by user's lab context
+- Use `database.getCurrentUserLabId()` to get the current user's lab
 
 ### 2. Component Organization
 
@@ -50,14 +51,16 @@ The `database` object provides:
 - Proper joins and relationships
 - Lab-scoped filtering
 - Standardized response format
+- Automatic order status updates via `checkAndUpdateStatus()`
 
 ## Workflow System (Survey.js)
 
 ### Core Components
 
-1. **WorkflowRunner** - Executes Survey.js workflows with database integration
+1. **SimpleWorkflowRunner** - Executes Survey.js workflows with database integration
 2. **FlowManager** - Orchestrates multiple workflows for complex procedures  
 3. **WorkflowConfigurator** - No-code workflow design interface
+4. **WorkflowDemo** - `/workflow-demo` route for testing workflows safely
 
 ### Database Schema
 
@@ -66,10 +69,16 @@ Workflows use a versioned approach:
 workflows → workflow_versions → workflow_instances → workflow_step_events
 ```
 
+**Key workflow tables**:
+- `workflows` - Workflow definitions and metadata
+- `workflow_versions` - Versioned workflow configurations with Survey.js JSON
+- `order_workflow_instances` - Active workflow executions per order
+- `workflow_step_events` - Audit trail of workflow steps
+
 ### Integration Pattern
 
 ```typescript
-// Order-gated workflow execution
+// Order-gated workflow execution in FlowManager
 <FlowManager
   orderId={order.id}
   testGroupId={testGroup.id} 
@@ -80,6 +89,12 @@ workflows → workflow_versions → workflow_instances → workflow_step_events
   }}
 />
 ```
+
+**Critical Workflow Rules**:
+- Always test workflows via `/workflow-demo` before production use
+- Workflows are lab-scoped and order-gated (require valid order)
+- Results flow: Survey.js → SimpleWorkflowRunner → database.results.create()
+- Use existing `results` and `result_values` tables (no separate workflow tables needed)
 
 ## Development Conventions
 
@@ -121,6 +136,27 @@ interface ResultWithSecurity {
 ```
 
 Check permissions before allowing modifications.
+
+### 5. Development Commands & Debugging
+
+**Start Development Server**:
+```bash
+npm run dev  # Runs on http://localhost:5173
+```
+
+**Key Development Routes**:
+- `/workflow-demo` - Test workflows without database changes
+- `/dashboard2` - Modern dashboard (newer version)
+- `/orders/:id` - Order detail with workflow capabilities
+
+**File Upload Pattern**:
+```typescript
+// Always use the organized file path helper
+const filePath = generateFilePath(fileName, patientId, labId, 'reports');
+const { path, publicUrl } = await uploadFile(file, filePath);
+```
+
+**PDF Generation**: Use `src/hooks/usePDFGeneration.ts` for report generation with progress tracking.
 
 ## Key Business Logic
 
@@ -209,6 +245,34 @@ END $$;
 ### 3. Testing Workflow Changes
 
 Use `http://localhost:5173/workflow-demo` to test workflow modifications without affecting production data.
+
+### 4. Order Status Management
+
+Order status updates are **automatic** via triggers:
+- `Order Created` → `In Progress` (when samples collected)
+- `In Progress` → `Pending Approval` (when all results submitted)
+- `Pending Approval` → `Completed` (when all results approved)
+- Manual: `Completed` → `Delivered` (via `database.orders.markAsDelivered()`)
+
+**Sample Tracking**: Orders automatically get:
+- `sample_id` (date-based with sequence)
+- `color_code` + `color_name` (for physical sample identification)
+- `qr_code_data` (JSON with order metadata)
+
+### 5. Verification Console Pattern
+
+Use `useVerificationConsole` hook for batch result operations:
+```typescript
+const {
+  results,
+  selectedIds,
+  bulkApprove,
+  bulkReject,
+  focusResult
+} = useVerificationConsole(filters);
+```
+
+**Security**: Results can be locked (`is_locked: true`) preventing edits. Always check `can_edit` before showing edit UI.
 
 ## Common Patterns to Follow
 

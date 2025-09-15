@@ -128,7 +128,7 @@ export default function ResultsVerification() {
             physician_name: result.physician_name,
             order_priority: result.order_priority,
             order_date: result.order_date,
-            sample_id: result.sample_id,
+            sample_id: result.orders?.sample_id || null, // Get sample_id from orders table
             critical_flag: result.critical_flag,
             hours_since_entry: result.hours_since_entry,
             results: []

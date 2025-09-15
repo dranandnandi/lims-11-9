@@ -110,6 +110,22 @@ export const database = {
       return user.user_metadata.lab_id;
     }
     
+    // For development/demo purposes, try to get a default lab
+    try {
+      const { data: labs, error: labError } = await supabase
+        .from('labs')
+        .select('id')
+        .eq('is_active', true)
+        .limit(1);
+      
+      if (!labError && labs && labs.length > 0) {
+        console.warn('Lab ID not found in user metadata. Using first available lab for demo:', labs[0].id);
+        return labs[0].id;
+      }
+    } catch (err) {
+      console.warn('Could not fetch default lab:', err);
+    }
+    
     // In production, this should fetch from a profiles table or use RLS
     console.warn('Lab ID not found in user metadata. Using default lab.');
     return null; // Return null to handle gracefully in calling code
@@ -475,24 +491,72 @@ export const database = {
         return { data: order, error: updateError };
       }
 
-      // Then create the associated tests
-      if (updatedOrder && tests && tests.length > 0) {
-        const orderTests = tests.map((test: string) => ({
-          order_id: updatedOrder.id,
-          test_name: test
-        }));
-
-        const { error: testsError } = await supabase
-          .from('order_tests')
-          .insert(orderTests);
-
-        if (testsError) {
-          console.error('Error inserting order tests:', testsError);
-          return { data: updatedOrder, error: testsError };
+      // Then create the associated tests only if there are tests to create
+      if (updatedOrder && tests && Array.isArray(tests) && tests.length > 0) {
+        let orderTestsData: any[] = [];
+        
+        // Handle both string array (legacy) and object array (new format)
+        if (typeof tests[0] === 'string') {
+          // Legacy format - lookup test_group_ids from test_groups table
+          const validTestNames = tests.filter(test => test && typeof test === 'string' && test.trim() !== '');
+          
+          if (validTestNames.length > 0) {
+            const { data: testGroups, error: testGroupError } = await supabase
+              .from('test_groups')
+              .select('id, name')
+              .in('name', validTestNames);
+            
+            if (testGroupError) {
+              console.error('Error fetching test groups:', testGroupError);
+            }
+            
+            // Create a map of test name to test_group_id
+            const testGroupMap = new Map<string, string>();
+            (testGroups || []).forEach(tg => {
+              testGroupMap.set(tg.name, tg.id);
+            });
+            
+            orderTestsData = validTestNames.map(testName => ({
+              order_id: updatedOrder.id,
+              test_name: testName,
+              test_group_id: testGroupMap.get(testName) || null,
+              sample_id: updatedOrder.sample_id
+            }));
+          }
+        } else {
+          // New format - tests are objects with id and name
+          const validTestObjects = tests.filter(test => 
+            test && 
+            typeof test === 'object' && 
+            test.name && 
+            test.name.trim() !== ''
+          );
+          
+          orderTestsData = validTestObjects.map(test => ({
+            order_id: updatedOrder.id,
+            test_name: test.name,
+            test_group_id: test.type === 'test' ? test.id : null, // Only include test_group_id for individual tests, not packages
+            sample_id: updatedOrder.sample_id
+          }));
+        }
+        
+        if (orderTestsData.length > 0) {
+          console.log('Creating order_tests with test_group_ids:', orderTestsData);
+          
+          const { error: orderTestsError } = await supabase
+            .from('order_tests')
+            .insert(orderTestsData);
+          
+          if (orderTestsError) {
+            console.error('Error creating order tests:', orderTestsError);
+            return { data: updatedOrder, error: orderTestsError };
+          }
+          
+          console.log(`✅ Created ${orderTestsData.length} order test records with proper test_group_ids`);
         }
       }
 
-      return { data: { ...updatedOrder, tests }, error: null };
+      return { data: { ...updatedOrder, tests: tests || [] }, error: null };
     },
 
     update: async (id: string, orderData: any) => {

@@ -1,0 +1,6 @@
+@media print {
+  body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  * { color: #000 !important; }
+  header, nav, .no-print, .btn, .action-strip { display: none !important; }
+  .card, .table, .panel { border-color: #000 !important; box-shadow: none !important; }
+}

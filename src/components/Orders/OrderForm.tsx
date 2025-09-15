@@ -95,10 +95,9 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
     const totalAmount = selectedTestDetails.reduce((sum, test) => sum + test.price, 0);
     
     // Convert to snake_case for Supabase
-    const orderData = {
+    const orderData: any = {
       patient_name: selectedPatient?.name || '',
       patient_id: formData.patientId,
-      tests: selectedTestDetails.map(test => test.name),
       status: 'Order Created', // Orders start as "Order Created" before sample collection
       priority: formData.priority,
       order_date: new Date().toISOString().split('T')[0],
@@ -106,6 +105,16 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
       total_amount: totalAmount,
       doctor: formData.doctor,
     };
+    
+    // Only include tests if there are actually tests selected
+    if (selectedTestDetails.length > 0) {
+      orderData.tests = selectedTestDetails.map(test => ({
+        name: test.name,
+        id: test.id,
+        type: test.type || 'test', // 'test' or 'package'
+        price: test.price || 0
+      }));
+    }
     
     onSubmit(orderData);
   };

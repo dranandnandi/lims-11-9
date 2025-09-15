@@ -117,16 +117,51 @@ const ensureAuthenticated = async (): Promise<string | null> => {
   return session.user.id;
 };
 
-// Enhanced HTML template generator
-const generateUniversalHTMLTemplate = (data: ReportData): string => {
+// Enhanced HTML template generator with optional draft watermark
+const generateUniversalHTMLTemplate = (data: ReportData, isDraft = false): string => {
   const { patient, report, testResults, interpretation } = data;
   const template = data.template || defaultLabTemplate;
+  
+  const draftWatermarkCSS = isDraft ? `
+    .draft-watermark {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%) rotate(-45deg);
+      font-size: 120px;
+      font-weight: bold;
+      color: rgba(220, 53, 69, 0.1);
+      z-index: -1;
+      pointer-events: none;
+      user-select: none;
+      text-transform: uppercase;
+      letter-spacing: 10px;
+    }
+    .draft-indicator {
+      background: #fff3cd;
+      border: 2px solid #ffc107;
+      border-radius: 8px;
+      padding: 15px;
+      margin: 20px 0;
+      text-align: center;
+      color: #856404;
+      font-weight: bold;
+      font-size: 14px;
+    }
+  ` : '';
+  
+  const draftWatermarkHTML = isDraft ? `
+    <div class="draft-watermark">DRAFT</div>
+    <div class="draft-indicator">
+      ⚠️ DRAFT REPORT - Some results may still be pending verification
+    </div>
+  ` : '';
   
   return `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Lab Report - ${report.reportId}</title>
+  <title>Lab Report - ${report.reportId}${isDraft ? ' (DRAFT)' : ''}</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { 
@@ -136,7 +171,9 @@ const generateUniversalHTMLTemplate = (data: ReportData): string => {
       color: #333;
       line-height: 1.6;
       font-size: 12px;
+      position: relative;
     }
+    ${draftWatermarkCSS}
     .header { 
       text-align: center; 
       border-bottom: 3px solid ${template.styling.primaryColor};
@@ -322,6 +359,7 @@ const generateUniversalHTMLTemplate = (data: ReportData): string => {
   </style>
 </head>
 <body>
+  ${draftWatermarkHTML}
   <div class="header">
     <div class="lab-name">${template.header.labName}</div>
     <div class="lab-info">
@@ -330,7 +368,7 @@ const generateUniversalHTMLTemplate = (data: ReportData): string => {
     </div>
   </div>
 
-  <div class="report-title">Laboratory Report</div>
+  <div class="report-title">Laboratory Report${isDraft ? ' (DRAFT)' : ''}</div>
 
   <div class="info-grid">
     <div class="info-box">
@@ -450,15 +488,15 @@ const generateUniversalHTMLTemplate = (data: ReportData): string => {
 };
 
 // Enhanced PDF generation with PDF.co API
-export const generatePDFWithAPI = async (reportData: ReportData): Promise<string> => {
-  console.log('Generating PDF with PDF.co API...');
+export const generatePDFWithAPI = async (reportData: ReportData, isDraft = false): Promise<string> => {
+  console.log('Generating PDF with PDF.co API...', isDraft ? '(DRAFT)' : '(FINAL)');
   
   if (!PDFCO_API_KEY) {
     throw new Error('PDF.co API key not configured');
   }
 
-  const htmlContent = generateUniversalHTMLTemplate(reportData);
-  const filename = `${reportData.patient.name.replace(/\s+/g, '_')}_${reportData.report.reportId}.pdf`;
+  const htmlContent = generateUniversalHTMLTemplate(reportData, isDraft);
+  const filename = `${reportData.patient.name.replace(/\s+/g, '_')}_${reportData.report.reportId}${isDraft ? '_DRAFT' : ''}.pdf`;
 
   const requestBody = {
     name: filename,
@@ -581,8 +619,8 @@ export const savePDFToStorage = async (pdfBlob: Blob, orderId: string): Promise<
 };
 
 // Update database with PDF information
-export const updateReportWithPDFInfo = async (orderId: string, pdfUrl: string): Promise<void> => {
-  console.log('Updating database with PDF info...');
+export const updateReportWithPDFInfo = async (orderId: string, pdfUrl: string, reportType: string = 'final'): Promise<void> => {
+  console.log(`Updating database with ${reportType} PDF info...`);
   
   try {
     const { error } = await supabase
@@ -592,14 +630,15 @@ export const updateReportWithPDFInfo = async (orderId: string, pdfUrl: string): 
         pdf_generated_at: new Date().toISOString(),
         status: 'completed'
       })
-      .eq('order_id', orderId);
+      .eq('order_id', orderId)
+      .eq('report_type', reportType);
 
     if (error) {
       console.error('Database update error:', error);
       throw error;
     }
 
-    console.log('Database updated successfully');
+    console.log(`Database updated successfully for ${reportType} report`);
   } catch (error) {
     console.error('Failed to update database:', error);
     throw error;
@@ -610,9 +649,10 @@ export const updateReportWithPDFInfo = async (orderId: string, pdfUrl: string): 
 export async function generateAndSavePDFReportWithProgress(
   orderId: string, 
   reportData: ReportData,
-  onProgress?: (stage: string, progress?: number) => void
+  onProgress?: (stage: string, progress?: number) => void,
+  isDraft = false
 ): Promise<string | null> {
-  console.log('generateAndSavePDFReportWithProgress called for order:', orderId);
+  console.log('generateAndSavePDFReportWithProgress called for order:', orderId, 'isDraft:', isDraft);
   
   onProgress?.('Checking authentication...', 5);
   
@@ -628,17 +668,19 @@ export async function generateAndSavePDFReportWithProgress(
   try {
     onProgress?.('Checking existing reports...', 10);
     
-    // First, ensure a report record exists
+    // First, check for existing report of the same type (draft vs final)
+    const reportType = isDraft ? 'draft' : 'final';
     let { data: existingReport } = await supabase
       .from('reports')
-      .select('id, pdf_url, pdf_generated_at, status')
+      .select('id, pdf_url, pdf_generated_at, status, report_type')
       .eq('order_id', orderId)
+      .eq('report_type', reportType)
       .maybeSingle(); // Use maybeSingle to avoid errors when no record exists
 
-    // If no report exists, create one
+    // If no report of this type exists, create one
     if (!existingReport) {
-      console.log('No report record exists, creating one...');
-      onProgress?.('Creating report record...', 15);
+      console.log(`No ${reportType} report record exists, creating one...`);
+      onProgress?.(`Creating ${reportType} report record...`, 15);
       
       // Get order details to populate report
       const { data: orderData, error: orderError } = await supabase
@@ -663,7 +705,7 @@ export async function generateAndSavePDFReportWithProgress(
           doctor: orderData.doctor || 'Unknown',
           status: 'pending',
           generated_date: new Date().toISOString(),
-          report_type: 'Laboratory Report',
+          report_type: reportType,
           report_status: 'generating'
         })
         .select()
@@ -674,8 +716,9 @@ export async function generateAndSavePDFReportWithProgress(
         if (insertError.code === '23505') {
           const { data: retryReport } = await supabase
             .from('reports')
-            .select('id, pdf_url, pdf_generated_at, status')
+            .select('id, pdf_url, pdf_generated_at, status, report_type')
             .eq('order_id', orderId)
+            .eq('report_type', reportType)
             .single();
           existingReport = retryReport;
         } else {
@@ -688,32 +731,32 @@ export async function generateAndSavePDFReportWithProgress(
       }
     }
 
-    // Check if PDF already exists and is valid
+    // Check if PDF already exists and is valid for this specific report type
     if (existingReport?.pdf_url) {
-      console.log('PDF already exists:', existingReport.pdf_url);
-      onProgress?.('Validating existing PDF...', 20);
+      console.log(`${reportType.toUpperCase()} PDF already exists:`, existingReport.pdf_url);
+      onProgress?.(`Validating existing ${reportType} PDF...`, 20);
       
       try {
         const response = await fetch(existingReport.pdf_url, { method: 'HEAD' });
         if (response.ok) {
-          console.log('Existing PDF is valid');
-          onProgress?.('Using existing PDF', 100);
+          console.log(`Existing ${reportType} PDF is valid`);
+          onProgress?.(`Using existing ${reportType} PDF`, 100);
           return existingReport.pdf_url;
         }
       } catch (error) {
-        console.warn('Existing PDF URL is invalid, regenerating...');
+        console.warn(`Existing ${reportType} PDF URL is invalid, regenerating...`);
       }
     }
 
-    console.log('Generating new PDF...');
-    onProgress?.('Generating PDF with PDF.co...', 25);
+    console.log(`Generating new ${reportType} PDF...`);
+    onProgress?.(`Generating ${reportType} PDF with PDF.co...`, 25);
     
     let pdfUrl: string | null = null;
     let pdfBlob: Blob | null = null;
 
     // Try PDF.co API - this is the only method we should use
     try {
-      pdfUrl = await generatePDFWithAPI(reportData);
+      pdfUrl = await generatePDFWithAPI(reportData, isDraft);
       console.log('✅ PDF.co URL received:', pdfUrl);
       onProgress?.('PDF generated, downloading...', 40);
       
@@ -778,7 +821,7 @@ export async function generateAndSavePDFReportWithProgress(
     // Update database
     console.log('Updating database with PDF URL...');
     onProgress?.('Updating database...', 90);
-    await updateReportWithPDFInfo(orderId, storageUrl);
+    await updateReportWithPDFInfo(orderId, storageUrl, reportType);
 
     console.log('PDF generation completed successfully');
     onProgress?.('PDF ready for download!', 100);
@@ -1058,7 +1101,7 @@ export async function generateAndSavePDFReport(orderId: string, reportData: Repo
     
     // Update database
     console.log('Updating database with PDF URL...');
-    await updateReportWithPDFInfo(orderId, storageUrl);
+    await updateReportWithPDFInfo(orderId, storageUrl, 'final');
 
     console.log('PDF generation completed successfully');
     return storageUrl;

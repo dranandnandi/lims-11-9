@@ -1,5 +1,3 @@
-'use client';
-
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { supabase } from '../utils/supabase';
 import { FileText, Download, Eye, Search, RefreshCw } from 'lucide-react';
@@ -12,9 +10,9 @@ import {
   startOfMonth,
   endOfMonth,
 } from 'date-fns';
-import { generateAndSavePDFReport, viewPDFReport } from '../utils/pdfService';
+import { viewPDFReport } from '../utils/pdfService';
 import PDFProgressModal from '../components/PDFProgressModal';
-import { usePDFGeneration } from '../hooks/usePDFGeneration';
+import { usePDFGeneration, isOrderReportReady } from '../hooks/usePDFGeneration';
 
 type DateFilter = 'today' | 'yesterday' | 'week' | 'month' | 'all';
 
@@ -49,6 +47,11 @@ interface ApprovedResult {
   has_report?: boolean;
   report_status?: string;
   report_generated_at?: string;
+  is_report_ready?: boolean; // New field for report readiness
+  has_draft_report?: boolean;
+  has_final_report?: boolean;
+  draft_report?: any;
+  final_report?: any;
 }
 
 interface OrderGroup {
@@ -63,13 +66,8 @@ interface OrderGroup {
   verified_by: string; // from latest
   test_names: string[];
   results: ApprovedResult[]; // raw rows
+  is_report_ready?: boolean; // New field for report readiness
 }
-
-type ReportRow = {
-  order_id: string;
-  status: string;
-  generated_date: string;
-};
 
 type PreparedReport = {
   patient: {
@@ -158,26 +156,49 @@ const Reports: React.FC = () => {
 
       if (!error && data) {
         // Load existing reports to check which orders already have reports
-        let existingReports: ReportRow[] = [];
+        let existingReports: any[] = [];
         const orderIds = data.map((r: ApprovedResult) => r.order_id).filter(Boolean);
 
         if (orderIds.length > 0) {
           const { data: reportsData } = await supabase
             .from('reports')
-            .select('order_id, status, generated_date')
+            .select('order_id, status, generated_date, report_type')
             .in('order_id', orderIds);
-          existingReports = (reportsData as ReportRow[]) || [];
+          existingReports = (reportsData as any[]) || [];
         }
 
-        const reportMap = new Map(existingReports.map((r) => [r.order_id, r]));
+        // Create maps for different report types
+        const draftReportMap = new Map(
+          existingReports
+            .filter(r => r.report_type === 'draft')
+            .map((r) => [r.order_id, r])
+        );
+        const finalReportMap = new Map(
+          existingReports
+            .filter(r => r.report_type === 'final')
+            .map((r) => [r.order_id, r])
+        );
 
         // Add report status to each result
-        const enhancedData: ApprovedResult[] = (data as ApprovedResult[]).map((result) => ({
-          ...result,
-          has_report: reportMap.has(result.order_id),
-          report_status: reportMap.get(result.order_id)?.status,
-          report_generated_at: reportMap.get(result.order_id)?.generated_date,
-        }));
+        const enhancedData: ApprovedResult[] = await Promise.all(
+          (data as ApprovedResult[]).map(async (result) => {
+            const draftReport = draftReportMap.get(result.order_id);
+            const finalReport = finalReportMap.get(result.order_id);
+            const isReady = await isOrderReportReady(result.order_id);
+            
+            return {
+              ...result,
+              has_report: finalReportMap.has(result.order_id) || draftReportMap.has(result.order_id),
+              report_status: finalReport?.status || draftReport?.status,
+              report_generated_at: finalReport?.generated_date || draftReport?.generated_date,
+              is_report_ready: isReady,
+              has_draft_report: draftReportMap.has(result.order_id),
+              has_final_report: finalReportMap.has(result.order_id),
+              draft_report: draftReport,
+              final_report: finalReport
+            };
+          })
+        );
 
         // Filter by search
         let filtered = enhancedData;
@@ -224,6 +245,7 @@ const Reports: React.FC = () => {
           verified_by: r.verified_by,
           test_names: [r.test_name],
           results: [r],
+          is_report_ready: r.is_report_ready || false
         };
         map.set(r.order_id, group);
       } else {
@@ -235,6 +257,8 @@ const Reports: React.FC = () => {
           group.verified_at = r.verified_at;
           group.verified_by = r.verified_by;
         }
+        // Update report readiness - should be true only if all results are ready
+        group.is_report_ready = group.is_report_ready && (r.is_report_ready || false);
       }
     }
     // Return sorted by verified_at desc
@@ -349,7 +373,7 @@ const Reports: React.FC = () => {
 
     try {
       console.log('Preparing report data for group:', group);
-      // Prepare report data
+      // Prepare report data using the legacy method for viewing
       const reportData = await prepareReportData(group);
       console.log('Report data prepared:', reportData);
       
@@ -369,7 +393,7 @@ const Reports: React.FC = () => {
   };
 
   // Download PDF for a specific order (aggregated). Fallback to simple HTML download
-  const handleDownload = async (orderId: string) => {
+  const handleDownload = async (orderId: string, forceDraft = false) => {
     console.log('handleDownload called for orderId:', orderId);
     
     const group = orderGroups.find(g => g.order_id === orderId);
@@ -380,13 +404,10 @@ const Reports: React.FC = () => {
     }
 
     try {
-      console.log('Preparing report data for download:', group);
-      // Prepare report data
-      const reportData = await prepareReportData(group);
-      console.log('Report data prepared for download:', reportData);
+      console.log('Generating PDF for download:', group);
       
-      // Use the progress-enabled PDF generation
-      await generatePDF(orderId, reportData);
+      // Use the new PDF generation hook that handles everything internally
+      await generatePDF(orderId, forceDraft);
     } catch (error) {
       console.error('Download failed:', error);
       alert('Download failed: ' + (error instanceof Error ? error.message : 'Unknown error'));
@@ -577,6 +598,9 @@ const Reports: React.FC = () => {
                       Approved At
                     </th>
                     <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
+                      Report Status
+                    </th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
                       Actions
                     </th>
                   </tr>
@@ -632,6 +656,30 @@ const Reports: React.FC = () => {
                         </div>
                       </td>
                       <td className="px-4 py-3">
+                        <div className="flex flex-col space-y-1">
+                          {(group.results[0] as ApprovedResult)?.has_final_report && (
+                            <span className="text-xs bg-green-100 text-green-800 px-2 py-1 rounded inline-block">
+                              Final Available
+                            </span>
+                          )}
+                          {(group.results[0] as ApprovedResult)?.has_draft_report && (
+                            <span className="text-xs bg-blue-100 text-blue-800 px-2 py-1 rounded inline-block">
+                              Draft Available
+                            </span>
+                          )}
+                          {!group.is_report_ready && !(group.results[0] as ApprovedResult)?.has_report && (
+                            <span className="text-xs bg-yellow-100 text-yellow-800 px-2 py-1 rounded inline-block">
+                              Pending Verification
+                            </span>
+                          )}
+                          {group.is_report_ready && !(group.results[0] as ApprovedResult)?.has_report && (
+                            <span className="text-xs bg-gray-100 text-gray-800 px-2 py-1 rounded inline-block">
+                              Ready to Generate
+                            </span>
+                          )}
+                        </div>
+                      </td>
+                      <td className="px-4 py-3">
                         <div className="flex space-x-2">
                           <button
                             className="text-blue-600 hover:text-blue-700 text-sm flex items-center space-x-1"
@@ -640,29 +688,84 @@ const Reports: React.FC = () => {
                             <Eye className="w-4 h-4" />
                             <span>View</span>
                           </button>
-                          <button
-                            className={`text-green-600 hover:text-green-700 text-sm flex items-center space-x-1 ${
-                              isGenerating ? 'opacity-50 cursor-not-allowed' : ''
-                            }`}
-                            onClick={() => handleDownload(group.order_id)}
-                            disabled={isGenerating}
-                          >
-                            {isGenerating ? (
-                              <>
-                                <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-green-600"></div>
-                                <span>Generating...</span>
-                              </>
-                            ) : (
-                              <>
-                                <Download className="w-4 h-4" />
-                                <span>Download</span>
-                              </>
-                            )}
-                          </button>
-                          {(group.results[0] as ApprovedResult)?.has_report && (
-                            <span className="text-xs bg-green-100 text-green-800 px-2 py-1 rounded">
-                              Report Generated
-                            </span>
+                          
+                          {/* Show different actions based on report availability and readiness */}
+                          {group.is_report_ready ? (
+                            <>
+                              {!(group.results[0] as ApprovedResult)?.has_final_report ? (
+                                <button
+                                  className={`text-green-600 hover:text-green-700 text-sm flex items-center space-x-1 ${
+                                    isGenerating ? 'opacity-50 cursor-not-allowed' : ''
+                                  }`}
+                                  onClick={() => handleDownload(group.order_id, false)}
+                                  disabled={isGenerating}
+                                  title="Generate final report (all results approved)"
+                                >
+                                  {isGenerating ? (
+                                    <>
+                                      <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-green-600"></div>
+                                      <span>Generating...</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Download className="w-4 h-4" />
+                                      <span>Generate Final</span>
+                                    </>
+                                  )}
+                                </button>
+                              ) : (
+                                <button
+                                  className="text-green-600 hover:text-green-700 text-sm flex items-center space-x-1"
+                                  onClick={() => {
+                                    const finalReport = (group.results[0] as ApprovedResult)?.final_report;
+                                    if (finalReport?.pdf_url) {
+                                      window.open(finalReport.pdf_url, '_blank');
+                                    }
+                                  }}
+                                  title="Download final report"
+                                >
+                                  <Download className="w-4 h-4" />
+                                  <span>Download Final</span>
+                                </button>
+                              )}
+                              
+                              {(group.results[0] as ApprovedResult)?.has_draft_report && (
+                                <button
+                                  className="text-blue-600 hover:text-blue-700 text-sm flex items-center space-x-1"
+                                  onClick={() => {
+                                    const draftReport = (group.results[0] as ApprovedResult)?.draft_report;
+                                    if (draftReport?.pdf_url) {
+                                      window.open(draftReport.pdf_url, '_blank');
+                                    }
+                                  }}
+                                  title="Download draft report"
+                                >
+                                  <Download className="w-4 h-4" />
+                                  <span>View Draft</span>
+                                </button>
+                              )}
+                            </>
+                          ) : (
+                            <button
+                              className={`text-orange-600 hover:text-orange-700 text-sm flex items-center space-x-1 ${
+                                isGenerating ? 'opacity-50 cursor-not-allowed' : ''
+                              }`}
+                              onClick={() => handleDownload(group.order_id, true)}
+                              disabled={isGenerating}
+                              title="Generate draft report (some results pending)"
+                            >
+                              {isGenerating ? (
+                                <>
+                                  <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-orange-600"></div>
+                                  <span>Generating...</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Download className="w-4 h-4" />
+                                  <span>Generate Draft</span>
+                                </>
+                              )}
+                            </button>
                           )}
                         </div>
                       </td>
