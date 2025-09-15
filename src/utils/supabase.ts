@@ -1794,6 +1794,106 @@ export const database = {
 
 // Database helper functions for attachments
 export const attachments = {
+  // Upload file with metadata including test-level support
+  upload: async (file: File, metadata: {
+    patient_id?: string;
+    related_table: string;
+    related_id: string;
+    order_id?: string;
+    order_test_id?: string; // New field for test-level attachments
+    description?: string;
+    tag?: string;
+  }) => {
+    try {
+      const labId = await database.getCurrentUserLabId();
+      const timestamp = Date.now();
+      const fileName = `${timestamp}_${file.name}`;
+      const filePath = `attachments/${labId}/${fileName}`;
+
+      // Upload file to storage
+      const { error: uploadError } = await supabase.storage
+        .from('attachments')
+        .upload(filePath, file);
+
+      if (uploadError) throw uploadError;
+
+      // Get public URL
+      const { data: { publicUrl } } = supabase.storage
+        .from('attachments')
+        .getPublicUrl(filePath);
+
+      // Save attachment metadata
+      const { data, error } = await supabase
+        .from('attachments')
+        .insert({
+          patient_id: metadata.patient_id,
+          related_table: metadata.related_table,
+          related_id: metadata.related_id,
+          order_id: metadata.order_id,
+          order_test_id: metadata.order_test_id, // Save test association
+          file_url: publicUrl,
+          file_type: file.type,
+          file_path: filePath,
+          original_filename: file.name,
+          stored_filename: fileName,
+          file_size: file.size,
+          description: metadata.description,
+          tag: metadata.tag,
+          lab_id: labId,
+          uploaded_by: (await supabase.auth.getUser()).data.user?.id
+        })
+        .select()
+        .single();
+
+      if (error) throw error;
+      return { data, error: null };
+    } catch (error) {
+      console.error('Error uploading attachment:', error);
+      return { data: null, error };
+    }
+  },
+
+  // Get attachments by order test ID
+  getByOrderTest: async (orderTestId: string) => {
+    try {
+      const { data, error } = await supabase
+        .from('attachments')
+        .select('*')
+        .eq('order_test_id', orderTestId)
+        .order('created_at', { ascending: false });
+
+      if (error) throw error;
+      return { data, error: null };
+    } catch (error) {
+      console.error('Error fetching test attachments:', error);
+      return { data: null, error };
+    }
+  },
+
+  // Get attachments by order with test information
+  getByOrderWithTestInfo: async (orderId: string) => {
+    try {
+      const { data, error } = await supabase
+        .from('attachments')
+        .select(`
+          *,
+          order_tests!attachments_order_test_id_fkey(
+            id,
+            test_name,
+            test_group_id
+          )
+        `)
+        .eq('order_id', orderId)
+        .order('created_at', { ascending: false });
+
+      if (error) throw error;
+      return { data, error: null };
+    } catch (error) {
+      console.error('Error fetching order attachments:', error);
+      return { data: null, error };
+    }
+  },
+
   getByRelatedId: async (relatedTable: string, relatedId: string) => {
     const { data, error } = await supabase
       .from('attachments')

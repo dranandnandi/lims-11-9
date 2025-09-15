@@ -42,6 +42,14 @@ export interface VerificationResult {
     thumb_url: string;
     full_url: string;
   }>;
+  attachments?: Array<{
+    id: string;
+    file_url: string;
+    file_type: string;
+    original_filename: string;
+    created_at: string;
+    level: 'test' | 'order';
+  }>;
   audit_info: {
     source: 'OCR' | 'Analyzer' | 'LIS' | 'Manual';
     auto_calculated: boolean;
@@ -195,15 +203,56 @@ class VerificationService {
         };
       });
 
+      // Fetch attachments for all order_ids
+      const uniqueOrderIds = [...new Set(results.map(r => r.order_id))];
+      const attachmentsByOrder: Record<string, any[]> = {};
+      
+      if (uniqueOrderIds.length > 0) {
+        const { data: attachmentsData } = await supabase
+          .from('attachments')
+          .select(`
+            id,
+            file_url,
+            file_type,
+            original_filename,
+            created_at,
+            order_id,
+            order_test_id
+          `)
+          .in('order_id', uniqueOrderIds)
+          .order('created_at', { ascending: false });
+        
+        // Group attachments by order_id
+        attachmentsData?.forEach(att => {
+          if (!attachmentsByOrder[att.order_id]) {
+            attachmentsByOrder[att.order_id] = [];
+          }
+          attachmentsByOrder[att.order_id].push({
+            id: att.id,
+            file_url: att.file_url,
+            file_type: att.file_type,
+            original_filename: att.original_filename,
+            created_at: att.created_at,
+            level: att.order_test_id ? 'test' : 'order'
+          });
+        });
+      }
+
+      // Add attachments to results
+      const resultsWithAttachments = results.map(result => ({
+        ...result,
+        attachments: attachmentsByOrder[result.order_id] || []
+      }));
+
       // Calculate stats
       const stats: VerificationStats = {
-        total: results.length,
-        pending: results.filter(r => r.verification_status === 'pending_verification').length,
-        flagged: results.filter(r => r.flags.critical || r.flags.repeat).length,
-        critical: results.filter(r => r.flags.critical).length
+        total: resultsWithAttachments.length,
+        pending: resultsWithAttachments.filter(r => r.verification_status === 'pending_verification').length,
+        flagged: resultsWithAttachments.filter(r => r.flags.critical || r.flags.repeat).length,
+        critical: resultsWithAttachments.filter(r => r.flags.critical).length
       };
 
-      return { results, stats };
+      return { results: resultsWithAttachments, stats };
 
     } catch (error) {
       console.error('Error in fetchVerificationResults:', error);

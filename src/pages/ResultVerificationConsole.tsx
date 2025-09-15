@@ -1,7 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import {
   Search,
-  Filter,
   Calendar,
   ChevronDown,
   ChevronUp,
@@ -12,7 +11,6 @@ import {
   CheckCircle2,
   XCircle,
   CheckSquare,
-  Square,
   RefreshCcw,
   AlertCircle,
   Clock,
@@ -25,7 +23,10 @@ import {
   Loader2,
   Filter as FilterIcon,
   X,
-  ChevronRight
+  ChevronRight,
+  Eye,
+  Expand,
+  Minimize
 } from "lucide-react";
 import { supabase } from "../utils/supabase";
 
@@ -61,6 +62,15 @@ type Analyte = {
   verified_at: string | null;
 };
 
+type Attachment = {
+  id: string;
+  file_url: string;
+  file_type: string;
+  original_filename: string;
+  created_at: string;
+  level: 'test' | 'order';
+};
+
 type StateFilter = "all" | "pending" | "partial" | "ready";
 
 /* =========================================
@@ -83,6 +93,235 @@ const fmtDate = (iso: string) =>
   });
 
 /* =========================================
+   Attachment Item Component
+========================================= */
+
+interface AttachmentItemProps {
+  attachment: Attachment;
+  levelColor: string;
+  levelBgColor: string;
+}
+
+const AttachmentItem: React.FC<AttachmentItemProps> = ({ attachment, levelColor, levelBgColor }) => {
+  const [isExpanded, setIsExpanded] = useState(false);
+  const [previewContent, setPreviewContent] = useState<string | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+
+  const isPreviewable = attachment.file_type === 'text/plain' || 
+                       attachment.file_type === 'application/json' ||
+                       attachment.file_type?.startsWith('image/') ||
+                       attachment.original_filename.toLowerCase().endsWith('.txt') ||
+                       attachment.original_filename.toLowerCase().endsWith('.json') ||
+                       attachment.original_filename.toLowerCase().endsWith('.csv') ||
+                       attachment.original_filename.toLowerCase().endsWith('.png') ||
+                       attachment.original_filename.toLowerCase().endsWith('.jpg') ||
+                       attachment.original_filename.toLowerCase().endsWith('.jpeg') ||
+                       attachment.original_filename.toLowerCase().endsWith('.gif') ||
+                       attachment.original_filename.toLowerCase().endsWith('.bmp');
+
+  const isImage = attachment.file_type?.startsWith('image/') ||
+                  attachment.original_filename.toLowerCase().match(/\.(png|jpg|jpeg|gif|bmp)$/);
+
+  const handleExpand = async () => {
+    if (!isExpanded && isPreviewable && !previewContent && !isImage) {
+      setPreviewLoading(true);
+      try {
+        const response = await fetch(attachment.file_url);
+        const text = await response.text();
+        setPreviewContent(text);
+      } catch (error) {
+        console.error('Failed to load preview:', error);
+        setPreviewContent('Failed to load preview');
+      } finally {
+        setPreviewLoading(false);
+      }
+    }
+    setIsExpanded(!isExpanded);
+  };
+
+  return (
+    <div className={`border rounded ${levelBgColor} ${levelColor.replace('text-', 'border-')}`}>
+      <div className="flex items-center justify-between p-2">
+        <div className="flex items-center space-x-2 flex-1">
+          <FileText className={`h-4 w-4 ${levelColor}`} />
+          <div className="flex-1">
+            <p className="text-sm font-medium">{attachment.original_filename}</p>
+            <p className={`text-xs ${levelColor}`}>
+              {attachment.level === 'test' ? 'Test' : 'Order'} Level • {new Date(attachment.created_at).toLocaleDateString()}
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center space-x-1">
+          {isPreviewable && (
+            <button
+              onClick={handleExpand}
+              className={`p-1 ${levelColor} hover:opacity-75 transition-opacity`}
+              title={isExpanded ? "Minimize" : "Expand preview"}
+            >
+              {isExpanded ? <Minimize className="h-4 w-4" /> : <Expand className="h-4 w-4" />}
+            </button>
+          )}
+          <a
+            href={attachment.file_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className={`${levelColor} hover:opacity-75 transition-opacity`}
+            title="Open in new tab"
+          >
+            <Eye className="h-4 w-4" />
+          </a>
+        </div>
+      </div>
+      
+      {isExpanded && (
+        <div className="border-t p-4 bg-white/50">
+          {previewLoading ? (
+            <div className="flex items-center justify-center py-8">
+              <RefreshCcw className="h-5 w-5 animate-spin mr-2" />
+              <span className="text-sm text-gray-600">Loading preview...</span>
+            </div>
+          ) : isImage ? (
+            <div className="max-h-96 overflow-y-auto border rounded bg-white p-2">
+              <img 
+                src={attachment.file_url} 
+                alt={attachment.original_filename}
+                className="max-w-full h-auto rounded"
+                style={{ maxHeight: '500px' }}
+              />
+            </div>
+          ) : previewContent ? (
+            <div className="max-h-96 overflow-y-auto border rounded bg-white">
+              <pre className="text-sm bg-gray-50 p-4 whitespace-pre-wrap break-words font-mono leading-relaxed">
+                {previewContent.length > 2000 ? `${previewContent.substring(0, 2000)}...\n\n[Preview truncated - full content available in new tab]` : previewContent}
+              </pre>
+            </div>
+          ) : (
+            <div className="text-sm text-gray-500 py-6 text-center">
+              Preview not available for this file type
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+/* =========================================
+   Attachment Viewer Component
+========================================= */
+
+interface AttachmentViewerProps {
+  attachments: Attachment[];
+  viewMode: 'test' | 'all';
+}
+
+const AttachmentViewer: React.FC<AttachmentViewerProps> = ({ attachments, viewMode }) => {
+  const testAttachments = attachments.filter(a => a.level === 'test');
+  const orderAttachments = attachments.filter(a => a.level === 'order');
+  const filteredAttachments = viewMode === 'test' ? testAttachments : attachments;
+
+  if (filteredAttachments.length === 0) {
+    if (viewMode === 'test') {
+      if (orderAttachments.length > 0) {
+        return (
+          <div className="space-y-3">
+            <div className="text-sm text-amber-600 bg-amber-50 p-3 rounded-lg border border-amber-200">
+              <div className="flex items-center space-x-2">
+                <AlertTriangle className="h-4 w-4" />
+                <span className="font-medium">No test-specific attachments for this test</span>
+              </div>
+              <p className="text-xs text-amber-700 mt-1">
+                There are {orderAttachments.length} order-level attachment{orderAttachments.length > 1 ? 's' : ''} available. Switch to "All" view to see them.
+              </p>
+            </div>
+          </div>
+        );
+      } else {
+        return (
+          <div className="text-sm text-gray-500 bg-gray-50 p-3 rounded-lg border border-gray-200">
+            <div className="flex items-center space-x-2">
+              <FileText className="h-4 w-4" />
+              <span>No attachments found for this test or order</span>
+            </div>
+          </div>
+        );
+      }
+    } else {
+      return (
+        <div className="text-sm text-gray-500 bg-gray-50 p-3 rounded-lg border border-gray-200">
+          <div className="flex items-center space-x-2">
+            <FileText className="h-4 w-4" />
+            <span>No attachments found for this order</span>
+          </div>
+        </div>
+      );
+    }
+  }
+
+  return (
+    <div className="space-y-2">
+      {viewMode === 'all' && testAttachments.length > 0 && orderAttachments.length > 0 && (
+        <div className="mb-4">
+          <h5 className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-2">Test-Specific Attachments</h5>
+          <div className="space-y-2">
+            {testAttachments.map(attachment => (
+              <AttachmentItem 
+                key={attachment.id} 
+                attachment={attachment} 
+                levelColor="text-blue-600" 
+                levelBgColor="bg-blue-50" 
+              />
+            ))}
+          </div>
+          
+          {orderAttachments.length > 0 && (
+            <>
+              <h5 className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-2 mt-4">Order-Level Attachments</h5>
+              <div className="space-y-2">
+                {orderAttachments.map(attachment => (
+                  <AttachmentItem 
+                    key={attachment.id} 
+                    attachment={attachment} 
+                    levelColor="text-gray-600" 
+                    levelBgColor="bg-gray-50" 
+                  />
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+      
+      {viewMode === 'test' && (
+        <div className="space-y-2">
+          {testAttachments.map(attachment => (
+            <AttachmentItem 
+              key={attachment.id} 
+              attachment={attachment} 
+              levelColor="text-blue-600" 
+              levelBgColor="bg-blue-50" 
+            />
+          ))}
+        </div>
+      )}
+      
+      {viewMode === 'all' && (testAttachments.length === 0 || orderAttachments.length === 0) && (
+        <div className="space-y-2">
+          {filteredAttachments.map(attachment => (
+            <AttachmentItem 
+              key={attachment.id} 
+              attachment={attachment} 
+              levelColor={attachment.level === 'test' ? "text-blue-600" : "text-gray-600"} 
+              levelBgColor={attachment.level === 'test' ? "bg-blue-50" : "bg-gray-50"} 
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+/* =========================================
    Modern Result Verification Console
 ========================================= */
 
@@ -93,6 +332,9 @@ const ResultVerificationConsole: React.FC = () => {
   const [q, setQ] = useState("");
   const [stateFilter, setStateFilter] = useState<StateFilter>("all");
   const [showAdvancedFilters, setShowAdvancedFilters] = useState(false);
+  
+  // attachment view mode
+  const [attachmentViewMode, setAttachmentViewMode] = useState<'test' | 'all'>('test');
 
   // data
   const [panels, setPanels] = useState<PanelRow[]>([]);
@@ -103,12 +345,50 @@ const ResultVerificationConsole: React.FC = () => {
   const [rowsByResult, setRowsByResult] = useState<Record<string, Analyte[]>>({});
   const [open, setOpen] = useState<Record<string, boolean>>({}); // result_id -> bool
   const [busy, setBusy] = useState<Record<string, boolean>>({});  // small per-row spinner
+  
+  // attachments cache by order_id
+  const [attachmentsByOrder, setAttachmentsByOrder] = useState<Record<string, Attachment[]>>({});
 
   // bulk operations
   const [selectedPanels, setSelectedPanels] = useState<Set<string>>(new Set());
   const [bulkProcessing, setBulkProcessing] = useState(false);
 
-  /* ----------------- Load panels ----------------- */
+    /* ----------------- Load attachments ----------------- */
+  const loadAttachments = async (orderId: string) => {
+    if (attachmentsByOrder[orderId]) return; // Already loaded
+
+    try {
+      const { data, error } = await supabase
+        .from('attachments')
+        .select(`
+          id,
+          file_url,
+          file_type,
+          original_filename,
+          created_at,
+          order_test_id
+        `)
+        .eq('order_id', orderId)
+        .order('created_at', { ascending: false });
+
+      if (error) throw error;
+
+      const attachments: Attachment[] = (data || []).map(att => ({
+        id: att.id,
+        file_url: att.file_url,
+        file_type: att.file_type,
+        original_filename: att.original_filename,
+        created_at: att.created_at,
+        level: att.order_test_id ? 'test' : 'order'
+      }));
+
+      setAttachmentsByOrder(prev => ({ ...prev, [orderId]: attachments }));
+    } catch (error) {
+      console.error('Error loading attachments:', error);
+    }
+  };
+
+  /* ----------------- Ensure analytes loaded ----------------- */
   const loadPanels = async () => {
     setLoading(true);
     setErr(null);
@@ -218,6 +498,7 @@ const ResultVerificationConsole: React.FC = () => {
     const k = row.result_id;
     setOpen((s) => ({ ...s, [k]: !s[k] }));
     if (!rowsByResult[k]) await ensureAnalytesLoaded(k);
+    if (!attachmentsByOrder[row.order_id]) await loadAttachments(row.order_id);
   };
 
   /* ----------------- Selection handlers ----------------- */
@@ -571,7 +852,11 @@ const ResultVerificationConsole: React.FC = () => {
           </div>
 
           <div className="mt-4 flex items-center justify-between">
-            <div className="flex items-center space-x-3">
+            <button
+              onClick={() => toggleOpen(row)}
+              className="flex items-center space-x-3 p-2 -m-2 rounded-lg hover:bg-gray-50 transition-colors cursor-pointer flex-1"
+              title="Click to expand/collapse test details"
+            >
               <TestTube className="h-5 w-5 text-gray-500" />
               <span className="text-lg font-semibold text-gray-900">
                 {row.test_group_name}
@@ -579,7 +864,12 @@ const ResultVerificationConsole: React.FC = () => {
               <span className="text-sm text-gray-500">
                 ({row.expected_analytes} analytes)
               </span>
-            </div>
+              {isOpen ? (
+                <ChevronUp className="h-4 w-4 text-gray-400 ml-2" />
+              ) : (
+                <ChevronDown className="h-4 w-4 text-gray-400 ml-2" />
+              )}
+            </button>
 
             {!isOpen && (
               <button
@@ -650,6 +940,61 @@ const ResultVerificationConsole: React.FC = () => {
                   ))}
                 </tbody>
               </table>
+            </div>
+            
+            {/* Attachments section */}
+            <div className="mt-6 bg-white rounded-xl shadow-sm border border-gray-200">
+              <div className="px-6 py-4 border-b border-gray-200">
+                <div className="flex items-center justify-between">
+                  <h4 className="text-lg font-semibold text-gray-900 flex items-center">
+                    <FileText className="h-5 w-5 mr-2 text-blue-600" />
+                    Attachments
+                    {attachmentsByOrder[row.order_id] && (
+                      <span className="ml-2 text-sm bg-blue-100 text-blue-800 px-2 py-1 rounded-full">
+                        {attachmentsByOrder[row.order_id].length}
+                      </span>
+                    )}
+                  </h4>
+                  <div className="flex items-center space-x-2">
+                    <button
+                      onClick={() => setAttachmentViewMode('test')}
+                      className={`text-xs px-3 py-1 rounded-full transition-colors ${
+                        attachmentViewMode === 'test' 
+                          ? 'bg-blue-100 text-blue-700 font-medium' 
+                          : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                      }`}
+                    >
+                      Test Only
+                      {attachmentsByOrder[row.order_id] && (
+                        <span className="ml-1 text-xs">
+                          ({attachmentsByOrder[row.order_id].filter(a => a.level === 'test').length})
+                        </span>
+                      )}
+                    </button>
+                    <button
+                      onClick={() => setAttachmentViewMode('all')}
+                      className={`text-xs px-3 py-1 rounded-full transition-colors ${
+                        attachmentViewMode === 'all' 
+                          ? 'bg-blue-100 text-blue-700 font-medium' 
+                          : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                      }`}
+                    >
+                      All
+                      {attachmentsByOrder[row.order_id] && (
+                        <span className="ml-1 text-xs">
+                          ({attachmentsByOrder[row.order_id].length})
+                        </span>
+                      )}
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <div className="p-6">
+                <AttachmentViewer 
+                  attachments={attachmentsByOrder[row.order_id] || []} 
+                  viewMode={attachmentViewMode} 
+                />
+              </div>
             </div>
           </div>
         )}

@@ -36,6 +36,7 @@ import {
   uploadFile,
   generateFilePath,
   database,
+  attachments as attachmentsAPI,
 } from "../../utils/supabase";
 import { useAuth } from "../../contexts/AuthContext";
 import { calculateFlagsForResults } from "../../utils/flagCalculation";
@@ -307,6 +308,10 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
   const [isOCRProcessing, setIsOCRProcessing] = useState(false);
   const [ocrResults, setOcrResults] = useState<any>(null);
   const [ocrError, setOcrError] = useState<string | null>(null);
+  
+  // Test-level attachment support
+  const [uploadScope, setUploadScope] = useState<'order' | 'test'>('order');
+  const [selectedTestId, setSelectedTestId] = useState<string>('');
 
   // --- AI console state ---
   type AiStep = {
@@ -373,6 +378,16 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
   const [orderAnalytes, setOrderAnalytes] = useState<any[]>([]);
   const [testGroups, setTestGroups] = useState<TestGroupResult[]>([]);
   const [selectedTestGroup, setSelectedTestGroup] = useState<string>();
+
+  // Get all available order tests for test selection
+  const availableOrderTests = React.useMemo(() => {
+    return testGroups
+      .filter(tg => tg.order_test_id) 
+      .map(tg => ({
+        id: tg.order_test_id!,
+        name: tg.test_group_name
+      }));
+  }, [testGroups]);
 
   // AI helpers
   const [selectedAnalyteForAI, setSelectedAnalyteForAI] = useState<any | null>(null);
@@ -813,41 +828,28 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
     setIsUploading(true);
     setOcrError(null);
     try {
-      const filePath = generateFilePath(file.name, order.patient_id, undefined, "order-results");
-      const uploadResult = await uploadFile(file, filePath);
-      const currentLabId = await database.getCurrentUserLabId();
+      // Use the new attachments.upload method with test-level support
+      const metadata = {
+        related_table: 'orders' as const,
+        related_id: order.id,
+        order_id: order.id,
+        order_test_id: uploadScope === 'test' && selectedTestId ? selectedTestId : undefined,
+        patient_id: order.patient_id,
+        description: `${uploadScope === 'test' ? 'Test-specific' : 'Order-level'} lab result document for order ${order.id}`,
+        tag: uploadScope === 'test' ? 'test-specific' : 'order-level'
+      };
 
-      const { data: attachment, error } = await supabase
-        .from("attachments")
-        .insert([
-          {
-            order_id: order.id,
-            related_table: "orders",
-            related_id: order.id,
-            patient_id: order.patient_id,
-            lab_id: currentLabId,
-            file_url: uploadResult.publicUrl,
-            file_path: uploadResult.path,
-            original_filename: file.name,
-            stored_filename: filePath.split("/").pop(),
-            file_type: file.type,
-            file_size: file.size,
-            description: `Lab result document for order ${order.id}`,
-            uploaded_by: user?.id || null,
-            upload_timestamp: new Date().toISOString(),
-          },
-        ])
-        .select()
-        .single();
+      const { data: attachment, error } = await attachmentsAPI.upload(file, metadata);
 
-      if (error) throw new Error(error.message);
+      if (error) throw new Error(String(error) || 'Upload failed');
+      
       setAttachmentId(attachment.id);
       setUploadedFile(file);
       // refresh visible list
       setAttachments(prev => [attachment, ...prev]);
       if (!activeAttachment) setActiveAttachment(attachment);
       
-      mark("upload", "ok", { name: file.name });
+      // mark("upload", "ok", { name: file.name }); // Comment out until mark function is available
     } catch (err) {
       console.error("Error uploading file:", err);
       setOcrError("Failed to upload file. Please try again.");
@@ -1346,10 +1348,60 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                 <Upload className="h-8 w-8 text-purple-600" />
               </div>
             </div>
+            
+            {/* Test selection for upload scope */}
+            <div className="space-y-3 mb-4">
+              <div className="flex items-center justify-center space-x-4">
+                <label className="flex items-center text-sm">
+                  <input
+                    type="radio"
+                    value="order"
+                    checked={uploadScope === 'order'}
+                    onChange={(e) => setUploadScope(e.target.value as 'order' | 'test')}
+                    className="mr-2"
+                  />
+                  <span>Order Level</span>
+                </label>
+                <label className="flex items-center text-sm">
+                  <input
+                    type="radio"
+                    value="test"
+                    checked={uploadScope === 'test'}
+                    onChange={(e) => setUploadScope(e.target.value as 'order' | 'test')}
+                    className="mr-2"
+                  />
+                  <span>Test Specific</span>
+                </label>
+              </div>
+
+              {/* Test selector when test-specific is selected */}
+              {uploadScope === 'test' && (
+                <select
+                  value={selectedTestId}
+                  onChange={(e) => setSelectedTestId(e.target.value)}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-purple-500 text-sm"
+                  required
+                >
+                  <option value="">Select a test...</option>
+                  {availableOrderTests.map(test => (
+                    <option key={test.id} value={test.id}>
+                      {test.name}
+                    </option>
+                  ))}
+                </select>
+              )}
+              
+              {uploadScope === 'test' && !selectedTestId && (
+                <p className="text-xs text-amber-600 text-center">
+                  Please select a test to upload a test-specific attachment
+                </p>
+              )}
+            </div>
+            
             <div>
               <button
                 onClick={() => document.getElementById("file-upload")?.click()}
-                disabled={isUploading}
+                disabled={isUploading || (uploadScope === 'test' && !selectedTestId)}
                 className="flex items-center justify-center mx-auto px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:bg-purple-400 disabled:cursor-not-allowed transition-colors"
               >
                 {isUploading ? (
