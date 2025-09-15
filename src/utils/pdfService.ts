@@ -628,10 +628,11 @@ export const updateReportWithPDFInfo = async (orderId: string, pdfUrl: string, r
       .update({
         pdf_url: pdfUrl,
         pdf_generated_at: new Date().toISOString(),
-        status: 'completed'
+        status: 'completed',
+        report_type: reportType,  // Ensure report type is updated
+        report_status: 'completed'
       })
-      .eq('order_id', orderId)
-      .eq('report_type', reportType);
+      .eq('order_id', orderId);
 
     if (error) {
       console.error('Database update error:', error);
@@ -668,19 +669,19 @@ export async function generateAndSavePDFReportWithProgress(
   try {
     onProgress?.('Checking existing reports...', 10);
     
-    // First, check for existing report of the same type (draft vs final)
-    const reportType = isDraft ? 'draft' : 'final';
+    // Check for existing report (regardless of type since there's a unique constraint on order_id)
     let { data: existingReport } = await supabase
       .from('reports')
       .select('id, pdf_url, pdf_generated_at, status, report_type')
       .eq('order_id', orderId)
-      .eq('report_type', reportType)
       .maybeSingle(); // Use maybeSingle to avoid errors when no record exists
 
-    // If no report of this type exists, create one
+    const reportType = isDraft ? 'draft' : 'final';
+    
+    // If no report exists, create one; if exists, we'll update it later
     if (!existingReport) {
-      console.log(`No ${reportType} report record exists, creating one...`);
-      onProgress?.(`Creating ${reportType} report record...`, 15);
+      console.log(`No report record exists, creating one...`);
+      onProgress?.(`Creating report record...`, 15);
       
       // Get order details to populate report
       const { data: orderData, error: orderError } = await supabase
@@ -696,10 +697,10 @@ export async function generateAndSavePDFReportWithProgress(
         return null;
       }
       
-      // Create report record
-      const { data: newReport, error: insertError } = await supabase
+      // Create report record using UPSERT to handle race conditions
+      const { data: newReport, error: upsertError } = await supabase
         .from('reports')
-        .insert({
+        .upsert({
           order_id: orderId,
           patient_id: orderData.patient_id,
           doctor: orderData.doctor || 'Unknown',
@@ -707,33 +708,31 @@ export async function generateAndSavePDFReportWithProgress(
           generated_date: new Date().toISOString(),
           report_type: reportType,
           report_status: 'generating'
+        }, {
+          onConflict: 'order_id',
+          ignoreDuplicates: false
         })
         .select()
         .single();
 
-      if (insertError) {
-        console.error('Failed to create report record:', insertError);
-        if (insertError.code === '23505') {
-          const { data: retryReport } = await supabase
-            .from('reports')
-            .select('id, pdf_url, pdf_generated_at, status, report_type')
-            .eq('order_id', orderId)
-            .eq('report_type', reportType)
-            .single();
-          existingReport = retryReport;
-        } else {
-          onProgress?.('Failed to create report record', 0);
-          alert('Failed to create report record. Please try again.');
-          return null;
-        }
-      } else {
-        existingReport = newReport;
+      if (upsertError) {
+        console.error('Failed to create/update report record:', upsertError);
+        onProgress?.('Failed to create report record', 0);
+        alert('Failed to create report record. Please try again.');
+        return null;
       }
+      
+      existingReport = newReport;
     }
 
-    // Check if PDF already exists and is valid for this specific report type
-    if (existingReport?.pdf_url) {
-      console.log(`${reportType.toUpperCase()} PDF already exists:`, existingReport.pdf_url);
+    // Check if we need to regenerate based on report type change
+    const needsRegeneration = !existingReport ||
+                              existingReport.report_type !== reportType || 
+                              !existingReport.pdf_url ||
+                              existingReport.status !== 'completed';
+
+    if (!needsRegeneration && existingReport?.pdf_url) {
+      console.log(`${reportType.toUpperCase()} PDF already exists and is current:`, existingReport.pdf_url);
       onProgress?.(`Validating existing ${reportType} PDF...`, 20);
       
       try {
@@ -744,7 +743,7 @@ export async function generateAndSavePDFReportWithProgress(
           return existingReport.pdf_url;
         }
       } catch (error) {
-        console.warn(`Existing ${reportType} PDF URL is invalid, regenerating...`);
+        console.warn(`Existing PDF URL is invalid, regenerating...`);
       }
     }
 
