@@ -1,0 +1,542 @@
+# Enhanced Comprehensive Implementation Plan with Detailed To-Do List
+
+BEGIN;
+
+-- ============================================================
+-- STEP 1: Base master tables (doctors, locations)
+-- ============================================================
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- DOCTORS
+CREATE TABLE IF NOT EXISTS public.doctors (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  lab_id uuid NOT NULL REFERENCES public.labs(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  specialization text,
+  qualification text,
+  registration_number text,
+  phone text,
+  email text,
+  preferred_contact text NOT NULL
+    CHECK (preferred_contact IN ('email','sms','whatsapp','none')) DEFAULT 'email',
+  report_delivery_method text NOT NULL
+    CHECK (report_delivery_method IN ('email','whatsapp','both','none')) DEFAULT 'email',
+  default_discount_percent numeric(5,2)
+    CHECK (default_discount_percent BETWEEN 0 AND 100),
+  is_active boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (lab_id, registration_number)
+);
+
+-- LOCATIONS
+CREATE TABLE IF NOT EXISTS public.locations (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  lab_id uuid NOT NULL REFERENCES public.labs(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  type text NOT NULL
+    CHECK (type IN ('hospital','clinic','diagnostic_center','home_collection','walk_in')),
+  contact_person text,
+  phone text,
+  email text,
+  address text,
+  city text,
+  state text,
+  pincode text,
+  supports_cash_collection boolean NOT NULL DEFAULT false,
+  default_discount_percent numeric(5,2)
+    CHECK (default_discount_percent BETWEEN 0 AND 100),
+  credit_limit numeric(12,2) NOT NULL DEFAULT 0 CHECK (credit_limit >= 0),
+  payment_terms integer NOT NULL DEFAULT 0 CHECK (payment_terms >= 0), -- days
+  is_active boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (lab_id, name)
+);
+
+-- ============================================================
+-- STEP 2: Extend existing tables
+-- ============================================================
+
+-- Patients
+ALTER TABLE public.patients
+  ADD COLUMN IF NOT EXISTS default_doctor_id    uuid REFERENCES public.doctors(id)   ON DELETE SET NULL,
+  ADD COLUMN IF NOT EXISTS default_location_id  uuid REFERENCES public.locations(id) ON DELETE SET NULL,
+  ADD COLUMN IF NOT EXISTS default_payment_type text NOT NULL DEFAULT 'self'
+    CHECK (default_payment_type IN ('self','credit','insurance','corporate'));
+
+-- Orders
+ALTER TABLE public.orders
+  ADD COLUMN IF NOT EXISTS referring_doctor_id uuid REFERENCES public.doctors(id)   ON DELETE SET NULL,
+  ADD COLUMN IF NOT EXISTS location_id         uuid REFERENCES public.locations(id) ON DELETE SET NULL,
+  ADD COLUMN IF NOT EXISTS payment_type        text NOT NULL DEFAULT 'self'
+    CHECK (payment_type IN ('self','credit','insurance','corporate')),
+  ADD COLUMN IF NOT EXISTS is_billed           boolean NOT NULL DEFAULT false,
+  ADD COLUMN IF NOT EXISTS billing_status      text NOT NULL DEFAULT 'pending'
+    CHECK (billing_status IN ('pending','partial','billed'));
+
+-- Order tests billing tracking
+ALTER TABLE public.order_tests
+  ADD COLUMN IF NOT EXISTS invoice_id    uuid REFERENCES public.invoices(id) ON DELETE SET NULL,
+  ADD COLUMN IF NOT EXISTS is_billed     boolean NOT NULL DEFAULT false,
+  ADD COLUMN IF NOT EXISTS billed_at     timestamptz,
+  ADD COLUMN IF NOT EXISTS billed_amount numeric(12,2);
+
+-- Invoices
+ALTER TABLE public.invoices
+  ADD COLUMN IF NOT EXISTS total_before_discount numeric(12,2),
+  ADD COLUMN IF NOT EXISTS total_discount        numeric(12,2) NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS total_after_discount  numeric(12,2),
+  ADD COLUMN IF NOT EXISTS location_id           uuid REFERENCES public.locations(id) ON DELETE SET NULL,
+  ADD COLUMN IF NOT EXISTS referring_doctor_id   uuid REFERENCES public.doctors(id)   ON DELETE SET NULL,
+  ADD COLUMN IF NOT EXISTS payment_type          text NOT NULL DEFAULT 'self'
+    CHECK (payment_type IN ('self','credit','insurance','corporate')),
+  ADD COLUMN IF NOT EXISTS is_partial            boolean NOT NULL DEFAULT false,
+  ADD COLUMN IF NOT EXISTS parent_invoice_id     uuid REFERENCES public.invoices(id) ON DELETE SET NULL;
+
+-- Invoice items
+ALTER TABLE public.invoice_items
+  ADD COLUMN IF NOT EXISTS order_test_id   uuid REFERENCES public.order_tests(id) ON DELETE SET NULL,
+  ADD COLUMN IF NOT EXISTS discount_type   text CHECK (discount_type IN ('percent','flat')),
+  ADD COLUMN IF NOT EXISTS discount_value  numeric(12,2),
+  ADD COLUMN IF NOT EXISTS discount_amount numeric(12,2),
+  ADD COLUMN IF NOT EXISTS discount_reason text;
+
+-- ============================================================
+-- STEP 3: New tables for payments & cash
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS public.payments (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  lab_id uuid REFERENCES public.labs(id) ON DELETE CASCADE,
+  invoice_id uuid NOT NULL REFERENCES public.invoices(id) ON DELETE CASCADE,
+  amount numeric(12,2) NOT NULL CHECK (amount >= 0),
+  payment_method text CHECK (payment_method IN ('cash','card','upi','bank','credit_adjustment')),
+  payment_reference text,
+  payment_date date NOT NULL DEFAULT CURRENT_DATE,
+  location_id uuid REFERENCES public.locations(id) ON DELETE SET NULL,
+  collected_by uuid REFERENCES public.users(id)   ON DELETE SET NULL,
+  notes text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.cash_register (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  lab_id uuid REFERENCES public.labs(id) ON DELETE CASCADE,
+  register_date date NOT NULL,
+  location_id uuid REFERENCES public.locations(id) ON DELETE SET NULL,
+  shift text NOT NULL DEFAULT 'full_day'
+    CHECK (shift IN ('morning','afternoon','night','full_day')),
+  opening_balance numeric(12,2) NOT NULL DEFAULT 0,
+  system_amount   numeric(12,2) NOT NULL DEFAULT 0,
+  actual_amount   numeric(12,2),
+  closing_balance numeric(12,2),
+  variance numeric(12,2) GENERATED ALWAYS AS (COALESCE(actual_amount,0) - COALESCE(system_amount,0)) STORED,
+  notes text,
+  reconciled boolean NOT NULL DEFAULT false,
+  reconciled_by uuid REFERENCES public.users(id) ON DELETE SET NULL,
+  reconciled_at timestamptz,
+  created_by uuid REFERENCES public.users(id) ON DELETE SET NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (lab_id, location_id, register_date, shift)
+);
+
+CREATE TABLE IF NOT EXISTS public.credit_transactions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  lab_id uuid REFERENCES public.labs(id) ON DELETE CASCADE,
+  location_id uuid REFERENCES public.locations(id) ON DELETE SET NULL,
+  patient_id uuid REFERENCES public.patients(id) ON DELETE SET NULL,
+  invoice_id uuid REFERENCES public.invoices(id) ON DELETE SET NULL,
+  amount numeric(12,2) NOT NULL,
+  transaction_type text CHECK (transaction_type IN ('credit','payment','adjustment')),
+  payment_method text,
+  reference_number text,
+  notes text,
+  balance_after numeric(12,2),
+  created_by uuid REFERENCES public.users(id) ON DELETE SET NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+COMMIT;
+MMIT;
+
+
+## Phase 2: API Layer Updates (Week 1-2)
+
+### 2.1 Update supabase.ts
+```typescript
+// Add to database object
+doctors: {
+  getAll: async () => {
+    const labId = await database.getCurrentUserLabId();
+    return supabase
+      .from('doctors')
+      .select('*')
+      .eq('lab_id', labId)
+      .eq('is_active', true)
+      .order('name');
+  },
+  create: async (data: Omit<Doctor, 'id' | 'created_at' | 'updated_at'>) => {
+    const labId = await database.getCurrentUserLabId();
+    return supabase.from('doctors').insert({ ...data, lab_id: labId });
+  },
+  update: async (id: string, data: Partial<Doctor>) => {
+    return supabase.from('doctors').update(data).eq('id', id);
+  },
+  search: async (query: string) => {
+    const labId = await database.getCurrentUserLabId();
+    return supabase
+      .from('doctors')
+      .select('*')
+      .eq('lab_id', labId)
+      .eq('is_active', true)
+      .or(`name.ilike.%${query}%,registration_number.ilike.%${query}%`);
+  }
+},
+
+locations: {
+  getAll: async () => {
+    const labId = await database.getCurrentUserLabId();
+    return supabase
+      .from('locations')
+      .select('*')
+      .eq('lab_id', labId)
+      .eq('is_active', true)
+      .order('name');
+  },
+  create: async (data: Omit<Location, 'id' | 'created_at' | 'updated_at'>) => {
+    const labId = await database.getCurrentUserLabId();
+    return supabase.from('locations').insert({ ...data, lab_id: labId });
+  },
+  update: async (id: string, data: Partial<Location>) => {
+    return supabase.from('locations').update(data).eq('id', id);
+  },
+  getCreditBalance: async (locationId: string) => {
+    const { data } = await supabase
+      .from('credit_transactions')
+      .select('balance_after')
+      .eq('location_id', locationId)
+      .order('created_at', { ascending: false })
+      .limit(1);
+    return data?.[0]?.balance_after || 0;
+  }
+},
+
+payments: {
+  create: async (data: Omit<Payment, 'id' | 'created_at'>) => {
+    const labId = await database.getCurrentUserLabId();
+    const user = await database.getCurrentUser();
+    return supabase.from('payments').insert({ 
+      ...data, 
+      lab_id: labId,
+      collected_by: user.id 
+    });
+  },
+  getByInvoice: async (invoiceId: string) => {
+    return supabase
+      .from('payments')
+      .select('*')
+      .eq('invoice_id', invoiceId)
+      .order('payment_date', { ascending: false });
+  },
+  getByDateRange: async (startDate: string, endDate: string, locationId?: string) => {
+    let query = supabase
+      .from('payments')
+      .select('*, invoices(*), locations(*)')
+      .gte('payment_date', startDate)
+      .lte('payment_date', endDate);
+    
+    if (locationId) query = query.eq('location_id', locationId);
+    
+    return query.order('payment_date', { ascending: false });
+  }
+},
+
+cashRegister: {
+  getOrCreate: async (date: string, locationId: string, shift: string = 'full_day') => {
+    const labId = await database.getCurrentUserLabId();
+    
+    // Try to get existing
+    const { data: existing } = await supabase
+      .from('cash_register')
+      .select('*')
+      .eq('lab_id', labId)
+      .eq('location_id', locationId)
+      .eq('register_date', date)
+      .eq('shift', shift)
+      .single();
+    
+    if (existing) return { data: existing, error: null };
+    
+    // Create new
+    return supabase.from('cash_register').insert({
+      lab_id: labId,
+      location_id: locationId,
+      register_date: date,
+      shift,
+      opening_balance: 0,
+      system_amount: 0
+    }).select().single();
+  },
+  reconcile: async (id: string, actualAmount: number, notes?: string) => {
+    const user = await database.getCurrentUser();
+    return supabase
+      .from('cash_register')
+      .update({
+        actual_amount: actualAmount,
+        closing_balance: actualAmount,
+        notes,
+        reconciled: true,
+        reconciled_by: user.id,
+        reconciled_at: new Date().toISOString()
+      })
+      .eq('id', id);
+  }
+}
+```
+
+## Phase 3: Component Development (Week 2-3)
+
+### 3.1 Master Management Components
+
+**📁 src/components/Masters/DoctorMaster.tsx**
+```typescript
+// Full CRUD interface for doctors
+// - Add/Edit doctor with all fields
+// - Search and filter
+// - Active/Inactive toggle
+// - Commission and discount settings
+// - Report delivery preferences
+```
+
+**📁 src/components/Masters/LocationMaster.tsx**
+```typescript
+// Full CRUD interface for locations
+// - Add/Edit location with all fields
+// - Credit limit management
+// - Cash collection capability
+// - Default discount settings
+// - Contact information
+```
+
+### 3.2 Enhanced OrderForm
+
+**📁 OrderForm.tsx (UPDATE)**
+```typescript
+// Add to existing OrderForm:
+// 1. Doctor selection (searchable dropdown)
+// 2. Location selection (required for credit patients)
+// 3. Payment type selector
+// 4. Show credit limit/balance for credit patients
+// 5. Test request form upload
+// 6. Expandable patient registration (compact/full modes)
+```
+
+### 3.3 Billing Components
+
+**📁 src/components/Billing/CreateInvoiceModal.tsx**
+```typescript
+// New modal for creating invoices from orders
+// - Select unbilled tests from order
+// - Apply discounts (auto + manual)
+// - Show discount breakdown
+// - Preview before creation
+```
+
+**📁 src/components/Billing/PaymentCapture.tsx**
+```typescript
+// Payment recording interface
+// - Multiple payment methods
+// - Partial payments
+// - Location-based cash collection
+// - Payment history
+```
+
+**📁 src/components/Billing/CashReconciliation.tsx**
+```typescript
+// Daily cash reconciliation
+// - Filter by date and location
+// - Show system vs actual
+// - Enter counted cash
+// - Save reconciliation notes
+// - Variance reports
+```
+
+### 3.4 Update Existing Components
+
+**📁 Dashboard.tsx (UPDATE)**
+```typescript
+// 1. Fix OrderForm handler - use proper handleAddOrder
+// 2. Add "Create Invoice" button to order cards
+// 3. Add "Add Tests" functionality
+// 4. Show billing status indicators
+// 5. Add quick "Register Patient" action
+```
+
+**📁 Patients.tsx (UPDATE)**
+```typescript
+// 1. Add default doctor/location fields
+// 2. Show in patient details
+// 3. Allow editing defaults
+// 4. Pass defaults to order creation
+```
+
+**📁 OrderDetailsModal.tsx (UPDATE)**
+```typescript
+// 1. Show referring doctor and location
+// 2. Add "Create Invoice" if unbilled tests exist
+// 3. Show billing history
+// 4. Add test request form viewer
+```
+
+## Phase 4: UI/UX Enhancements (Week 3)
+
+### 4.1 Visual Indicators
+```typescript
+// Order cards/rows should show:
+// 💰 Fully billed (green badge)
+// 💸 Partially billed (yellow badge)  
+// 📋 Not billed (gray badge)
+// 💳 Credit patient (red border)
+// 🏥 Location referral (location icon)
+// 👨‍⚕️ Doctor referral (doctor icon)
+```
+
+### 4.2 Quick Actions
+```typescript
+// Dashboard quick actions:
+// - Register New Patient
+// - Create Order (with patient search)
+// - Today's Collections
+// - Pending Bills
+
+// Order card actions:
+// - View Details
+// - Create Invoice (if unbilled)
+// - Add Tests (if not completed)
+// - Print/Email Invoice
+```
+
+### 4.3 Navigation Updates
+```typescript
+// Add to main navigation:
+// - Masters > Doctors
+// - Masters > Locations  
+// - Billing > Invoices
+// - Billing > Payments
+// - Billing > Cash Reconciliation
+// - Reports > Financial Reports
+```
+
+## Phase 5: Workflow Integration (Week 3-4)
+
+### 5.1 Order Creation Flow
+```
+Patient Selection → Doctor/Location → Tests → Payment Type → Create Order
+                 ↓                           ↓
+          (Auto-fill defaults)        (Check credit limit)
+```
+
+### 5.2 Billing Flow
+```
+Order View → Select Unbilled Tests → Apply Discounts → Generate Invoice
+           ↓                       ↓                 ↓
+    (Group by panel)      (Auto + Manual)      (Update order_tests)
+```
+
+### 5.3 Payment Flow
+```
+Invoice → Record Payment → Update Status → Cash Register (if cash)
+        ↓               ↓               ↓
+  (Partial allowed)  (Paid/Pending)  (Location-based)
+```
+
+### 5.4 Reconciliation Flow
+```
+Select Date/Location → System Collections → Enter Actual → Save Variance
+                    ↓                    ↓              ↓
+              (Auto-calculate)      (Manual count)  (Notes + Reconcile)
+```
+
+## Phase 6: Reporting (Week 4)
+
+### 6.1 Financial Reports
+```typescript
+// New report components:
+// - DoctorWiseReport: Referrals, revenue, commissions
+// - LocationWiseReport: Collections, credits, outstanding
+// - DiscountAnalytics: By source, amount, percentage
+// - AgingReport: Outstanding by age buckets
+// - DailyCollection: Cash + other methods by location
+```
+
+### 6.2 Operational Reports
+```typescript
+// Enhanced reports:
+// - Order status by doctor/location
+// - Test volume by referral source
+// - Payment method analysis
+// - Credit utilization report
+```
+
+## Detailed To-Do List for Implementation
+
+### Week 1: Database & API
+- [ ] Create migration file with all Phase 1 SQL
+- [ ] Run migrations on development database
+- [ ] Update TypeScript interfaces in types
+- [ ] Add doctor API methods to `supabase.ts`
+- [ ] Add location API methods to `supabase.ts`
+- [ ] Add payment API methods to `supabase.ts`
+- [ ] Add cash register API methods to `supabase.ts`
+- [ ] Test all new API methods
+
+### Week 2: Core Components
+- [ ] Create DoctorMaster component with CRUD
+- [ ] Create LocationMaster component with CRUD
+- [ ] Update PatientForm with defaults
+- [ ] Update OrderForm with doctor/location/payment
+- [ ] Create CreateInvoiceModal component
+- [ ] Create PaymentCapture component
+- [ ] Fix Dashboard OrderForm handler
+- [ ] Add billing actions to Dashboard
+
+### Week 3: Integration & Polish
+- [ ] Create CashReconciliation component
+- [ ] Update OrderDetailsModal with billing
+- [ ] Add visual indicators to order cards
+- [ ] Implement discount calculation logic
+- [ ] Test credit patient workflows
+- [ ] Add navigation menu items
+- [ ] Create financial report components
+- [ ] Test end-to-end workflows
+
+### Week 4: Testing & Deployment
+- [ ] User acceptance testing
+- [ ] Fix bugs and edge cases
+- [ ] Create user documentation
+- [ ] Deploy to production
+- [ ] Monitor for issues
+- [ ] Gather feedback
+
+## Key Implementation Notes
+
+1. **Multi-lab Support**: All new tables include `lab_id` and queries filter by current user's lab
+2. **Backward Compatibility**: All changes are additive - no breaking changes
+3. **Audit Trail**: Payment and cash register tables track who did what when
+4. **Flexibility**: Supports multiple payment types and partial payments
+5. **Security**: RLS policies needed for new tables
+6. **Performance**: Indexes needed on foreign keys and frequently queried columns
+
+## Success Criteria
+
+1. Orders can be created with doctor/location/payment type
+2. Invoices can be generated from orders with proper discounts
+3. Payments can be recorded against invoices
+4. Cash can be reconciled daily by location
+5. Credit patients are tracked with limits
+6. All actions are auditable
+7. Reports show financial health by various dimensions
+
+This comprehensive plan provides a clear roadmap for implementing the enhanced billing, master data management, and cash reconciliation features while maintaining the existing system's integrity.

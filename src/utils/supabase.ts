@@ -105,12 +105,46 @@ export const database = {
       return null;
     }
     
-    // Check if lab_id is in user metadata
+    // Primary: Check users table for lab_id (most reliable)
+    try {
+      const { data: userData, error: userDataError } = await supabase
+        .from('users')
+        .select('lab_id')
+        .eq('email', user.email) // Match by email since auth.users.id might be different from public.users.id
+        .eq('status', 'Active')
+        .single();
+      
+      if (!userDataError && userData?.lab_id) {
+        return userData.lab_id;
+      }
+    } catch (err) {
+      console.warn('Could not fetch lab_id from users table:', err);
+    }
+    
+    // Secondary: Check if lab_id is in user metadata (fallback)
     if (user?.user_metadata?.lab_id) {
+      console.warn('Using lab_id from user metadata (consider updating users table):', user.user_metadata.lab_id);
       return user.user_metadata.lab_id;
     }
     
-    // For development/demo purposes, try to get a default lab
+    // Tertiary: Check user_labs table for user-lab assignment (if exists)
+    try {
+      const { data: userLab, error: userLabError } = await supabase
+        .from('user_labs')
+        .select('lab_id')
+        .eq('user_id', user.id)
+        .eq('is_active', true)
+        .single();
+      
+      if (!userLabError && userLab?.lab_id) {
+        console.warn('Using lab_id from user_labs table (consider updating users table):', userLab.lab_id);
+        return userLab.lab_id;
+      }
+    } catch (err) {
+      // user_labs table might not exist, which is fine
+    }
+    
+    // Final fallback: For development/demo purposes, get first available lab
     try {
       const { data: labs, error: labError } = await supabase
         .from('labs')
@@ -119,30 +153,41 @@ export const database = {
         .limit(1);
       
       if (!labError && labs && labs.length > 0) {
-        console.warn('Lab ID not found in user metadata. Using first available lab for demo:', labs[0].id);
+        console.warn('Lab ID not found for user. Using first available lab for demo:', labs[0].id);
+        console.warn('Please update the users table with proper lab_id for user:', user.email);
         return labs[0].id;
       }
     } catch (err) {
       console.warn('Could not fetch default lab:', err);
     }
     
-    // In production, this should fetch from a profiles table or use RLS
-    console.warn('Lab ID not found in user metadata. Using default lab.');
-    return null; // Return null to handle gracefully in calling code
+    console.error('No lab_id found for user and no default lab available');
+    return null;
   },
 
 
   patients: {
     getAll: async () => {
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+      
       const { data, error } = await supabase
         .from('patients')
         .select('*')
         .eq('is_active', true)
+        .eq('lab_id', lab_id)
         .order('created_at', { ascending: false });
       return { data, error };
     },
 
     getAllWithTestCounts: async () => {
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+      
       const { data, error } = await supabase
         .from('patients')
         .select(`
@@ -150,6 +195,7 @@ export const database = {
           orders!inner(count)
         `)
         .eq('is_active', true)
+        .eq('lab_id', lab_id)
         .order('created_at', { ascending: false });
       // Optionally, transform data here if needed
       return { data, error };
@@ -167,6 +213,12 @@ export const database = {
     create: async (patientData: any) => {
       const { requestedTests, referring_doctor, ...patientDetails } = patientData;
       
+      // Get current user's lab_id
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+      
       // Get today's date in DD-Mon-YYYY format
       const today = new Date();
       const day = today.getDate().toString().padStart(2, '0');
@@ -178,6 +230,7 @@ export const database = {
       const { count: todayCount, error: countError } = await supabase
         .from('patients')
         .select('id', { count: 'exact', head: true })
+        .eq('lab_id', lab_id)
         .gte('created_at', today.toISOString().split('T')[0]);
       
       if (countError) {
@@ -191,13 +244,14 @@ export const database = {
       // Generate display_id in format DD-Mon-YYYY-SeqNum
       const display_id = `${dateFormatted}-${sequentialNumber}`;
       
-      // Create patient with display_id (color assignment happens at order level)
+      // Create patient with display_id and lab_id
       const { data, error } = await supabase
         .from('patients')
         .insert([{
           ...patientDetails,
           referring_doctor,
-          display_id
+          display_id,
+          lab_id
         }])
         .select()
         .single();
@@ -361,6 +415,11 @@ export const database = {
   
   orders: {
     getAll: async () => {
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+      
       const { data, error } = await supabase
         .from('orders')
         .select(`
@@ -369,6 +428,7 @@ export const database = {
           order_tests(test_name, created_at),
           results(id, status, result_values(parameter, value, unit, reference_range, flag))
         `)
+        .eq('lab_id', lab_id)
         .order('order_date', { ascending: false });
       
       if (error || !data) return { data, error };
@@ -426,13 +486,20 @@ export const database = {
     },
 
     create: async (orderData: any) => {
+      // Get current user's lab_id
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+      
       // First get the daily sequence for sample ID generation
       const orderDate = orderData.order_date || new Date().toISOString().split('T')[0];
       
-      // Count existing orders for this date to get sequence number
+      // Count existing orders for this date to get sequence number (filtered by lab_id)
       const { count: dailyOrderCount, error: countError } = await supabase
         .from('orders')
         .select('id', { count: 'exact', head: true })
+        .eq('lab_id', lab_id)
         .gte('order_date', orderDate)
         .lt('order_date', new Date(new Date(orderDate).getTime() + 24 * 60 * 60 * 1000).toISOString().split('T')[0]);
       
@@ -447,13 +514,14 @@ export const database = {
       const sampleId = generateOrderSampleId(new Date(orderDate), dailySequence);
       const { color_code, color_name } = getOrderAssignedColor(dailySequence);
       
-      // Create the order with sample tracking data
+      // Create the order with sample tracking data and lab_id
       const { tests, ...orderDetails } = orderData;
       const orderWithSample = {
         ...orderDetails,
         sample_id: sampleId,
         color_code,
         color_name,
+        lab_id,
         status: orderData.status || 'Order Created' // Default status
       };
       
@@ -520,7 +588,8 @@ export const database = {
               order_id: updatedOrder.id,
               test_name: testName,
               test_group_id: testGroupMap.get(testName) || null,
-              sample_id: updatedOrder.sample_id
+              sample_id: updatedOrder.sample_id,
+              lab_id
             }));
           }
         } else {
@@ -536,7 +605,8 @@ export const database = {
             order_id: updatedOrder.id,
             test_name: test.name,
             test_group_id: test.type === 'test' ? test.id : null, // Only include test_group_id for individual tests, not packages
-            sample_id: updatedOrder.sample_id
+            sample_id: updatedOrder.sample_id,
+            lab_id
           }));
         }
         
@@ -992,6 +1062,11 @@ export const database = {
 
   invoices: {
     getAll: async () => {
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+      
       // Query invoices with basic data
       const { data, error } = await supabase
         .from('invoices')
@@ -999,6 +1074,7 @@ export const database = {
           *,
           invoice_items(*)
         `)
+        .eq('lab_id', lab_id)
         .order('invoice_date', { ascending: false });
       
       if (error) {
@@ -1030,10 +1106,16 @@ export const database = {
     create: async (invoiceData: any) => {
       const { invoice_items, ...invoiceDetails } = invoiceData;
       
-      // First create the invoice
+      // Get current user's lab_id
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+      
+      // First create the invoice with lab_id
       const { data: invoice, error } = await supabase
         .from('invoices')
-        .insert([invoiceDetails])
+        .insert([{ ...invoiceDetails, lab_id }])
         .select()
         .single();
 
@@ -1045,7 +1127,8 @@ export const database = {
       if (invoice && invoice_items && invoice_items.length > 0) {
         const invoiceItemsToInsert = invoice_items.map((item: any) => ({
           ...item,
-          invoice_id: invoice.id
+          invoice_id: invoice.id,
+          lab_id
         }));
 
         const { error: itemsError } = await supabase
@@ -1119,6 +1202,15 @@ export const database = {
     },
     
     create: async (paymentData: any) => {
+      // Get current user's lab_id if not already provided
+      if (!paymentData.lab_id) {
+        const lab_id = await database.getCurrentUserLabId();
+        if (!lab_id) {
+          return { data: null, error: new Error('No lab_id found for current user') };
+        }
+        paymentData.lab_id = lab_id;
+      }
+      
       const { data, error } = await supabase
         .from('payments')
         .insert([paymentData])
@@ -2013,5 +2105,68 @@ export const ocrResults = {
       .select()
       .single();
     return { data, error };
+  }
+};
+
+// User management helper functions
+export const userManagement = {
+  // Get current user's profile from public.users
+  getCurrentUserProfile: async () => {
+    const { data: { user }, error: authError } = await supabase.auth.getUser();
+    if (authError || !user) {
+      return { data: null, error: authError };
+    }
+
+    const { data, error } = await supabase
+      .from('users')
+      .select(`
+        *,
+        labs(id, name, code)
+      `)
+      .eq('email', user.email)
+      .single();
+    
+    return { data, error };
+  },
+
+  // Update user's lab assignment
+  updateUserLab: async (userId: string, labId: string) => {
+    const { data, error } = await supabase
+      .from('users')
+      .update({ 
+        lab_id: labId,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', userId)
+      .select()
+      .single();
+    
+    return { data, error };
+  },
+
+  // Get all users for a specific lab
+  getUsersByLab: async (labId: string) => {
+    const { data, error } = await supabase
+      .from('users')
+      .select(`
+        id,
+        name,
+        email,
+        role,
+        status,
+        join_date,
+        last_login
+      `)
+      .eq('lab_id', labId)
+      .eq('status', 'Active')
+      .order('name');
+    
+    return { data, error };
+  },
+
+  // Check if current user has admin access
+  isCurrentUserAdmin: async () => {
+    const { data: profile } = await userManagement.getCurrentUserProfile();
+    return profile && ['Admin', 'Manager'].includes(profile.role);
   }
 };

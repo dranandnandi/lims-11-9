@@ -5,7 +5,7 @@ import {
   Eye, User, Calendar, TestTube, ChevronDown, ChevronUp, TrendingUp
 } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
-import { supabase } from "../utils/supabase";
+import { supabase, database } from "../utils/supabase";
 import OrderForm from "../components/Orders/OrderForm";
 import OrderDetailsModal from "../components/Orders/OrderDetailsModal";
 
@@ -143,6 +143,13 @@ const Dashboard: React.FC = () => {
   };
 
   const fetchOrders = async () => {
+    // Get current user's lab_id
+    const lab_id = await database.getCurrentUserLabId();
+    if (!lab_id) {
+      console.error('No lab_id found for current user');
+      return;
+    }
+    
     // 1) base orders with date range filter
     const { data: rows, error } = await supabase
       .from("orders")
@@ -152,6 +159,7 @@ const Dashboard: React.FC = () => {
         patients(name, age, gender),
         order_tests(id, test_group_id, test_name)
       `)
+      .eq('lab_id', lab_id)
       .gte("order_date", dateFrom)
       .lte("order_date", dateTo + "T23:59:59.999Z")
       .order("order_date", { ascending: false });

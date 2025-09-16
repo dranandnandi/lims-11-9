@@ -299,6 +299,13 @@ const Orders: React.FC = () => {
   };
 
   const fetchOrders = async () => {
+    // Get current user's lab_id
+    const lab_id = await database.getCurrentUserLabId();
+    if (!lab_id) {
+      console.error('No lab_id found for current user');
+      return;
+    }
+    
     // 1) base orders
     const { data: rows, error } = await supabase
       .from("orders")
@@ -308,6 +315,7 @@ const Orders: React.FC = () => {
         patients(name, age, gender),
         order_tests(id, test_group_id, test_name)
       `)
+      .eq('lab_id', lab_id)
       .order("order_date", { ascending: false });
 
     if (error) {
