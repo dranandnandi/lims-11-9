@@ -211,7 +211,7 @@ export const database = {
     },
 
     create: async (patientData: any) => {
-      const { requestedTests, referring_doctor, ...patientDetails } = patientData;
+      const { requestedTests, referring_doctor, referring_doctor_id, ...patientDetails } = patientData;
       
       // Get current user's lab_id
       const lab_id = await database.getCurrentUserLabId();
@@ -304,6 +304,7 @@ export const database = {
                 expected_date: new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString().split('T')[0], // 2 days from now
                 total_amount: totalAmount,
                 doctor: referring_doctor || 'Self',
+                referring_doctor_id: referring_doctor_id || null,
               };
               
               const { data: orderResult, error: orderError } = await database.orders.create(orderData);
@@ -1160,6 +1161,139 @@ export const database = {
         .delete()
         .eq('id', id);
       return { error };
+    },
+
+    // NEW: Dual invoice system methods
+    getUnbilledByAccount: async (accountId: string, billingPeriod?: string) => {
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+
+      let query = supabase
+        .from('invoices')
+        .select(`
+          *,
+          invoice_items(*)
+        `)
+        .eq('lab_id', lab_id)
+        .eq('account_id', accountId)
+        .eq('invoice_type', 'account')
+        .is('consolidated_invoice_id', null); // Not yet consolidated
+
+      if (billingPeriod) {
+        query = query.eq('billing_period', billingPeriod);
+      }
+
+      const { data, error } = await query.order('invoice_date', { ascending: false });
+      return { data, error };
+    },
+
+    getByBillingPeriod: async (billingPeriod: string) => {
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+
+      const { data, error } = await supabase
+        .from('invoices')
+        .select(`
+          *,
+          invoice_items(*),
+          accounts(name)
+        `)
+        .eq('lab_id', lab_id)
+        .eq('billing_period', billingPeriod)
+        .order('account_id')
+        .order('invoice_date', { ascending: false });
+      
+      return { data, error };
+    },
+
+    markAsConsolidated: async (invoiceIds: string[], consolidatedInvoiceId: string) => {
+      const { data, error } = await supabase
+        .from('invoices')
+        .update({ consolidated_invoice_id: consolidatedInvoiceId })
+        .in('id', invoiceIds)
+        .select();
+      
+      return { data, error };
+    }
+  },
+
+  // NEW: Consolidated invoices methods
+  consolidatedInvoices: {
+    getAll: async () => {
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+
+      const { data, error } = await supabase
+        .from('consolidated_invoices')
+        .select(`
+          *,
+          accounts(name)
+        `)
+        .eq('lab_id', lab_id)
+        .order('invoice_date', { ascending: false });
+      
+      return { data, error };
+    },
+
+    getById: async (id: string) => {
+      const { data, error } = await supabase
+        .from('consolidated_invoices')
+        .select(`
+          *,
+          accounts(name)
+        `)
+        .eq('id', id)
+        .single();
+      
+      return { data, error };
+    },
+
+    create: async (consolidatedData: any) => {
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+
+      const { data, error } = await supabase
+        .from('consolidated_invoices')
+        .insert([{ ...consolidatedData, lab_id }])
+        .select()
+        .single();
+      
+      return { data, error };
+    },
+
+    update: async (id: string, updates: any) => {
+      const { data, error } = await supabase
+        .from('consolidated_invoices')
+        .update(updates)
+        .eq('id', id)
+        .select()
+        .single();
+      
+      return { data, error };
+    },
+
+    getByAccount: async (accountId: string) => {
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+
+      const { data, error } = await supabase
+        .from('consolidated_invoices')
+        .select('*')
+        .eq('lab_id', lab_id)
+        .eq('account_id', accountId)
+        .order('billing_period', { ascending: false });
+      
+      return { data, error };
     }
   },
   
@@ -2162,11 +2296,1031 @@ export const userManagement = {
       .order('name');
     
     return { data, error };
-  },
-
-  // Check if current user has admin access
-  isCurrentUserAdmin: async () => {
-    const { data: profile } = await userManagement.getCurrentUserProfile();
-    return profile && ['Admin', 'Manager'].includes(profile.role);
   }
 };
+
+// Phase 2 API Methods - Master Data Management
+const masterDataAPI = {
+  // Doctors API
+  doctors: {
+    getAll: async () => {
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+      
+      const { data, error } = await supabase
+        .from('doctors')
+        .select('*')
+        .eq('lab_id', lab_id)
+        .eq('is_active', true)
+        .order('name');
+      return { data, error };
+    },
+
+    getById: async (id: string) => {
+      const { data, error } = await supabase
+        .from('doctors')
+        .select('*')
+        .eq('id', id)
+        .single();
+      return { data, error };
+    },
+
+    search: async (searchTerm: string) => {
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+      
+      const { data, error } = await supabase
+        .from('doctors')
+        .select('*')
+        .eq('lab_id', lab_id)
+        .eq('is_active', true)
+        .or(`name.ilike.%${searchTerm}%,license_number.ilike.%${searchTerm}%,specialization.ilike.%${searchTerm}%,hospital.ilike.%${searchTerm}%`)
+        .order('name')
+        .limit(20);
+      return { data, error };
+    },
+
+    create: async (doctorData: {
+      name: string;
+      license_number?: string;
+      specialization?: string;
+      phone?: string;
+      email?: string;
+      hospital?: string;
+      address?: string;
+      is_referring_doctor?: boolean;
+      notes?: string;
+    }) => {
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+
+      const { data, error } = await supabase
+        .from('doctors')
+        .insert([{
+          ...doctorData,
+          lab_id,
+          is_active: true,
+          created_at: new Date().toISOString()
+        }])
+        .select()
+        .single();
+      return { data, error };
+    },
+
+    update: async (id: string, updates: {
+      name?: string;
+      license_number?: string;
+      specialization?: string;
+      phone?: string;
+      email?: string;
+      hospital?: string;
+      address?: string;
+      is_referring_doctor?: boolean;
+      notes?: string;
+      is_active?: boolean;
+    }) => {
+      const { data, error } = await supabase
+        .from('doctors')
+        .update({
+          ...updates,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', id)
+        .select()
+        .single();
+      return { data, error };
+    },
+
+    delete: async (id: string) => {
+      const { data, error } = await supabase
+        .from('doctors')
+        .update({ 
+          is_active: false,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', id)
+        .select()
+        .single();
+      return { data, error };
+    }
+  },
+
+  // Locations API  
+  locations: {
+    getAll: async () => {
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+      
+      const { data, error } = await supabase
+        .from('locations')
+        .select('*')
+        .eq('lab_id', lab_id)
+        .eq('is_active', true)
+        .order('name');
+      return { data, error };
+    },
+
+    getById: async (id: string) => {
+      const { data, error } = await supabase
+        .from('locations')
+        .select('*')
+        .eq('id', id)
+        .single();
+      return { data, error };
+    },
+
+    getWithCreditBalance: async (id: string) => {
+      const { data, error } = await supabase
+        .from('locations')
+        .select(`
+          *,
+          credit_transactions!location_id(
+            amount,
+            type,
+            created_at
+          )
+        `)
+        .eq('id', id)
+        .single();
+
+      if (error || !data) {
+        return { data, error };
+      }
+
+      // Calculate current credit balance
+      const creditTransactions = data.credit_transactions || [];
+      const totalCredits = creditTransactions
+        .filter((t: any) => t.type === 'credit')
+        .reduce((sum: number, t: any) => sum + parseFloat(t.amount), 0);
+      const totalDebits = creditTransactions
+        .filter((t: any) => t.type === 'debit')
+        .reduce((sum: number, t: any) => sum + parseFloat(t.amount), 0);
+      
+      const currentBalance = totalCredits - totalDebits;
+
+      return {
+        data: {
+          ...data,
+          current_credit_balance: currentBalance
+        },
+        error: null
+      };
+    },
+
+    create: async (locationData: {
+      name: string;
+      code?: string;
+      address?: string;
+      phone?: string;
+      email?: string;
+      contact_person?: string;
+      credit_limit?: number;
+      collection_percentage?: number;
+      is_cash_collection_center?: boolean;
+      notes?: string;
+    }) => {
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+
+      const { data, error } = await supabase
+        .from('locations')
+        .insert([{
+          ...locationData,
+          lab_id,
+          is_active: true,
+          created_at: new Date().toISOString()
+        }])
+        .select()
+        .single();
+      return { data, error };
+    },
+
+    update: async (id: string, updates: {
+      name?: string;
+      code?: string;
+      address?: string;
+      phone?: string;
+      email?: string;
+      contact_person?: string;
+      credit_limit?: number;
+      collection_percentage?: number;
+      is_cash_collection_center?: boolean;
+      notes?: string;
+      is_active?: boolean;
+    }) => {
+      const { data, error } = await supabase
+        .from('locations')
+        .update({
+          ...updates,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', id)
+        .select()
+        .single();
+      return { data, error };
+    },
+
+    delete: async (id: string) => {
+      const { data, error } = await supabase
+        .from('locations')
+        .update({ 
+          is_active: false,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', id)
+        .select()
+        .single();
+      return { data, error };
+    },
+
+    checkCreditLimit: async (id: string, orderAmount: number) => {
+      const { data: location, error } = await supabase
+        .from('locations')
+        .select(`
+          *,
+          credit_transactions!location_id(
+            amount,
+            transaction_type,
+            created_at
+          )
+        `)
+        .eq('id', id)
+        .single();
+
+      if (error || !location) {
+        return { 
+          allowed: false, 
+          currentBalance: 0, 
+          creditLimit: 0, 
+          availableCredit: 0,
+          name: '',
+          error 
+        };
+      }
+
+      // Calculate current credit balance
+      const creditTransactions = location.credit_transactions || [];
+      const totalCredits = creditTransactions
+        .filter((t: any) => t.transaction_type === 'credit')
+        .reduce((sum: number, t: any) => sum + parseFloat(t.amount), 0);
+      const totalDebits = creditTransactions
+        .filter((t: any) => t.transaction_type === 'debit')
+        .reduce((sum: number, t: any) => sum + parseFloat(t.amount), 0);
+      
+      const currentBalance = totalCredits - totalDebits;
+      const creditLimit = location.credit_limit || 0;
+      const availableCredit = creditLimit - currentBalance;
+      const allowed = orderAmount <= availableCredit;
+
+      return {
+        allowed,
+        currentBalance,
+        creditLimit,
+        availableCredit,
+        name: location.name,
+        error: null
+      };
+    }
+  },
+
+  // Accounts API
+  accounts: {
+    getAll: async () => {
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+      
+      const { data, error } = await supabase
+        .from('accounts')
+        .select('*')
+        .eq('lab_id', lab_id)
+        .eq('is_active', true)
+        .order('name');
+      return { data, error };
+    },
+
+    getById: async (id: string) => {
+      const { data, error } = await supabase
+        .from('accounts')
+        .select('*')
+        .eq('id', id)
+        .single();
+      return { data, error };
+    },
+
+    search: async (searchTerm: string) => {
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+      
+      const { data, error } = await supabase
+        .from('accounts')
+        .select('*')
+        .eq('lab_id', lab_id)
+        .eq('is_active', true)
+        .or(`name.ilike.%${searchTerm}%,type.ilike.%${searchTerm}%,contact_person.ilike.%${searchTerm}%`)
+        .order('name')
+        .limit(20);
+      return { data, error };
+    },
+
+    create: async (accountData: {
+      name: string;
+      type: 'hospital' | 'corporate' | 'insurer' | 'clinic' | 'doctor' | 'other';
+      contact_person?: string;
+      phone?: string;
+      email?: string;
+      address?: string;
+      credit_limit?: number;
+      default_discount_percent?: number;
+      payment_terms?: number;
+      notes?: string;
+    }) => {
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+
+      const { data, error } = await supabase
+        .from('accounts')
+        .insert([{
+          ...accountData,
+          lab_id,
+          is_active: true,
+          created_at: new Date().toISOString()
+        }])
+        .select()
+        .single();
+      return { data, error };
+    },
+
+    update: async (id: string, updates: {
+      name?: string;
+      type?: 'hospital' | 'corporate' | 'insurer' | 'clinic' | 'doctor' | 'other';
+      contact_person?: string;
+      phone?: string;
+      email?: string;
+      address?: string;
+      credit_limit?: number;
+      default_discount_percent?: number;
+      payment_terms?: number;
+      notes?: string;
+      is_active?: boolean;
+    }) => {
+      const { data, error } = await supabase
+        .from('accounts')
+        .update({
+          ...updates,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', id)
+        .select()
+        .single();
+      return { data, error };
+    },
+
+    delete: async (id: string) => {
+      const { data, error } = await supabase
+        .from('accounts')
+        .update({ 
+          is_active: false,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', id)
+        .select()
+        .single();
+      return { data, error };
+    },
+
+    checkCreditLimit: async (id: string, orderAmount: number) => {
+      const { data: account, error } = await supabase
+        .from('accounts')
+        .select(`
+          *,
+          credit_transactions!account_id(
+            amount,
+            transaction_type,
+            created_at
+          )
+        `)
+        .eq('id', id)
+        .single();
+
+      if (error || !account) {
+        return { 
+          allowed: false, 
+          currentBalance: 0, 
+          creditLimit: 0, 
+          availableCredit: 0,
+          name: '',
+          error 
+        };
+      }
+
+      // Calculate current credit balance
+      const creditTransactions = account.credit_transactions || [];
+      const totalCredits = creditTransactions
+        .filter((t: any) => t.transaction_type === 'credit')
+        .reduce((sum: number, t: any) => sum + parseFloat(t.amount), 0);
+      const totalDebits = creditTransactions
+        .filter((t: any) => t.transaction_type === 'debit')
+        .reduce((sum: number, t: any) => sum + parseFloat(t.amount), 0);
+      
+      const currentBalance = totalCredits - totalDebits;
+      const creditLimit = account.credit_limit || 0;
+      const availableCredit = creditLimit - currentBalance;
+      const allowed = orderAmount <= availableCredit;
+
+      return {
+        allowed,
+        currentBalance,
+        creditLimit,
+        availableCredit,
+        name: account.name,
+        error: null
+      };
+    }
+  },
+
+  // Order Tests API
+  orderTests: {
+    getUnbilledByOrder: async (orderId: string) => {
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+
+      const { data, error } = await supabase
+        .from('order_tests')
+        .select('id, test_group_id, test_name, price, is_billed, invoice_id')
+        .eq('order_id', orderId)
+        .eq('is_billed', false)
+        .order('test_name');
+      
+      return { data, error };
+    },
+
+    getAll: async (orderId: string) => {
+      const { data, error } = await supabase
+        .from('order_tests')
+        .select('*')
+        .eq('order_id', orderId)
+        .order('test_name');
+      
+      return { data, error };
+    },
+
+    updateBillingStatus: async (testId: string, billingData: {
+      is_billed: boolean;
+      invoice_id?: string;
+      billed_at?: string;
+      billed_amount?: number;
+    }) => {
+      const { data, error } = await supabase
+        .from('order_tests')
+        .update(billingData)
+        .eq('id', testId)
+        .select()
+        .single();
+      
+      return { data, error };
+    }
+  },
+
+  // Enhanced Payments API
+  enhancedPayments: {
+    getAllPayments: async (filters?: {
+      startDate?: string;
+      endDate?: string;
+      paymentMethod?: string;
+      locationId?: string;
+    }) => {
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+
+      let query = supabase
+        .from('payments')
+        .select(`
+          *,
+          invoices(
+            id,
+            invoice_number,
+            total_amount,
+            status
+          ),
+          locations(
+            id,
+            name
+          ),
+          cash_registers(
+            id,
+            register_name
+          )
+        `)
+        .eq('lab_id', lab_id);
+
+      if (filters?.startDate) {
+        query = query.gte('payment_date', filters.startDate);
+      }
+      if (filters?.endDate) {
+        query = query.lte('payment_date', filters.endDate);
+      }
+      if (filters?.paymentMethod) {
+        query = query.eq('payment_method', filters.paymentMethod);
+      }
+      if (filters?.locationId) {
+        query = query.eq('location_id', filters.locationId);
+      }
+
+      const { data, error } = await query.order('payment_date', { ascending: false });
+      return { data, error };
+    },
+
+    createPayment: async (paymentData: {
+      invoice_id: string;
+      amount: number;
+      payment_method: 'cash' | 'card' | 'upi' | 'cheque' | 'bank_transfer' | 'credit';
+      reference_number?: string;
+      location_id?: string;
+      cash_register_id?: string;
+      cheque_number?: string;
+      cheque_date?: string;
+      bank_name?: string;
+      notes?: string;
+    }) => {
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+
+      // Start transaction
+      const { data: payment, error: paymentError } = await supabase
+        .from('payments')
+        .insert([{
+          ...paymentData,
+          lab_id,
+          payment_date: new Date().toISOString().split('T')[0],
+          created_at: new Date().toISOString()
+        }])
+        .select()
+        .single();
+
+      if (paymentError) {
+        return { data: null, error: paymentError };
+      }
+
+      // Update invoice status based on payment
+      if (payment) {
+        await masterDataAPI.enhancedPayments.updateInvoiceStatus(paymentData.invoice_id);
+        
+        // If cash payment and register specified, update cash register
+        if (paymentData.payment_method === 'cash' && paymentData.cash_register_id) {
+          await masterDataAPI.cashRegister.addTransaction(paymentData.cash_register_id, {
+            type: 'collection',
+            amount: paymentData.amount,
+            description: `Payment for Invoice #${payment.id}`,
+            reference_id: payment.id
+          });
+        }
+
+        // If credit payment, create credit transaction
+        if (paymentData.payment_method === 'credit' && paymentData.location_id) {
+          await masterDataAPI.creditTransactions.create({
+            location_id: paymentData.location_id,
+            amount: paymentData.amount,
+            type: 'debit',
+            description: `Payment for Invoice #${payment.id}`,
+            reference_type: 'payment',
+            reference_id: payment.id
+          });
+        }
+      }
+
+      return { data: payment, error: null };
+    },
+
+    updateInvoiceStatus: async (invoiceId: string) => {
+      // Get total payments for this invoice
+      const { data: payments } = await supabase
+        .from('payments')
+        .select('amount')
+        .eq('invoice_id', invoiceId);
+
+      // Get invoice total
+      const { data: invoice } = await supabase
+        .from('invoices')
+        .select('total_amount')
+        .eq('id', invoiceId)
+        .single();
+
+      if (!invoice || !payments) return;
+
+      const totalPaid = payments.reduce((sum, p) => sum + parseFloat(p.amount), 0);
+      const invoiceTotal = parseFloat(invoice.total_amount);
+
+      let status = 'pending';
+      if (totalPaid >= invoiceTotal) {
+        status = 'paid';
+      } else if (totalPaid > 0) {
+        status = 'partially_paid';
+      }
+
+      await supabase
+        .from('invoices')
+        .update({ 
+          status,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', invoiceId);
+    },
+
+    getPaymentsByInvoice: async (invoiceId: string) => {
+      const { data, error } = await supabase
+        .from('payments')
+        .select(`
+          *,
+          locations(name),
+          cash_registers(register_name)
+        `)
+        .eq('invoice_id', invoiceId)
+        .order('payment_date', { ascending: false });
+      return { data, error };
+    }
+  },
+
+  // Cash Register API
+  cashRegister: {
+    getAll: async () => {
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+      
+      const { data, error } = await supabase
+        .from('cash_registers')
+        .select('*')
+        .eq('lab_id', lab_id)
+        .eq('is_active', true)
+        .order('register_name');
+      return { data, error };
+    },
+
+    getById: async (id: string) => {
+      const { data, error } = await supabase
+        .from('cash_registers')
+        .select(`
+          *,
+          cash_register_transactions(
+            id,
+            type,
+            amount,
+            description,
+            transaction_date,
+            created_at
+          )
+        `)
+        .eq('id', id)
+        .single();
+
+      if (error || !data) {
+        return { data, error };
+      }
+
+      // Calculate current balance
+      const transactions = data.cash_register_transactions || [];
+      const collections = transactions
+        .filter((t: any) => t.type === 'collection')
+        .reduce((sum: number, t: any) => sum + parseFloat(t.amount), 0);
+      const expenses = transactions
+        .filter((t: any) => t.type === 'expense')
+        .reduce((sum: number, t: any) => sum + parseFloat(t.amount), 0);
+      
+      const currentBalance = parseFloat(data.opening_balance) + collections - expenses;
+
+      return {
+        data: {
+          ...data,
+          current_balance: currentBalance,
+          total_collections: collections,
+          total_expenses: expenses
+        },
+        error: null
+      };
+    },
+
+    create: async (registerData: {
+      register_name: string;
+      location_id?: string;
+      opening_balance: number;
+      responsible_person?: string;
+      description?: string;
+    }) => {
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+
+      const { data, error } = await supabase
+        .from('cash_registers')
+        .insert([{
+          ...registerData,
+          lab_id,
+          is_active: true,
+          created_at: new Date().toISOString()
+        }])
+        .select()
+        .single();
+      return { data, error };
+    },
+
+    addTransaction: async (registerId: string, transactionData: {
+      type: 'collection' | 'expense';
+      amount: number;
+      description: string;
+      reference_id?: string;
+    }) => {
+      const { data, error } = await supabase
+        .from('cash_register_transactions')
+        .insert([{
+          cash_register_id: registerId,
+          ...transactionData,
+          transaction_date: new Date().toISOString().split('T')[0],
+          created_at: new Date().toISOString()
+        }])
+        .select()
+        .single();
+      return { data, error };
+    },
+
+    getDailyReconciliation: async (registerId: string, date: string) => {
+      const { data: register, error: registerError } = await masterDataAPI.cashRegister.getById(registerId);
+      if (registerError || !register) {
+        return { data: null, error: registerError };
+      }
+
+      const { data: transactions, error: transactionsError } = await supabase
+        .from('cash_register_transactions')
+        .select('*')
+        .eq('cash_register_id', registerId)
+        .eq('transaction_date', date)
+        .order('created_at');
+
+      if (transactionsError) {
+        return { data: null, error: transactionsError };
+      }
+
+      const dailyCollections = transactions
+        ?.filter(t => t.type === 'collection')
+        .reduce((sum, t) => sum + parseFloat(t.amount), 0) || 0;
+      
+      const dailyExpenses = transactions
+        ?.filter(t => t.type === 'expense')
+        .reduce((sum, t) => sum + parseFloat(t.amount), 0) || 0;
+
+      return {
+        data: {
+          register,
+          date,
+          transactions: transactions || [],
+          daily_collections: dailyCollections,
+          daily_expenses: dailyExpenses,
+          net_change: dailyCollections - dailyExpenses,
+          expected_balance: register.current_balance
+        },
+        error: null
+      };
+    },
+
+    closeDay: async (registerId: string, closingData: {
+      closing_balance: number;
+      variance?: number;
+      notes?: string;
+    }) => {
+      const date = new Date().toISOString().split('T')[0];
+      
+      const { data, error } = await supabase
+        .from('cash_register_closings')
+        .insert([{
+          cash_register_id: registerId,
+          closing_date: date,
+          ...closingData,
+          created_at: new Date().toISOString()
+        }])
+        .select()
+        .single();
+      return { data, error };
+    },
+
+    // Phase 4 methods for CashReconciliation
+    getOrCreate: async (date: string, locationId: string, shift: 'morning' | 'afternoon' | 'night' | 'full_day') => {
+      const labId = await database.getCurrentUserLabId();
+      const { data, error } = await supabase
+        .from('cash_register')
+        .select('*')
+        .eq('lab_id', labId)
+        .eq('register_date', date)
+        .eq('location_id', locationId)
+        .eq('shift', shift)
+        .maybeSingle();
+
+      if (error) return { data: null, error };
+      if (data) return { data, error: null };
+
+      const { data: created, error: insertErr } = await supabase
+        .from('cash_register')
+        .insert({
+          lab_id: labId,
+          register_date: date,
+          location_id: locationId,
+          shift,
+          opening_balance: 0,
+          system_amount: 0,
+        })
+        .select('*')
+        .single();
+      return { data: created, error: insertErr };
+    },
+
+    update: async (id: string, patch: Partial<{ system_amount: number }>) =>
+      supabase.from('cash_register').update(patch).eq('id', id),
+
+    reconcile: async (id: string, actualAmount: number, notes?: string) =>
+      supabase
+        .from('cash_register')
+        .update({
+          actual_amount: actualAmount,
+          reconciled: true,
+          notes: notes || null,
+          reconciled_at: new Date().toISOString(),
+        })
+        .eq('id', id)
+  },
+
+  // Credit Transactions API
+  creditTransactions: {
+    getByLocation: async (locationId: string, limit?: number) => {
+      let query = supabase
+        .from('credit_transactions')
+        .select('*')
+        .eq('location_id', locationId)
+        .order('created_at', { ascending: false });
+
+      if (limit) {
+        query = query.limit(limit);
+      }
+
+      const { data, error } = await query;
+      return { data, error };
+    },
+
+    create: async (transactionData: {
+      location_id: string;
+      amount: number;
+      type: 'credit' | 'debit';
+      description: string;
+      reference_type?: string;
+      reference_id?: string;
+      notes?: string;
+    }) => {
+      const { data, error } = await supabase
+        .from('credit_transactions')
+        .insert([{
+          ...transactionData,
+          transaction_date: new Date().toISOString().split('T')[0],
+          created_at: new Date().toISOString()
+        }])
+        .select()
+        .single();
+      return { data, error };
+    },
+
+    getCreditSummaryByLocation: async (locationId: string) => {
+      const { data: transactions, error } = await supabase
+        .from('credit_transactions')
+        .select('amount, type')
+        .eq('location_id', locationId);
+
+      if (error || !transactions) {
+        return { data: null, error };
+      }
+
+      const totalCredits = transactions
+        .filter(t => t.type === 'credit')
+        .reduce((sum, t) => sum + parseFloat(t.amount), 0);
+      
+      const totalDebits = transactions
+        .filter(t => t.type === 'debit')
+        .reduce((sum, t) => sum + parseFloat(t.amount), 0);
+
+      return {
+        data: {
+          location_id: locationId,
+          total_credits: totalCredits,
+          total_debits: totalDebits,
+          current_balance: totalCredits - totalDebits
+        },
+        error: null
+      };
+    },
+
+    getLocationCreditReport: async (startDate?: string, endDate?: string) => {
+      const lab_id = await database.getCurrentUserLabId();
+      if (!lab_id) {
+        return { data: null, error: new Error('No lab_id found for current user') };
+      }
+
+      let query = supabase
+        .from('credit_transactions')
+        .select(`
+          *,
+          locations!location_id(
+            id,
+            name,
+            credit_limit
+          )
+        `)
+        .eq('locations.lab_id', lab_id);
+
+      if (startDate) {
+        query = query.gte('transaction_date', startDate);
+      }
+      if (endDate) {
+        query = query.lte('transaction_date', endDate);
+      }
+
+      const { data, error } = await query.order('transaction_date', { ascending: false });
+      return { data, error };
+    }
+  },
+
+  // --- NEW Phase 4: Account-aware invoice helpers used by Billing page/PaymentCapture ---
+  invoices: {
+    getById: async (id: string) =>
+      supabase
+        .from('invoices')
+        .select('*, locations(name), accounts(name)')
+        .eq('id', id)
+        .single(),
+
+    getAll: async () =>
+      supabase
+        .from('invoices')
+        .select('*, locations(name), accounts(name)')
+        .order('created_at', { ascending: false }),
+
+    getByStatus: async (status: 'Unpaid' | 'Paid' | 'Partial') =>
+      supabase
+        .from('invoices')
+        .select('*, locations(name), accounts(name)')
+        .eq('status', status)
+        .order('created_at', { ascending: false }),
+  },
+
+  // --- NEW Phase 4: Payments (used by PaymentCapture & CashReconciliation) ---
+  payments: {
+    create: async (payload: {
+      invoice_id: string;
+      amount: number;
+      payment_method: 'cash' | 'card' | 'upi' | 'bank' | 'credit_adjustment';
+      payment_reference?: string | null;
+      payment_date: string; // YYYY-MM-DD
+      location_id?: string | null;
+      account_id?: string | null;
+      notes?: string | null;
+    }) => supabase.from('payments').insert(payload).single(),
+
+    getByInvoice: async (invoiceId: string) =>
+      supabase.from('payments').select('*').eq('invoice_id', invoiceId).order('created_at'),
+
+    // For Cash Reconciliation (cash-only, date + location)
+    getByDateRange: async (fromDate: string, toDate: string, locationId: string) =>
+      supabase
+        .from('payments')
+        .select('*, invoices(patient_name)')
+        .eq('payment_method', 'cash')
+        .eq('location_id', locationId)
+        .gte('payment_date', fromDate)
+        .lte('payment_date', toDate)
+        .order('created_at'),
+  },
+
+  // --- NEW Phase 4: Cash Register helpers used by CashReconciliation ---
+  // (Merged into main cashRegister object above)
+};
+
+// Merge master data APIs into main database object
+Object.assign(database, masterDataAPI);

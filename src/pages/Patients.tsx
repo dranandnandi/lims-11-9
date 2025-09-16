@@ -93,7 +93,7 @@ const Patients: React.FC = () => {
 
   const handleAddPatient = async (formData: any) => {
     try {
-      const { ocrResults, attachmentId, requestedTests, ...patientDetails } = formData;
+      const { ocrResults, attachmentId, requestedTests, selectedDoctorId, ...patientDetails } = formData;
       
       const patientData = {
         name: `${patientDetails.firstName} ${patientDetails.lastName}`.trim(),
@@ -113,7 +113,8 @@ const Patients: React.FC = () => {
         total_tests: 0,
         is_active: true,
         requestedTests: requestedTests || [],
-        referring_doctor: patientDetails.referringDoctor || null,
+        referring_doctor: patientDetails.referring_doctor || null, // Use the doctor name for now
+        referring_doctor_id: selectedDoctorId || null, // Add the doctor ID
       };
 
       const { data, error } = await database.patients.create(patientData);

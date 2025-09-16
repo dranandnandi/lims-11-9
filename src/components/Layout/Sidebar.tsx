@@ -13,10 +13,10 @@ import {
   X,
   Activity,
   CheckCircle2,
-  Workflow
-} from 'lucide-react';
-
-interface SidebarProps {
+  Workflow,
+  UserCheck,
+  Building
+} from 'lucide-react';interface SidebarProps {
   isOpen: boolean;
   onToggle: () => void;
 }
@@ -36,6 +36,10 @@ const navigation = [
   // Business & Administrative
   { name: 'Billing', href: '/billing', icon: Receipt, category: 'business' },
   { name: 'Cash Reconciliation', href: '/cash-reconciliation', icon: DollarSign, category: 'business' },
+  
+  // Master Data Management
+  { name: 'Doctor Master', href: '/masters/doctors', icon: UserCheck, category: 'masters' },
+  { name: 'Location Master', href: '/masters/locations', icon: Building, category: 'masters' },
   
   // Advanced Tools
   { name: 'AI Tools', href: '/ai-tools', icon: Brain, category: 'tools' },
@@ -151,6 +155,34 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen, onToggle }) => {
                   onClick={() => window.innerWidth < 1024 && onToggle()}
                 >
                   <item.icon className={`h-5 w-5 mr-3 ${isActive ? 'text-purple-700' : 'text-gray-400'}`} />
+                  {item.name}
+                </Link>
+              );
+            })}
+          </div>
+
+          {/* Master Data Management */}
+          <div className="mb-6">
+            <h3 className="px-4 text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3">
+              📊 Master Data
+            </h3>
+            {navigation.filter(item => item.category === 'masters').map((item) => {
+              const isActive = location.pathname === item.href;
+              return (
+                <Link
+                  key={item.name}
+                  to={item.href}
+                  className={`
+                    flex items-center px-4 py-3 rounded-lg text-sm font-medium transition-colors duration-200 mb-1
+                    border-l-4 border-l-orange-500
+                    ${isActive
+                      ? 'bg-orange-50 text-orange-700 border-l-orange-700'
+                      : 'text-gray-600 hover:bg-orange-50 hover:text-orange-700 border-l-transparent hover:border-l-orange-300'
+                    }
+                  `}
+                  onClick={() => window.innerWidth < 1024 && onToggle()}
+                >
+                  <item.icon className={`h-5 w-5 mr-3 ${isActive ? 'text-orange-700' : 'text-gray-400'}`} />
                   {item.name}
                 </Link>
               );

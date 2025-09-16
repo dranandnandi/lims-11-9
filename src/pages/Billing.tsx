@@ -1,9 +1,12 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, Search, Filter, DollarSign, FileText, Download, Eye, CreditCard, Calendar, TrendingUp, Clock as ClockIcon } from 'lucide-react';
+import { Plus, Search, Filter, DollarSign, FileText, Download, Eye, CreditCard, Calendar, TrendingUp, Clock as ClockIcon, Calculator, Building } from 'lucide-react';
+import { useSearchParams } from 'react-router-dom';
 import { generateAndDownloadReport, getLabTemplate, ReportData } from '../utils/pdfGenerator';
-import { database, supabase } from '../utils/supabase';
+import { database } from '../utils/supabase';
 import InvoiceForm from '../components/Billing/InvoiceForm';
 import MarkAsPaidModal from '../components/Billing/MarkAsPaidModal';
+import CashReconciliation from '../components/Billing/CashReconciliation';
+import MonthlyAccountBilling from '../components/Billing/MonthlyAccountBilling';
 
 interface InvoiceItem {
   id: string;
@@ -44,6 +47,9 @@ interface Invoice {
 }
 
 const Billing: React.FC = () => {
+  const [searchParams] = useSearchParams();
+  const view = searchParams.get('view') || 'invoices';
+
   const [invoices, setInvoices] = useState<Invoice[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -241,235 +247,294 @@ const Billing: React.FC = () => {
     .filter(i => i.payment_date === new Date().toISOString().split('T')[0])
     .reduce((sum, i) => sum + (i.paid_amount || 0), 0);
 
-  return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h1 className="text-3xl font-bold text-gray-900">Billing & Invoicing</h1>
-        <div className="flex space-x-3">
-          <button 
-            onClick={() => setShowInvoiceForm(true)}
-            className="flex items-center px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors"
-          >
-            <Download className="h-4 w-4 mr-2" />
-            Export Reports
-          </button>
-          <button 
-            onClick={() => setShowInvoiceForm(true)}
-            className="flex items-center px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
-          >
-            <Plus className="h-4 w-4 mr-2" />
-            Create Invoice
-          </button>
-        </div>
-      </div>
+  const renderContent = () => {
+    if (view === 'cash-reconciliation') return <CashReconciliation />;
+    if (view === 'b2b-monthly') return <MonthlyAccountBilling />;
 
-      {/* Financial Overview Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
-        <div className="bg-gradient-to-r from-green-50 to-green-100 rounded-lg shadow-sm border border-green-200 p-6">
-          <div className="flex items-center">
-            <div className="bg-green-500 p-3 rounded-lg">
-              <DollarSign className="h-6 w-6 text-white" />
+    // Render the existing invoices UI
+    return (
+      <>
+        {/* Financial Overview Cards */}
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+          <div className="bg-gradient-to-r from-green-50 to-green-100 rounded-lg shadow-sm border border-green-200 p-6">
+            <div className="flex items-center">
+              <div className="bg-green-500 p-3 rounded-lg">
+                <DollarSign className="h-6 w-6 text-white" />
+              </div>
+              <div className="ml-4">
+                <div className="text-2xl font-bold text-green-900">₹{totalRevenue.toLocaleString()}</div>
+                <div className="text-sm text-green-700">Total Revenue</div>
+                <div className="text-xs text-green-600 mt-1">Today: ₹{todayCollections.toLocaleString()}</div>
+              </div>
             </div>
-            <div className="ml-4">
-              <div className="text-2xl font-bold text-green-900">₹{totalRevenue.toLocaleString()}</div>
-              <div className="text-sm text-green-700">Total Revenue</div>
-              <div className="text-xs text-green-600 mt-1">Today: ₹{todayCollections.toLocaleString()}</div>
-            </div>
-          </div>
-        </div>
-        
-        <div className="bg-gradient-to-r from-blue-50 to-blue-100 rounded-lg shadow-sm border border-blue-200 p-6">
-          <div className="flex items-center">
-            <div className="bg-blue-500 p-3 rounded-lg">
-              <ClockIcon className="h-6 w-6 text-white" />
-            </div>
-            <div className="ml-4">
-              <div className="text-2xl font-bold text-blue-900">₹{pendingAmount.toLocaleString()}</div>
-              <div className="text-sm text-blue-700">Pending Payments</div>
-            </div>
-          </div>
-        </div>
-
-        <div className="bg-gradient-to-r from-red-50 to-red-100 rounded-lg shadow-sm border border-red-200 p-6">
-          <div className="flex items-center">
-            <div className="bg-red-500 p-3 rounded-lg">
-              <Calendar className="h-6 w-6 text-white" />
-            </div>
-            <div className="ml-4">
-              <div className="text-2xl font-bold text-red-900">₹{overdueAmount.toLocaleString()}</div>
-              <div className="text-sm text-red-700">Overdue Amount</div>
-            </div>
-          </div>
-        </div>
-
-        <div className="bg-gradient-to-r from-purple-50 to-purple-100 rounded-lg shadow-sm border border-purple-200 p-6">
-          <div className="flex items-center">
-            <div className="bg-purple-500 p-3 rounded-lg">
-              <TrendingUp className="h-6 w-6 text-white" />
-            </div>
-            <div className="ml-4">
-              <div className="text-2xl font-bold text-purple-900">{invoices.length}</div>
-              <div className="text-sm text-purple-700">Total Invoices</div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* Search and Filter Bar */}
-      <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-4">
-        <div className="flex flex-col sm:flex-row gap-4">
-          <div className="flex-1 relative">
-            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-gray-400" />
-            <input
-              type="text"
-              placeholder="Search by patient name or invoice ID..."
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              className="pl-10 pr-4 py-2 w-full border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-            />
-          </div>
-          <select
-            value={selectedStatus}
-            onChange={(e) => setSelectedStatus(e.target.value)}
-            className="px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-          >
-            {statuses.map(status => (
-              <option key={status} value={status}>{status}</option>
-            ))}
-          </select>
-          <button className="flex items-center px-4 py-2 border border-gray-300 rounded-md hover:bg-gray-50 transition-colors">
-            <Filter className="h-4 w-4 mr-2" />
-            Date Range
-          </button>
-        </div>
-      </div>
-
-      {/* Invoices Table */}
-      {loading ? (
-        <div className="flex items-center justify-center min-h-64">
-          <div className="animate-spin rounded-full h-12 w-12 border-4 border-blue-600 border-t-transparent"></div>
-        </div>
-      ) : error ? (
-        <div className="bg-red-50 border border-red-200 rounded-lg p-4 text-red-700">{error}</div>
-      ) : (
-        <div className="bg-white rounded-lg shadow-sm border border-gray-200 overflow-hidden">
-          <div className="px-6 py-4 border-b border-gray-200">
-            <h3 className="text-lg font-semibold text-gray-900">
-              Invoices ({filteredInvoices.length})
-            </h3>
           </div>
           
-          <div className="overflow-x-auto">
-            <table className="min-w-full divide-y divide-gray-200">
-              <thead className="bg-gray-50">
-                <tr>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Invoice Details
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Patient
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Amount
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Status
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Dates
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Actions
-                  </th>
-                </tr>
-              </thead>
-              <tbody className="bg-white divide-y divide-gray-200">
-                {filteredInvoices.length === 0 ? (
-                  <tr>
-                    <td colSpan={6} className="px-6 py-4 text-center text-gray-500">
-                      No invoices found
-                    </td>
-                  </tr>
-                ) : (
-                  filteredInvoices.map((invoice) => (
-                    <tr key={invoice.id} className="hover:bg-gray-50 transition-colors">
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <div>
-                          <div className="text-sm font-medium text-gray-900">{invoice.id}</div>
-                          <div className="text-sm text-gray-500">
-                            {(invoice.invoice_items?.length || invoice.tests?.length || 0)} items
-                          </div>
-                        </div>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <div>
-                          <div className="text-sm font-medium text-gray-900">
-                            {invoice.patient_name || invoice.patientName}
-                          </div>
-                          <div className="text-sm text-gray-500">
-                            {invoice.patient_id || invoice.patientId}
-                          </div>
-                        </div>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <div className="text-sm font-bold text-gray-900">₹{invoice.total.toLocaleString()}</div>
-                        <div className="text-sm text-gray-500">Sub: ₹{invoice.subtotal}</div>
-                        {invoice.paid_amount !== undefined && invoice.paid_amount > 0 && (
-                          <div className="text-sm text-green-600">Paid: ₹{invoice.paid_amount.toLocaleString()}</div>
-                        )}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(invoice.payment_status || invoice.status)}`}>
-                          {invoice.payment_status || invoice.status}
-                        </span>
-                        {(invoice.payment_method || invoice.paymentMethod) && (
-                          <div className="text-xs text-gray-500 mt-1">
-                            {invoice.payment_method || invoice.paymentMethod}
-                          </div>
-                        )}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600">
-                        <div>Issued: {new Date(invoice.invoice_date || invoice.invoiceDate || '').toLocaleDateString()}</div>
-                        <div>Due: {new Date(invoice.due_date || invoice.dueDate || '').toLocaleDateString()}</div>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm font-medium space-x-2">
-                        <button
-                          onClick={() => setSelectedInvoice(invoice)}
-                          className="text-blue-600 hover:text-blue-900 p-1 rounded"
-                          title="Preview Invoice"
-                        >
-                          <Eye className="h-4 w-4" />
-                        </button>
-                        <button 
-                          onClick={() => handleDownloadInvoice(invoice)}
-                          disabled={downloadingInvoices.has(invoice.id)}
-                          className="text-blue-600 hover:text-blue-900 p-1 rounded disabled:opacity-50 disabled:cursor-not-allowed"
-                          title="Download PDF"
-                        >
-                          {downloadingInvoices.has(invoice.id) ? (
-                            <div className="animate-spin rounded-full h-4 w-4 border-2 border-blue-600 border-t-transparent"></div>
-                          ) : (
-                            <Download className="h-4 w-4" />
-                          )}
-                        </button>
-                        {(invoice.payment_status !== 'Paid' && invoice.status !== 'Paid') && (
-                          <button 
-                            onClick={() => handleOpenPaymentModal(invoice)}
-                            className="text-green-600 hover:text-green-900 p-1 rounded"
-                            title="Process Payment"
-                          >
-                            <CreditCard className="h-4 w-4" />
-                          </button>
-                        )}
-                      </td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
+          <div className="bg-gradient-to-r from-blue-50 to-blue-100 rounded-lg shadow-sm border border-blue-200 p-6">
+            <div className="flex items-center">
+              <div className="bg-blue-500 p-3 rounded-lg">
+                <ClockIcon className="h-6 w-6 text-white" />
+              </div>
+              <div className="ml-4">
+                <div className="text-2xl font-bold text-blue-900">₹{pendingAmount.toLocaleString()}</div>
+                <div className="text-sm text-blue-700">Pending Payments</div>
+              </div>
+            </div>
+          </div>
+
+          <div className="bg-gradient-to-r from-red-50 to-red-100 rounded-lg shadow-sm border border-red-200 p-6">
+            <div className="flex items-center">
+              <div className="bg-red-500 p-3 rounded-lg">
+                <Calendar className="h-6 w-6 text-white" />
+              </div>
+              <div className="ml-4">
+                <div className="text-2xl font-bold text-red-900">₹{overdueAmount.toLocaleString()}</div>
+                <div className="text-sm text-red-700">Overdue Amount</div>
+              </div>
+            </div>
+          </div>
+
+          <div className="bg-gradient-to-r from-purple-50 to-purple-100 rounded-lg shadow-sm border border-purple-200 p-6">
+            <div className="flex items-center">
+              <div className="bg-purple-500 p-3 rounded-lg">
+                <TrendingUp className="h-6 w-6 text-white" />
+              </div>
+              <div className="ml-4">
+                <div className="text-2xl font-bold text-purple-900">{invoices.length}</div>
+                <div className="text-sm text-purple-700">Total Invoices</div>
+              </div>
+            </div>
           </div>
         </div>
-      )}
+
+        {/* Search and Filter Bar */}
+        <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-4">
+          <div className="flex flex-col sm:flex-row gap-4">
+            <div className="flex-1 relative">
+              <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-gray-400" />
+              <input
+                type="text"
+                placeholder="Search by patient name or invoice ID..."
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                className="pl-10 pr-4 py-2 w-full border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              />
+            </div>
+            <select
+              value={selectedStatus}
+              onChange={(e) => setSelectedStatus(e.target.value)}
+              className="px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+            >
+              {statuses.map(status => (
+                <option key={status} value={status}>{status}</option>
+              ))}
+            </select>
+            <button className="flex items-center px-4 py-2 border border-gray-300 rounded-md hover:bg-gray-50 transition-colors">
+              <Filter className="h-4 w-4 mr-2" />
+              Date Range
+            </button>
+          </div>
+        </div>
+
+        {/* Invoices Table - Existing implementation continues... */}
+        {loading ? (
+          <div className="flex items-center justify-center min-h-64">
+            <div className="animate-spin rounded-full h-12 w-12 border-4 border-blue-600 border-t-transparent"></div>
+          </div>
+        ) : error ? (
+          <div className="bg-red-50 border border-red-200 rounded-lg p-4 text-red-700">{error}</div>
+        ) : (
+          <div className="bg-white rounded-lg shadow-sm border border-gray-200 overflow-hidden">
+            <div className="px-6 py-4 border-b border-gray-200">
+              <h3 className="text-lg font-semibold text-gray-900">
+                Invoices ({filteredInvoices.length})
+              </h3>
+            </div>
+            
+            <div className="overflow-x-auto">
+              <table className="min-w-full divide-y divide-gray-200">
+                <thead className="bg-gray-50">
+                  <tr>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Invoice Details
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Patient
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Bill To
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Amount
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Status
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Dates
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Actions
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="bg-white divide-y divide-gray-200">
+                  {filteredInvoices.length === 0 ? (
+                    <tr>
+                      <td colSpan={7} className="px-6 py-4 text-center text-gray-500">
+                        No invoices found
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredInvoices.map((invoice) => {
+                      // Determine bill-to information
+                      const invoiceType = (invoice as any).invoice_type || 'patient';
+                      const billTo = invoiceType === 'account' 
+                        ? { type: 'Account', name: (invoice as any).account?.name || 'Account' }
+                        : (invoice as any).location_id 
+                        ? { type: 'Location', name: (invoice as any).location?.name || 'Location' }
+                        : { type: 'Self', name: 'Direct Pay' };
+
+                      return (
+                        <tr key={invoice.id} className="hover:bg-gray-50 transition-colors">
+                          <td className="px-6 py-4 whitespace-nowrap">
+                            <div>
+                              <div className="text-sm font-medium text-gray-900">#{invoice.id.slice(0, 8)}</div>
+                              <div className="text-sm text-gray-500">
+                                {(invoice.invoice_items?.length || invoice.tests?.length || 0)} items
+                              </div>
+                              {invoiceType === 'account' && (
+                                <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800 mt-1">
+                                  B2B Credit
+                                </span>
+                              )}
+                            </div>
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap">
+                            <div>
+                              <div className="text-sm font-medium text-gray-900">
+                                {invoice.patient_name || invoice.patientName}
+                              </div>
+                              <div className="text-sm text-gray-500">
+                                ID: {(invoice.patient_id || invoice.patientId || '').slice(0, 8)}
+                              </div>
+                            </div>
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap">
+                            <div>
+                              <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
+                                billTo.type === 'Account' ? 'bg-purple-100 text-purple-800' :
+                                billTo.type === 'Location' ? 'bg-orange-100 text-orange-800' :
+                                'bg-gray-100 text-gray-800'
+                              }`}>
+                                {billTo.type}
+                              </span>
+                              {billTo.name !== billTo.type && (
+                                <div className="text-xs text-gray-600 mt-1 truncate max-w-32" title={billTo.name}>
+                                  {billTo.name}
+                                </div>
+                              )}
+                            </div>
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap">
+                            <div className="text-sm font-bold text-gray-900">₹{invoice.total.toLocaleString()}</div>
+                            <div className="text-sm text-gray-500">Sub: ₹{invoice.subtotal}</div>
+                            {invoice.paid_amount !== undefined && invoice.paid_amount > 0 && (
+                              <div className="text-sm text-green-600">Paid: ₹{invoice.paid_amount.toLocaleString()}</div>
+                            )}
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap">
+                            <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(invoice.payment_status || invoice.status)}`}>
+                              {invoice.payment_status || invoice.status}
+                            </span>
+                            {invoice.payment_method && (
+                              <div className="text-xs text-gray-500 mt-1">
+                                {invoice.payment_method}
+                              </div>
+                            )}
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600">
+                            <div>Issued: {new Date(invoice.invoice_date || invoice.invoiceDate || '').toLocaleDateString()}</div>
+                            <div>Due: {new Date(invoice.due_date || invoice.dueDate || '').toLocaleDateString()}</div>
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm font-medium space-x-2">
+                            <button
+                              onClick={() => setSelectedInvoice(invoice)}
+                              className="text-blue-600 hover:text-blue-900 p-1 rounded"
+                              title="Preview Invoice"
+                            >
+                              <Eye className="h-4 w-4" />
+                            </button>
+                            <button 
+                              onClick={() => handleDownloadInvoice(invoice)}
+                              disabled={downloadingInvoices.has(invoice.id)}
+                              className="text-green-600 hover:text-green-900 p-1 rounded disabled:opacity-50"
+                              title="Download Invoice"
+                            >
+                              <Download className="h-4 w-4" />
+                            </button>
+                            {(invoice.payment_status !== 'Paid' && invoice.status !== 'Paid') && (
+                              <button 
+                                onClick={() => handleOpenPaymentModal(invoice)}
+                                className="text-orange-600 hover:text-orange-900 p-1 rounded"
+                                title="Record Payment"
+                              >
+                                <CreditCard className="h-4 w-4" />
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* Rest of the existing UI... */}
+      </>
+    );
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="flex justify-between items-center">
+        <h1 className="text-2xl font-bold text-gray-900">Billing Management</h1>
+
+        {/* View Tabs */}
+        <div className="flex gap-2">
+          <button
+            onClick={() => (window.location.href = '/billing?view=invoices')}
+            className={`px-4 py-2 rounded-md text-sm font-medium flex items-center gap-2 ${
+              view === 'invoices' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+            }`}
+          >
+            <FileText className="w-4 h-4" />
+            Invoices
+          </button>
+          <button
+            onClick={() => (window.location.href = '/billing?view=b2b-monthly')}
+            className={`px-4 py-2 rounded-md text-sm font-medium flex items-center gap-2 ${
+              view === 'b2b-monthly' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+            }`}
+          >
+            <Building className="w-4 h-4" />
+            B2B Monthly
+          </button>
+          <button
+            onClick={() => (window.location.href = '/billing?view=cash-reconciliation')}
+            className={`px-4 py-2 rounded-md text-sm font-medium flex items-center gap-2 ${
+              view === 'cash-reconciliation' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+            }`}
+          >
+            <Calculator className="w-4 h-4" />
+            Cash Reconciliation
+          </button>
+        </div>
+      </div>
+
+      {renderContent()}
 
       {/* Payment Gateway Integration */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">

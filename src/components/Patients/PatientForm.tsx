@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { X, User, Phone, Mail, MapPin, Calendar, Upload, FileText, Brain, Zap, Plus, Minus, TestTube, CheckCircle, AlertTriangle, RotateCcw } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { X, User, Phone, Mail, MapPin, Calendar, Upload, FileText, Brain, Zap, Plus, Minus, TestTube, CheckCircle, AlertTriangle, RotateCcw, UserCheck } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
 import { supabase, uploadFile, generateFilePath, database } from '../../utils/supabase';
 import { useAuth } from '../../contexts/AuthContext';
@@ -96,6 +96,11 @@ const PatientForm: React.FC<PatientFormProps> = ({
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [filteredSuggestions, setFilteredSuggestions] = useState<string[]>([]);
   
+  // Doctors state for referring doctor dropdown
+  const [doctors, setDoctors] = useState<any[]>([]);
+  const [loadingDoctors, setLoadingDoctors] = useState(true);
+  const [selectedDoctorId, setSelectedDoctorId] = useState<string>('');
+  
   // Internal file upload and OCR states
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
   const [attachmentId, setAttachmentId] = useState<string | null>(null);
@@ -155,10 +160,28 @@ const PatientForm: React.FC<PatientFormProps> = ({
       
       // Set referring doctor from OCR
       if (ocrResults.doctor_info && ocrResults.doctor_info.name) {
-        setFormData(prev => ({
-          ...prev,
-          referring_doctor: ocrResults.doctor_info.name
-        }));
+        const ocrDoctorName = ocrResults.doctor_info.name;
+        
+        // Try to find matching doctor from the loaded doctors list
+        const matchingDoctor = doctors.find((doctor: any) => 
+          doctor.name.toLowerCase().includes(ocrDoctorName.toLowerCase()) ||
+          ocrDoctorName.toLowerCase().includes(doctor.name.toLowerCase())
+        );
+        
+        if (matchingDoctor) {
+          // Select the matching doctor
+          setSelectedDoctorId(matchingDoctor.id);
+          setFormData(prev => ({
+            ...prev,
+            referring_doctor: matchingDoctor.name
+          }));
+        } else {
+          // If no match found, still set the name for manual review
+          setFormData(prev => ({
+            ...prev,
+            referring_doctor: ocrDoctorName
+          }));
+        }
       }
       
       // Set requested tests from OCR
@@ -208,6 +231,51 @@ const PatientForm: React.FC<PatientFormProps> = ({
     fetchTestData();
   }, []);
 
+  // Fetch referring doctors on component mount
+  React.useEffect(() => {
+    const fetchDoctors = async () => {
+      setLoadingDoctors(true);
+      try {
+        // Use the database.doctors API if available, otherwise fallback to direct supabase call
+        let doctorsData: any[] = [];
+        let error: any = null;
+        
+        if ((database as any).doctors) {
+          const result = await (database as any).doctors.getAll();
+          doctorsData = result.data || [];
+          error = result.error;
+        } else {
+          // Fallback to direct supabase call
+          const lab_id = await database.getCurrentUserLabId();
+          if (lab_id) {
+            const result = await supabase
+              .from('doctors')
+              .select('*')
+              .eq('lab_id', lab_id)
+              .eq('is_active', true)
+              .order('name');
+            doctorsData = result.data || [];
+            error = result.error;
+          }
+        }
+        
+        if (error) {
+          console.error('Error fetching doctors:', error);
+        } else {
+          // Filter only referring doctors for the dropdown
+          const referringDoctors = (doctorsData || []).filter((doctor: any) => doctor.is_referring_doctor);
+          setDoctors(referringDoctors);
+        }
+      } catch (error) {
+        console.error('Error fetching doctors:', error);
+      } finally {
+        setLoadingDoctors(false);
+      }
+    };
+
+    fetchDoctors();
+  }, []);
+
   // Update suggestions when newTestName changes
   React.useEffect(() => {
     if (newTestName.trim().length > 0) {
@@ -237,6 +305,7 @@ const PatientForm: React.FC<PatientFormProps> = ({
       requestedTests,
       ocrResults,
       attachmentId,
+      selectedDoctorId, // Include the selected doctor ID
     });
   };
 
@@ -841,21 +910,56 @@ const PatientForm: React.FC<PatientFormProps> = ({
           {/* Referring Doctor - Only show for new patients */}
           {!patient && (
             <div className="space-y-4">
-              <h3 className="text-lg font-medium text-gray-900">Referring Doctor</h3>
+              <h3 className="text-lg font-medium text-gray-900 flex items-center">
+                <UserCheck className="h-5 w-5 mr-2" />
+                Referring Doctor
+              </h3>
               
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Doctor Name *
+                  Select Doctor *
                 </label>
-                <input
-                  type="text"
-                  name="referring_doctor"
-                  required
-                  value={formData.referring_doctor}
-                  onChange={handleChange}
-                  placeholder="Dr. Name"
-                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                />
+                {loadingDoctors ? (
+                  <div className="w-full px-3 py-2 border border-gray-300 rounded-md bg-gray-50 text-gray-500">
+                    Loading doctors...
+                  </div>
+                ) : (
+                  <select
+                    value={selectedDoctorId}
+                    onChange={(e) => {
+                      setSelectedDoctorId(e.target.value);
+                      const selectedDoctor = doctors.find(doc => doc.id === e.target.value);
+                      setFormData(prev => ({
+                        ...prev,
+                        referring_doctor: selectedDoctor ? selectedDoctor.name : ''
+                      }));
+                    }}
+                    required
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                  >
+                    <option value="">Select a referring doctor...</option>
+                    {doctors.map((doctor) => (
+                      <option key={doctor.id} value={doctor.id}>
+                        {doctor.name}
+                        {doctor.specialization && ` - ${doctor.specialization}`}
+                        {doctor.hospital && ` (${doctor.hospital})`}
+                      </option>
+                    ))}
+                  </select>
+                )}
+                
+                {/* Option to add new doctor */}
+                <div className="mt-2">
+                  <a
+                    href="/masters/doctors"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-sm text-blue-600 hover:text-blue-800 flex items-center gap-1"
+                  >
+                    <UserCheck className="h-3 w-3" />
+                    Add new doctor to master list
+                  </a>
+                </div>
               </div>
             </div>
           )}

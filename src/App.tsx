@@ -26,6 +26,10 @@ import "./styles/print.css";
 // ⬇️ New modern dashboard page
 import Dashboard2 from './pages/Dashboard2';
 
+// ⬇️ Master Data Components
+import DoctorMaster from './components/Masters/DoctorMaster';
+import LocationMaster from './components/Masters/LocationMaster';
+
 const AppRoutes: React.FC = () => {
   const { user, loading } = useAuth();
 
@@ -77,6 +81,9 @@ const AppRoutes: React.FC = () => {
                 <Route path="/workflows" element={<WorkflowManagement />} />
                 <Route path="/workflow-demo" element={<WorkflowDemo />} />
                 <Route path="/orders/:id" element={<OrderDetail />} />
+                {/* Master Data Routes */}
+                <Route path="/masters/doctors" element={<DoctorMaster />} />
+                <Route path="/masters/locations" element={<LocationMaster />} />
               </Routes>
             </Layout>
           </ProtectedRoute>

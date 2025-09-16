@@ -2,12 +2,15 @@
 import React, { useEffect, useMemo, useState } from "react";
 import {
   Plus, Search, Filter, Clock as ClockIcon, CheckCircle, AlertTriangle,
-  Eye, User, Calendar, TestTube, ChevronDown, ChevronUp, TrendingUp
+  Eye, User, Calendar, TestTube, ChevronDown, ChevronUp, TrendingUp,
+  UserPlus, DollarSign, FileText, CreditCard
 } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
 import { supabase, database } from "../utils/supabase";
 import OrderForm from "../components/Orders/OrderForm";
 import OrderDetailsModal from "../components/Orders/OrderDetailsModal";
+import CreateInvoiceModal from "../components/Billing/CreateInvoiceModal";
+import PaymentCapture from "../components/Billing/PaymentCapture";
 
 /* ===========================
    Types
@@ -53,6 +56,10 @@ type OrderRow = {
   sample_collected_at: string | null;
   sample_collected_by: string | null;
 
+  // Billing fields
+  billing_status?: 'pending' | 'partial' | 'billed' | null;
+  is_billed?: boolean | null;
+
   // relations
   patients: { name?: string | null; age?: string | null; gender?: string | null } | null;
   order_tests: { id: string; test_group_id: string | null; test_name: string }[] | null;
@@ -87,6 +94,10 @@ type CardOrder = {
   color_name: string | null;
   sample_collected_at: string | null;
   sample_collected_by: string | null;
+
+  // Billing fields
+  billing_status?: 'pending' | 'partial' | 'billed' | null;
+  is_billed?: boolean | null;
 
   patient?: { name?: string | null; age?: string | null; gender?: string | null } | null;
   tests: string[];
@@ -127,6 +138,14 @@ const Dashboard: React.FC = () => {
   const [showOrderForm, setShowOrderForm] = useState(false);
   const [selectedOrder, setSelectedOrder] = useState<CardOrder | null>(null);
 
+  // State for invoice modal
+  const [showInvoiceModal, setShowInvoiceModal] = useState(false);
+  const [invoiceOrderId, setInvoiceOrderId] = useState<string | null>(null);
+
+  // State for payment modal
+  const [showPaymentModal, setShowPaymentModal] = useState(false);
+  const [paymentInvoiceId, setPaymentInvoiceId] = useState<string | null>(null);
+
   // dashboard counters
   const [summary, setSummary] = useState({ allDone: 0, mostlyDone: 0, pending: 0, awaitingApproval: 0 });
 
@@ -156,6 +175,7 @@ const Dashboard: React.FC = () => {
       .select(`
         id, patient_id, patient_name, status, priority, order_date, expected_date, total_amount, doctor,
         order_number, sample_id, color_code, color_name, sample_collected_at, sample_collected_by,
+        billing_status, is_billed,
         patients(name, age, gender),
         order_tests(id, test_group_id, test_name)
       `)
@@ -242,6 +262,10 @@ const Dashboard: React.FC = () => {
         sample_collected_at: o.sample_collected_at,
         sample_collected_by: o.sample_collected_by,
 
+        // Billing fields
+        billing_status: o.billing_status,
+        is_billed: o.is_billed,
+
         patient: o.patients,
         tests: (o.order_tests || []).map((t) => t.test_name),
 
@@ -278,6 +302,66 @@ const Dashboard: React.FC = () => {
 
     setOrders(sorted);
     setSummary(s);
+  };
+
+  // Add this function after the existing fetchOrders function
+  const handleAddOrder = async (orderData: any) => {
+    try {
+      // Get current user's lab ID
+      const labId = await database.getCurrentUserLabId();
+
+      // Create the order (pass through optional account_id if present)
+      const { data: order, error: orderError } = await database.orders.create({
+        ...orderData,
+        lab_id: labId,
+        status: 'Order Created',
+        order_date: new Date().toISOString(),
+        expected_date: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(), // Next day
+        priority: orderData.priority || 'Normal',
+        account_id: orderData.account_id || null, // NEW: optional bill-to account
+      });
+
+      if (orderError) throw orderError;
+
+      // If the form attached a test request file, upload now (optional pattern)
+      if (orderData.testRequestFile) {
+        await database.attachments.uploadForOrder(order.id, orderData.testRequestFile, {
+          file_type: 'test_request_form',
+          description: 'Test Request Form',
+        });
+      }
+
+      // Refresh orders
+      await fetchOrders();
+
+      // Success UX
+      console.log('Order created successfully:', order);
+    } catch (error) {
+      console.error('Error creating order:', error);
+      alert('Failed to create order. Please try again.');
+    }
+  };
+
+  // Handler for creating invoices
+  const handleCreateInvoice = (orderId: string) => {
+    setInvoiceOrderId(orderId);
+    setShowInvoiceModal(true);
+  };
+
+  const handleRecordPayment = (invoiceId: string) => {
+    setPaymentInvoiceId(invoiceId);
+    setShowPaymentModal(true);
+  };
+
+  // Billing badge helper
+  const getBillingBadge = (order: any) => {
+    if (order.billing_status === 'billed') {
+      return <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-green-100 text-green-800">💰 Fully Billed</span>;
+    } else if (order.billing_status === 'partial') {
+      return <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-yellow-100 text-yellow-800">💸 Partially Billed</span>;
+    } else {
+      return <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-gray-100 text-gray-800">📋 Not Billed</span>;
+    }
   };
 
   /* ------------- filtering + grouping ------------- */
@@ -559,6 +643,8 @@ const Dashboard: React.FC = () => {
                             <span className="inline-flex items-center px-3 py-1.5 rounded-lg text-sm font-bold border-2 bg-blue-100 text-blue-800 border-blue-200">
                               ● {o.status === "In Progress" ? "In Process" : o.status}
                             </span>
+                            {/* Billing Badge */}
+                            {getBillingBadge(o)}
                             <button
                               className="p-2 text-gray-600 hover:bg-gray-100 rounded-lg"
                               onClick={() => setExpanded((prev) => ({ ...prev, [o.id]: !prev[o.id] }))}
@@ -661,6 +747,35 @@ const Dashboard: React.FC = () => {
                               <Eye className="h-4 w-4 mr-1" />
                               View Full Details
                             </button>
+                            
+                            {/* Invoice creation button */}
+                            {o.billing_status !== 'billed' && (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleCreateInvoice(o.id);
+                                }}
+                                className="mt-2 inline-flex items-center px-3 py-1.5 text-sm bg-green-600 text-white rounded-lg hover:bg-green-700"
+                              >
+                                <DollarSign className="h-4 w-4 mr-1" />
+                                Create Invoice
+                              </button>
+                            )}
+
+                            {/* Record Payment button - for billed orders */}
+                            {o.billing_status === 'billed' && (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  // For now, use order ID - in a real implementation, we'd need the invoice ID
+                                  handleRecordPayment(o.id);
+                                }}
+                                className="mt-2 inline-flex items-center px-3 py-1.5 text-sm bg-purple-600 text-white rounded-lg hover:bg-purple-700"
+                              >
+                                <CreditCard className="h-4 w-4 mr-1" />
+                                Record Payment
+                              </button>
+                            )}
                           </div>
                         </div>
 
@@ -785,7 +900,13 @@ const Dashboard: React.FC = () => {
 
       {/* Modals */}
       {showOrderForm && (
-        <OrderForm onClose={() => setShowOrderForm(false)} onSubmit={() => setShowOrderForm(false)} />
+        <OrderForm
+          onClose={() => setShowOrderForm(false)}
+          onSubmit={(orderData) => {
+            handleAddOrder(orderData);
+            setShowOrderForm(false);
+          }}
+        />
       )}
 
       {selectedOrder && (
@@ -803,6 +924,24 @@ const Dashboard: React.FC = () => {
           onAfterSaveDraft={async () => {
             await fetchOrders();
           }}
+        />
+      )}
+
+      {/* Invoice Modal */}
+      {showInvoiceModal && invoiceOrderId && (
+        <CreateInvoiceModal
+          orderId={invoiceOrderId}
+          onClose={() => { setShowInvoiceModal(false); setInvoiceOrderId(null); }}
+          onSuccess={() => { setShowInvoiceModal(false); setInvoiceOrderId(null); fetchOrders(); }}
+        />
+      )}
+
+      {/* Payment Modal */}
+      {showPaymentModal && paymentInvoiceId && (
+        <PaymentCapture
+          invoiceId={paymentInvoiceId}
+          onClose={() => { setShowPaymentModal(false); setPaymentInvoiceId(null); }}
+          onSuccess={() => { setShowPaymentModal(false); setPaymentInvoiceId(null); fetchOrders(); }}
         />
       )}
     </div>
