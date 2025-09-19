@@ -311,7 +311,11 @@ const Reports: React.FC = () => {
         };
         map.set(r.order_id, group);
       } else {
-        group.results.push(r);
+        // Check if this result_id already exists to prevent duplicates
+        const existingResult = group.results.find(existing => existing.result_id === r.result_id);
+        if (!existingResult) {
+          group.results.push(r);
+        }
         if (!group.sample_ids.includes(r.sample_id)) group.sample_ids.push(r.sample_id);
         if (!group.test_names.includes(r.test_name)) group.test_names.push(r.test_name);
         if (new Date(r.verified_at) > new Date(group.verified_at)) {
@@ -420,7 +424,12 @@ const Reports: React.FC = () => {
       flag?: string;
     }[] = [];
 
-    for (const r of group.results) {
+    // Deduplicate results by result_id to prevent processing the same result multiple times
+    const uniqueResults = group.results.filter((result, index, self) => 
+      index === self.findIndex(r => r.result_id === result.result_id)
+    );
+
+    for (const r of uniqueResults) {
       try {
         const { data: values, error } = await supabase
           .from('result_values')
@@ -431,13 +440,21 @@ const Reports: React.FC = () => {
           console.warn('Failed to fetch result values for', r.result_id, error);
         } else {
           (values || []).forEach((v: any) => {
-            analyteRows.push({
-              parameter: `${r.test_name} - ${v.parameter}`,
-              result: v.value,
-              unit: v.unit || '',
-              referenceRange: v.reference_range || '',
-              flag: v.flag || ''
-            });
+            // Additional check to prevent duplicate parameters within the same test
+            const parameterKey = `${r.test_name} - ${v.parameter}`;
+            const existingParam = analyteRows.find(row => row.parameter === parameterKey);
+            
+            if (!existingParam) {
+              analyteRows.push({
+                parameter: parameterKey,
+                result: v.value,
+                unit: v.unit || '',
+                referenceRange: v.reference_range || '',
+                flag: v.flag || ''
+              });
+            } else {
+              console.warn(`Duplicate parameter detected and skipped: ${parameterKey}`);
+            }
           });
         }
       } catch (e) {
@@ -512,8 +529,11 @@ const Reports: React.FC = () => {
             {
               order_id: orderId,
               patient_id: group.patient_id,
-              status: 'Generated',
+              doctor: group.results[0]?.doctor || 'Unknown',
+              status: 'pending',
+              report_status: 'generating',
               generated_date: new Date().toISOString(),
+              report_type: group.is_report_ready ? 'final' : 'draft',
               notes: JSON.stringify({
                 test_names: group.test_names,
                 sample_ids: group.sample_ids,

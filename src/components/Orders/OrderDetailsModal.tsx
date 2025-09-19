@@ -43,6 +43,8 @@ import { calculateFlagsForResults } from "../../utils/flagCalculation";
 import { ResultAudit } from "./ResultAudit"; // expects named export
 import AIProcessingProgress, { AIStep } from "./AIProcessingProgress"; // adjust path if needed
 import PopoutInput from "./PopoutInput";
+import QuickStatusButtons from "./QuickStatusButtons";
+import { useOrderStatusCentral } from "../../hooks/useOrderStatusCentral";
 
 // ===========================================================
 // #region Types
@@ -327,6 +329,46 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
   const [aiProgress, setAiProgress] = useState(0);
   const [aiMatchedCount, setAiMatchedCount] = useState(0);
   const aiLogRef = React.useRef<HTMLDivElement>(null);
+
+  // Centralized status updater (for quick buttons and collection actions)
+  const { markSampleCollected: markCollectedCentral } = useOrderStatusCentral();
+  const [updatingCollection, setUpdatingCollection] = useState(false);
+
+  const handleMarkSampleCollected = async () => {
+    try {
+      setUpdatingCollection(true);
+      const res = await markCollectedCentral(order.id);
+      if (!res.success) {
+        alert(res.message);
+        return;
+      }
+      await database.orders.checkAndUpdateStatus(order.id);
+      if (onUpdateStatus) await onUpdateStatus(order.id, "Sample Collection");
+    } catch (e) {
+      console.error("Error marking sample collected:", e);
+      alert("Failed to mark sample collected");
+    } finally {
+      setUpdatingCollection(false);
+    }
+  };
+
+  const handleMarkSampleNotCollected = async () => {
+    try {
+      setUpdatingCollection(true);
+      const { error } = await database.orders.markSampleNotCollected(order.id);
+      if (error) {
+        console.error("Error marking not collected:", error);
+        alert("Failed to mark as not collected");
+        return;
+      }
+      if (onUpdateStatus) await onUpdateStatus(order.id, "Pending Collection");
+    } catch (e) {
+      console.error("Error marking sample not collected:", e);
+      alert("Failed to mark sample not collected");
+    } finally {
+      setUpdatingCollection(false);
+    }
+  };
 
   React.useEffect(() => {
     if (aiPhase === "running" && aiLogRef.current) {
@@ -1467,7 +1509,40 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
     return (
       <div className="border border-gray-200 rounded-lg p-4 mb-4">
         <div className="flex items-center justify-between mb-4">
-          <h4 className="text-lg font-medium">{testGroup.test_group_name}</h4>
+          <div className="flex items-center space-x-4">
+            <h4 className="text-lg font-medium">{testGroup.test_group_name}</h4>
+            
+            {/* Sample Collection Status */}
+            <div className="flex items-center gap-2">
+              <span className={`px-2 py-1 rounded-full text-xs font-medium ${
+                order.sample_collected_at 
+                  ? 'bg-green-100 text-green-800' 
+                  : 'bg-yellow-100 text-yellow-800'
+              }`}>
+                {order.sample_collected_at ? 'Sample Collected' : 'Sample Pending'}
+              </span>
+              
+              {/* Sample Collection Action Buttons */}
+              {order.sample_collected_at ? (
+                <button
+                  onClick={handleMarkSampleNotCollected}
+                  disabled={updatingCollection}
+                  className="px-3 py-1 text-xs bg-red-100 text-red-700 rounded hover:bg-red-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {updatingCollection ? 'Updating...' : 'Mark Not Collected'}
+                </button>
+              ) : (
+                <button
+                  onClick={handleMarkSampleCollected}
+                  disabled={updatingCollection}
+                  className="px-3 py-1 text-xs bg-green-100 text-green-700 rounded hover:bg-green-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {updatingCollection ? 'Updating...' : 'Mark Collected'}
+                </button>
+              )}
+            </div>
+          </div>
+          
           <div className="flex items-center space-x-3">
             <span className="text-sm text-gray-500">
               {completedCount}/{testGroupValues.length} completed • {pendingCount} pending
@@ -1523,13 +1598,13 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
             <tbody className="bg-white divide-y divide-gray-200">
               {testGroupValues.map((value) => {
                 const globalIndex = manualValues.findIndex((v) => v.parameter === value.parameter);
-                const analyte = testGroup.analytes.find((a) => a.name === value.parameter);
-
                 return (
-                  <tr key={`${testGroup.test_group_id}-${value.parameter}`} className="hover:bg-gray-50">
-                    <td className="px-4 py-3 text-sm font-medium text-gray-900">
-                      <div className="whitespace-nowrap">{value.parameter}</div>
-                      <div className="text-xs text-gray-500">({analyte?.code})</div>
+                  <tr key={value.parameter} className="hover:bg-gray-50">
+                    {/* Parameter Name */}
+                    <td className="px-4 py-3 min-w-[200px]">
+                      <div className="font-medium text-gray-900">
+                        {value.parameter}
+                      </div>
                     </td>
                     
                     {/* ✅ Pop-out Value Input */}
@@ -1676,18 +1751,15 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                     Open Result Audit
                   </button>
                 </div>
-                <div className="flex flex-wrap gap-2 sm:gap-3 mt-3">
-                  {getAvailableStatusActions(order.status, order).map((action) => (
-                    <button
-                      key={action.status}
-                      onClick={() => onUpdateStatus(order.id, action.status)}
-                      className={`px-3 sm:px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-                        action.primary ? "bg-blue-600 text-white hover:bg-blue-700" : "bg-gray-100 text-gray-700 hover:bg-gray-200"
-                      }`}
-                    >
-                      {action.label}
-                    </button>
-                  ))}
+                <div className="mt-3">
+                  <QuickStatusButtons
+                    orderId={order.id}
+                    currentStatus={order.status}
+                    onStatusChanged={async () => {
+                      // Parent will refresh and/or close
+                      if (onUpdateStatus) await onUpdateStatus(order.id, order.status);
+                    }}
+                  />
                 </div>
               </div>
 

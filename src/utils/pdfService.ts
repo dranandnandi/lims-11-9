@@ -949,7 +949,7 @@ export const downloadLargePDFWithProgress = async (
 };
 
 // Main PDF generation function with comprehensive error handling and authentication
-export async function generateAndSavePDFReport(orderId: string, reportData: ReportData): Promise<string | null> {
+export async function generateAndSavePDFReport(orderId: string, reportData: ReportData, isDraft = false): Promise<string | null> {
   console.log('generateAndSavePDFReport called for order:', orderId);
   
   // Check authentication for database operations only
@@ -995,7 +995,7 @@ export async function generateAndSavePDFReport(orderId: string, reportData: Repo
           doctor: orderData.doctor || 'Unknown',
           status: 'pending',
           generated_date: new Date().toISOString(),
-          report_type: 'Laboratory Report',
+          report_type: isDraft ? 'draft' : 'final',
           report_status: 'generating'
         })
         .select()
