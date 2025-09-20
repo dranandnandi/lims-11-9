@@ -1,72 +1,401 @@
-import React, { useState, useCallback, useMemo } from 'react';
+import React, { useState } from 'react';
 import { 
-  Search, 
-  Filter, 
-  CheckCircle, 
-  Clock as ClockIcon, 
-  AlertTriangle, 
-  FileText, 
-  Download, 
-  Eye, 
-  Brain, 
-  Paperclip, 
-  User, 
-  Calendar, 
-  TestTube, 
-  Activity, 
-  TrendingUp, 
-  ChevronDown, 
-  ChevronUp,
-  ChevronRight,
-  XCircle,
-  AlertCircle,
-  Copy,
-  CheckSquare,
-  Square,
-  RefreshCw,
-  ArrowUp,
-  ArrowDown
+  FileText,
+  Brain,
+  TestTube,
+  Activity,
+  RefreshCw
 } from 'lucide-react';
 import { Result, initializeStorage } from '../utils/localStorage';
 import { database, supabase } from '../utils/supabase';
 import { useAuth } from '../contexts/AuthContext';
-import { calculateFlag, hasAbnormalFlags, getFlagColor } from '../utils/flagCalculation';
-import AIToolsModal from '../components/Results/AIToolsModal';
+import { hasAbnormalFlags } from '../utils/flagCalculation';
 
-interface VerificationStats {
-  pending_count: number;
-  approved_count: number;
-  rejected_count: number;
-  clarification_count: number;
-  urgent_count: number;
-  avg_verification_time_hours: number;
+// Import Entry Mode Components
+// import OrderSelector from '../components/Results/EntryMode/OrderSelector';
+import AIUploadPanel from '../components/Results/EntryMode/AIUploadPanel';
+import ManualEntryForm from '../components/Results/EntryMode/ManualEntryForm';
+import WorkflowPanel from '../components/Results/EntryMode/WorkflowPanel';
+import DepartmentView from '../components/Results/EntryMode/DepartmentView';
+import EnhancedViewSelector from '../components/Results/EnhancedViewSelector';
+import ResultStatsDashboard from '../components/Results/ResultStatsDashboard';
+import BatchOperations from '../components/Results/BatchOperations';
+// QuickActionToolbar intentionally disabled to avoid scroll issues
+
+// Verification stats interface kept for future use
+// interface VerificationStats {
+//   pending_count: number;
+//   approved_count: number;
+//   rejected_count: number;
+//   clarification_count: number;
+//   urgent_count: number;
+//   avg_verification_time_hours: number;
+// }
+
+// Enhanced types for the new entry system
+interface OrderTestProgress {
+  order_id: string;
+  patient_id: string;
+  patient_name: string;
+  sample_id: string;
+  order_status: string;
+  priority: string;
+  test_group_id: string;
+  test_group_name: string;
+  department: string;
+  total_analytes: number;
+  completed_analytes: number;
+  panel_status: 'not_started' | 'in_progress' | 'completed';
+  completion_percentage: number;
+  workflow_eligible: boolean;
+  last_activity: string;
+  hours_since_order: number;
 }
 
-type ViewMode = 'cards' | 'verification' | 'console';
+interface OrderWithProgress {
+  id: string;
+  patient_name: string;
+  patient_id?: string; // Add this
+  age?: number;
+  sample_id: string;
+  priority: string;
+  status: string;
+  created_at: string;
+  lab_id?: string; // Add this
+  color_code?: string | null;
+  color_name?: string | null;
+  testGroups: OrderTestProgress[];
+  totalTests: number;
+  completedTests: number;
+  percentComplete: number;
+}
+
+interface ProcessingStatus {
+  id: string;
+  status: 'uploading' | 'processing' | 'completed' | 'failed';
+  progress: number;
+  message?: string;
+  results?: any[];
+}
+
+type ViewMode = 'entry' | 'review';
+type EntryViewMode = 'order-based' | 'test-group' | 'department';
+type EntryMethod = 'ai-upload' | 'manual' | 'workflow';
 
 const Results: React.FC = () => {
-  const { user } = useAuth();
+  useAuth();
   const [results, setResults] = useState<Result[]>([]);
-  const [verificationStats, setVerificationStats] = useState<VerificationStats | null>(null);
+  // const [verificationStats, setVerificationStats] = useState<VerificationStats | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
-  const [selectedStatus, setSelectedStatus] = useState('All');
-  const [filterDate, setFilterDate] = useState('today');
-  const [filterUrgency, setFilterUrgency] = useState('all');
-  const [selectedResult, setSelectedResult] = useState<Result | null>(null);
-  const [showAITools, setShowAITools] = useState(false);
-  const [aiEnhancedResults, setAIEnhancedResults] = useState<{[key: string]: any}>({});
-  const [isReverting, setIsReverting] = useState(false);
-  const [expandedDetails, setExpandedDetails] = useState<{[key: string]: boolean}>({});
-  const [selectedResultIds, setSelectedResultIds] = useState<Set<string>>(new Set());
-  const [verificationNotes, setVerificationNotes] = useState('');
-  const [viewMode, setViewMode] = useState<ViewMode>('cards');
+  // Unused legacy states removed during entry-mode refactor
+  const [viewMode, setViewMode] = useState<ViewMode>('entry');
   const [loading, setLoading] = useState(false);
+
+  // New state for entry mode
+  const [entryViewMode, setEntryViewMode] = useState<EntryViewMode>('order-based');
+  const [entryMethod, setEntryMethod] = useState<EntryMethod>('ai-upload');
+  const [selectedOrder, setSelectedOrder] = useState<OrderWithProgress | null>(null);
+  // Removed unused local states from earlier implementations
+  const [, setProcessingStatus] = useState<ProcessingStatus | null>(null);
+  const [selectedDepartment, setSelectedDepartment] = useState<string | null>(null);
+  const [availableTestGroups, setAvailableTestGroups] = useState<{ id: string; name: string; department: string }[]>([]);
+  const [selectedTestGroupId, setSelectedTestGroupId] = useState<string | null>(null);
+  const [currentLabId, setCurrentLabId] = useState<string>('');
+
+  // Enhanced filter state
+  const [filters, setFilters] = useState({
+    mode: viewMode,
+    entrySubMode: entryViewMode,
+    searchTerm: '',
+    department: null as string | null,
+    status: 'pending',
+    priority: 'all',
+    dateRange: 'today',
+    dateFrom: '' as string | null,
+    dateTo: '' as string | null,
+    urgentOnly: false,
+    workflowEligibleOnly: false
+  });
+
+  // Available departments (derived from data)
+  const [availableDepartments, setAvailableDepartments] = useState<string[]>([]);
+
+  // Batch operations state
+  const [showBatchOperations, setShowBatchOperations] = useState(false);
+  const [selectedForBatch, setSelectedForBatch] = useState<Set<string>>(new Set());
+
+  // Real-time updates state
+  const [realTimeNotification, setRealTimeNotification] = useState<{
+    message: string;
+    type: 'info' | 'success' | 'warning';
+    timestamp: Date;
+  } | null>(null);
+  const [showStats, setShowStats] = useState(false);
+
+  // Performance optimization state
+  const [pagination, setPagination] = useState({
+    page: 1,
+    pageSize: 50,
+    total: 0
+  });
+  const [, setLoadingMore] = useState(false);
+
+  // helper: compute age from yyyy-mm-dd
+  const calculateAge = (dobIso: string): number => {
+    const dob = new Date(dobIso);
+    const today = new Date();
+    let age = today.getFullYear() - dob.getFullYear();
+    const m = today.getMonth() - dob.getMonth();
+    if (m < 0 || (m === 0 && today.getDate() < dob.getDate())) {
+      age--;
+    }
+    return age;
+  };
 
   // Load results from localStorage on component mount
   React.useEffect(() => {
     initializeStorage(); // Initialize local storage for other data (e.g., analytes, test groups)
     fetchResults();
+    fetchDepartments();
+    fetchTestGroups();
+    setupRealTimeSubscriptions();
+    database.getCurrentUserLabId().then(id => setCurrentLabId(id || ''));
+    
+    // Cleanup subscriptions on unmount
+    return () => {
+      cleanupSubscriptions();
+    };
   }, []);
+
+  // Refetch data when view mode changes
+  React.useEffect(() => {
+    fetchResults(); // Refetch appropriate data for the current view mode
+  }, [viewMode]);
+
+  // Real-time subscription management
+  const [subscriptions, setSubscriptions] = useState<any[]>([]);
+
+  const setupRealTimeSubscriptions = async () => {
+    const userLabId = await database.getCurrentUserLabId();
+    if (!userLabId) return;
+
+    // Subscribe to results table changes
+    const resultsSubscription = supabase
+      .channel('results-changes')
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'results',
+          filter: `lab_id=eq.${userLabId}`
+        },
+        (payload) => {
+          console.log('Results table change detected:', payload);
+          handleResultsRealTimeUpdate(payload);
+        }
+      )
+      .subscribe();
+
+    // Subscribe to result_values table changes
+    const resultValuesSubscription = supabase
+      .channel('result-values-changes')
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'result_values'
+        },
+        (payload: any) => {
+          console.log('Result values change detected:', payload);
+          handleResultValuesRealTimeUpdate();
+        }
+      )
+      .subscribe();
+
+    // Subscribe to orders table changes for status updates
+    const ordersSubscription = supabase
+      .channel('orders-changes')
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'orders',
+          filter: `lab_id=eq.${userLabId}`
+        },
+        (payload: any) => {
+          console.log('Order status change detected:', payload);
+          handleOrderStatusRealTimeUpdate(payload);
+        }
+      )
+      .subscribe();
+
+    setSubscriptions([resultsSubscription, resultValuesSubscription, ordersSubscription]);
+  };
+
+  const cleanupSubscriptions = () => {
+    subscriptions.forEach(subscription => {
+      supabase.removeChannel(subscription);
+    });
+    setSubscriptions([]);
+  };
+
+  const handleResultsRealTimeUpdate = (payload: any) => {
+    const { eventType, new: newRecord, old: oldRecord } = payload as {
+      eventType: 'INSERT' | 'UPDATE' | 'DELETE';
+      new: any;
+      old: any;
+    };
+    
+    // Show notification
+    const notificationMessage = {
+      INSERT: 'New result added',
+      UPDATE: 'Result updated',
+      DELETE: 'Result deleted'
+    }[eventType] || 'Result changed';
+    
+    setRealTimeNotification({
+      message: notificationMessage,
+      type: eventType === 'DELETE' ? 'warning' : 'info',
+      timestamp: new Date()
+    });
+    
+    // Clear notification after 3 seconds
+    setTimeout(() => setRealTimeNotification(null), 3000);
+    
+    setResults(prevResults => {
+      switch (eventType) {
+        case 'INSERT':
+          // Add new result if it doesn't exist
+          const existsInsert = prevResults.some(r => r.id === newRecord.id);
+          if (!existsInsert) {
+            const newResult = mapResultFromDatabase(newRecord);
+            return [...prevResults, newResult];
+          }
+          return prevResults;
+          
+        case 'UPDATE':
+          // Update existing result
+          return prevResults.map(result => 
+            result.id === newRecord.id 
+              ? { ...result, ...mapResultFromDatabase(newRecord) }
+              : result
+          );
+          
+        case 'DELETE':
+          // Remove deleted result
+          return prevResults.filter(result => result.id !== oldRecord.id);
+          
+        default:
+          return prevResults;
+      }
+    });
+  };
+
+  const handleResultValuesRealTimeUpdate = () => {
+    // Show notification for value changes
+    setRealTimeNotification({
+      message: 'Result values updated',
+      type: 'success',
+      timestamp: new Date()
+    });
+    
+    // Clear notification after 3 seconds
+    setTimeout(() => setRealTimeNotification(null), 3000);
+    
+    // Refresh the entire results list when result values change
+    // This ensures we get the latest values with proper joins
+    fetchResults();
+  };
+
+  const handleOrderStatusRealTimeUpdate = (payload: any) => {
+    const { new: newRecord } = payload;
+    
+    // Show notification for order status changes
+    setRealTimeNotification({
+      message: `Order status updated to ${newRecord.status}`,
+      type: 'info',
+      timestamp: new Date()
+    });
+    
+    // Clear notification after 3 seconds
+    setTimeout(() => setRealTimeNotification(null), 3000);
+    
+    // Update any orders in our current view
+    setSelectedOrder(prevOrder => {
+      if (prevOrder && prevOrder.id === newRecord.id) {
+        return {
+          ...prevOrder,
+          status: newRecord.status
+        };
+      }
+      return prevOrder;
+    });
+    
+    // Also refresh the results to get updated order status
+    fetchResults();
+  };
+
+  const mapResultFromDatabase = (dbResult: any): Result => {
+    return {
+      id: dbResult.id,
+      orderId: dbResult.order_id,
+      patientId: dbResult.patient_id,
+      patientName: dbResult.patient_name || 'Unknown Patient',
+      testName: dbResult.test_name || 'Unknown Test',
+      status: dbResult.status,
+      enteredBy: dbResult.entered_by,
+      enteredDate: dbResult.entered_date,
+      reviewedBy: dbResult.reviewed_by,
+      reviewedDate: dbResult.reviewed_date,
+      attachmentId: dbResult.attachment_id,
+      values: [] // Will be populated by separate query or from joined data
+    };
+  };
+
+  // Fetch available departments
+  const fetchDepartments = async () => {
+    try {
+      const userLabId = await database.getCurrentUserLabId();
+      if (!userLabId) return;
+
+      const { data, error } = await supabase
+        .from('v_order_test_progress_enhanced')
+        .select('department')
+        .eq('lab_id', userLabId);
+
+      if (error) throw error;
+
+      const uniqueDepartments = Array.from(new Set(data?.map((row: any) => row.department) || [])) as string[];
+      setAvailableDepartments(uniqueDepartments.sort());
+    } catch (error) {
+      console.error('Error fetching departments:', error);
+    }
+  };
+
+  // Fetch available test groups
+  const fetchTestGroups = async () => {
+    try {
+      const userLabId = await database.getCurrentUserLabId();
+      if (!userLabId) return;
+      const { data, error } = await supabase
+        .from('v_order_test_progress_enhanced')
+        .select('test_group_id, test_group_name, department')
+        .eq('lab_id', userLabId);
+      if (error) throw error;
+      const map = new Map<string, { id: string; name: string; department: string }>();
+      (data || []).forEach((r: any) => {
+        if (!map.has(r.test_group_id)) {
+          map.set(r.test_group_id, { id: r.test_group_id, name: r.test_group_name, department: r.department });
+        }
+      });
+      setAvailableTestGroups(Array.from(map.values()));
+    } catch (e) {
+      console.error('Error fetching test groups:', e);
+    }
+  };
 
   // Enhanced summary statistics with verification stats
   const summaryStats = React.useMemo(() => {
@@ -96,1294 +425,929 @@ const Results: React.FC = () => {
     };
   }, [results]);
 
-  const fetchResults = async () => {
+  const fetchResults = async (page = 1, append = false) => {
     try {
-      setLoading(true);
+      setLoading(!append);
+      if (append) setLoadingMore(true);
       
-      // Fetch results with enhanced verification data
-      const { data, error } = await database.results.getAll();
-      if (error) {
-        console.error('Error loading results:', error);
-      } else if (data) {
-        // Map result_values to 'values' property and consolidate by order+test
-        const allResults = data.map((result: any) => ({
-          id: result.id,
-          orderId: result.order_id,
-          patientId: result.patient_id,
-          patientName: result.patient_name,
-          testName: result.test_name,
-          status: result.status,
-          enteredBy: result.entered_by,
-          enteredDate: result.entered_date,
-          reviewedBy: result.reviewed_by,
-          reviewedDate: result.reviewed_date,
-          notes: result.notes,
-          attachmentId: result.attachment_id,
-          priority: result.priority || 'Normal',
-          critical_flag: result.critical_flag || false,
-          delta_check_flag: result.delta_check_flag || false,
-          values: result.result_values ? result.result_values.map((val: any) => ({
-            parameter: val.parameter,
-            value: val.value,
-            unit: val.unit,
-            reference: val.reference_range,
-            flag: val.flag
-          })) : [],
-        }));
-        
-        // Consolidate results by orderId + testName, keeping only the most recent
-        const consolidatedResults = new Map<string, any>();
-        
-        allResults.forEach(result => {
-          const compositeKey = `${result.orderId}-${result.testName}`;
-          const existingResult = consolidatedResults.get(compositeKey);
+      // Get user's lab ID
+      const userLabId = await database.getCurrentUserLabId();
+      if (!userLabId) {
+        console.error('User lab_id not available');
+        setLoading(false);
+        setLoadingMore(false);
+        return;
+      }
+      
+      // Calculate offset for pagination
+      const offset = (page - 1) * pagination.pageSize;
+      
+      // Entry mode: fetch worklist from v_order_test_progress_enhanced (not results)
+      if (viewMode === 'entry') {
+        // Fetch orders from the enhanced view that shows test progress
+        let query = supabase
+          .from('v_order_test_progress_enhanced')
+          .select(`*, order_test_id`, { count: 'exact' })
+          .eq('lab_id', userLabId)
+          .order('order_date', { ascending: false });
+
+        // Apply date range filters
+        const now = new Date();
+        const fmt = (d: Date) => d.toISOString().split('T')[0]; // YYYY-MM-DD
+        if (filters.dateRange === 'today') {
+          const todayStr = fmt(new Date());
+          query = query.eq('order_date', todayStr);
+        } else if (filters.dateRange === '7d') {
+          const start = new Date(now);
+          start.setDate(now.getDate() - 7);
+          query = query.gte('order_date', fmt(start)).lte('order_date', fmt(now));
+        } else if (filters.dateRange === '30d') {
+          const start = new Date(now);
+          start.setDate(now.getDate() - 30);
+          query = query.gte('order_date', fmt(start)).lte('order_date', fmt(now));
+        } else if (filters.dateRange === '90d') {
+          const start = new Date(now);
+          start.setDate(now.getDate() - 90);
+          query = query.gte('order_date', fmt(start)).lte('order_date', fmt(now));
+        } else if (filters.dateRange === 'custom' && filters.dateFrom && filters.dateTo) {
+          query = query.gte('order_date', filters.dateFrom).lte('order_date', filters.dateTo);
+        }
+        // Status filter mapping
+        if (filters.status === 'pending') {
+          query = query.neq('panel_status', 'completed');
+        } else if (filters.status === 'in_progress') {
+          query = query.eq('panel_status', 'in_progress');
+        } else if (filters.status === 'completed') {
+          query = query.eq('panel_status', 'completed');
+        }
+
+        // Department filter
+        if (filters.department) {
+          query = query.eq('department', filters.department);
+        }
+
+        // Priority filter mapping (normalize UI values to DB enum/text)
+        if (filters.priority && filters.priority !== 'all') {
+          const mapPriority = (p: string) => (
+            p === 'URGENT' ? 'Urgent' :
+            p === 'HIGH' ? 'High' :
+            p === 'NORMAL' ? 'Normal' : p
+          );
+          query = query.eq('priority', mapPriority(filters.priority));
+        }
+
+        // Urgent only: include STAT and Urgent
+        if (filters.urgentOnly) {
+          query = query.in('priority', ['STAT', 'Urgent']);
+        }
+
+        // Workflow eligible only
+        if (filters.workflowEligibleOnly) {
+          query = query.eq('workflow_eligible', true);
+        }
+
+        const { data, error, count } = await query.range(offset, offset + pagination.pageSize - 1);
+
+        if (error) {
+          console.error('Error loading orders for entry:', error);
+          setLoading(false);
+          setLoadingMore(false);
+          return;
+        }
+
+        if (data) {
+          // Group by order and create a consolidated view
+          const orderMap = new Map<string, any>();
           
-          if (!existingResult || new Date(result.enteredDate) > new Date(existingResult.enteredDate)) {
-            consolidatedResults.set(compositeKey, result);
+          data.forEach(row => {
+            if (!orderMap.has(row.order_id)) {
+              orderMap.set(row.order_id, {
+                id: row.order_id, // Map to expected Result interface
+                orderId: row.order_id,
+                patientName: row.patient_name,
+                patient_id: row.patient_id,
+                patientId: '', // Will be populated if needed
+                testName: row.test_group_name,
+                status: row.panel_status || 'Pending Entry',
+                enteredBy: '',
+                enteredDate: row.created_at,
+                reviewedBy: '',
+                reviewedDate: '',
+                values: [],
+                sampleId: row.sample_id,
+                priority: row.priority,
+                department: row.department,
+                workflowEligible: row.workflow_eligible,
+                percentComplete: row.completion_percentage,
+                testGroups: []
+              });
+            }
+            
+            // Add test group info
+            const order = orderMap.get(row.order_id);
+            order.testGroups.push({
+              test_group_id: row.test_group_id,
+              test_group_name: row.test_group_name,
+              department: row.department,
+              panel_status: row.panel_status,
+              completed_analytes: row.completed_analytes,
+              total_analytes: row.total_analytes,
+              workflow_eligible: row.workflow_eligible
+            });
+            // keep a reference to latest order_test_id at order level for convenience
+            order.last_order_test_id = row.order_test_id;
+          });
+
+          // Enrich with patient age and order color info
+          const ordersArray = Array.from(orderMap.values());
+          const uniquePatientIds = Array.from(new Set(ordersArray.map((o: any) => o.patient_id).filter(Boolean)));
+          const uniqueOrderIds = Array.from(new Set(ordersArray.map((o: any) => o.id)));
+
+          // Fetch patients DOB to compute age
+          if (uniquePatientIds.length > 0) {
+            const { data: patientsData } = await supabase
+              .from('patients')
+              .select('id, date_of_birth')
+              .in('id', uniquePatientIds);
+            const dobMap = new Map<string, string | null>((patientsData || []).map((p: any) => [p.id, p.date_of_birth]));
+            ordersArray.forEach((o: any) => {
+              const dob = o.patient_id ? dobMap.get(o.patient_id) : null;
+              o.age = dob ? calculateAge(dob) : undefined;
+            });
           }
-        });
-        
-        // Convert map values back to array and set state
-        const formattedData = Array.from(consolidatedResults.values());
-        setResults(formattedData);
-        
-        console.log(`Consolidated ${allResults.length} results into ${formattedData.length} unique entries`);
+
+          // Fetch color assignment for orders
+          if (uniqueOrderIds.length > 0) {
+            const { data: orderInfo } = await supabase
+              .from('orders')
+              .select('id, color_code, color_name')
+              .eq('lab_id', userLabId)
+              .in('id', uniqueOrderIds);
+            const colorMap = new Map<string, { color_code: string | null, color_name: string | null }>((orderInfo || []).map((o: any) => [o.id, { color_code: o.color_code, color_name: o.color_name }]));
+            ordersArray.forEach((o: any) => {
+              const c = colorMap.get(o.id);
+              o.color_code = c?.color_code || null;
+              o.color_name = c?.color_name || null;
+            });
+          }
+
+          const ordersAsResults = Array.from(orderMap.values());
+          
+          if (append) {
+            setResults(prev => [...prev, ...ordersAsResults]);
+          } else {
+            setResults(ordersAsResults);
+          }
+          
+          setPagination(prev => ({
+            ...prev,
+            total: count || 0,
+            page: page
+          }));
+        }
+      } else {
+        // For review/verification modes: defer implementation (keep placeholder view); don't fetch results here to avoid coupling
+        setResults([]);
       }
 
-      // Fetch verification stats
-      try {
-        const { data: stats } = await supabase
-          .from('view_verification_stats')
-          .select('*')
-          .single();
-        if (stats) setVerificationStats(stats);
-      } catch (statsError) {
-        console.warn('Could not load verification stats:', statsError);
-      }
+      // Note: verification stats load removed in entry-mode focus
     } catch (err) {
       console.error('Error fetching results:', err);
     } finally {
       setLoading(false);
+      setLoadingMore(false);
     }
   };
 
-  const toggleDetails = (resultId: string) => {
-    setExpandedDetails(prev => ({
-      ...prev,
-      [resultId]: !prev[resultId]
-    }));
+  // Filter and view mode handlers
+  const handleFiltersChange = (newFilters: Partial<typeof filters>, refreshNow: boolean = false) => {
+    setFilters(prev => ({ ...prev, ...newFilters }));
+    
+    // Update related state variables for backward compatibility
+    if (newFilters.searchTerm !== undefined) setSearchTerm(newFilters.searchTerm);
+    if (newFilters.department !== undefined) setSelectedDepartment(newFilters.department);
+    // Auto-refresh when any server-side filter changes
+    if (
+      refreshNow ||
+      'status' in newFilters ||
+      'dateRange' in newFilters ||
+      'department' in newFilters ||
+      'dateFrom' in newFilters ||
+      'dateTo' in newFilters ||
+      'priority' in newFilters ||
+      'urgentOnly' in newFilters ||
+      'workflowEligibleOnly' in newFilters
+    ) {
+      setTimeout(() => fetchResults(), 0);
+    }
   };
 
-  const handleApproveResult = async (resultId: string) => {
-    const resultToUpdate = results.find(result => result.id === resultId);
-    if (!resultToUpdate) return;
+  const handleViewModeChange = (mode: 'entry' | 'review') => {
+    setViewMode(mode);
+    setFilters(prev => ({ ...prev, mode }));
+  };
 
-    const updatedResultData = {
-      status: 'Approved' as const,
-      reviewed_by: user?.email || 'System',
-      reviewed_date: new Date().toISOString().split('T')[0],
+  const handleEntryViewModeChange = (mode: 'order-based' | 'test-group' | 'department') => {
+    setEntryViewMode(mode);
+    setFilters(prev => ({ ...prev, entrySubMode: mode }));
+  };
+
+  // Calculate result counts for view mode selector
+  const resultCounts = React.useMemo(() => {
+    return {
+      entry: results.filter(r => r.status === 'Entered' || r.status === 'Under Review').length,
+      review: results.filter(r => r.status === 'Under Review').length
     };
+  }, [results]);
 
+  // Entry Mode Functions
+  const handleOrderSelect = (order: OrderWithProgress) => {
+    setSelectedOrder(order);
+  };
+
+  const handleUploadComplete = (uploadResults: any[]) => {
+    console.log('Upload completed:', uploadResults);
+    // Refresh results
+    fetchResults();
+  };
+
+  const handleManualEntrySubmit = (entryResults: any[]) => {
+    console.log('Manual entry completed:', entryResults);
+    // Refresh results
+    fetchResults();
+  };
+
+  const handleWorkflowComplete = (workflowResults: any[]) => {
+    console.log('Workflow completed:', workflowResults);
+    // Refresh results
+    fetchResults();
+  };
+
+  // Batch Operations Handlers
+  const handleSelectAllForBatch = () => {
+    const allIds = new Set(results.map(r => r.id));
+    setSelectedForBatch(allIds);
+  };
+
+  const handleClearBatchSelection = () => {
+    setSelectedForBatch(new Set());
+  };
+
+  const handleBatchOperation = async (operationId: string, selectedIds: string[]) => {
     try {
-      const { data, error } = await database.results.update(resultId, updatedResultData);
-      if (error) {
-        console.error('Error approving result:', error);
-        return;
+      console.log(`Executing batch operation ${operationId} on ${selectedIds.length} items`);
+      
+      switch (operationId) {
+        case 'approve':
+          // Implement batch approval
+          for (const id of selectedIds) {
+            await database.results.update(id, { status: 'Approved' });
+          }
+          break;
+          
+        case 'reject':
+          // Implement batch rejection - not a standard status, using Under Review instead
+          for (const id of selectedIds) {
+            await database.results.update(id, { status: 'Under Review' });
+          }
+          break;
+          
+        case 'mark-reviewed':
+          // Implement batch review marking
+          for (const id of selectedIds) {
+            await database.results.update(id, { status: 'Under Review' });
+          }
+          break;
+          
+        case 'export-csv':
+          // Implement CSV export
+          const selectedResults = results.filter(r => selectedIds.includes(r.id));
+          downloadCSV(selectedResults);
+          break;
+          
+        case 'print-reports':
+          // Implement batch printing
+          const reportData = results.filter(r => selectedIds.includes(r.id));
+          generatePrintReports(reportData);
+          break;
+          
+        default:
+          console.warn(`Unknown batch operation: ${operationId}`);
       }
       
-      // Update local state
-      setResults(prev => prev.map(r => r.id === resultId ? { ...r, ...data, values: r.values } : r)); // Preserve values array
-      
-      // Get the approved result (from updated local state)
-      const approvedResult = results.find(r => r.id === resultId); // Use the original result object to get patientId etc.
-      if (approvedResult) {      
-        // Create report for the approved result
-        createReportForResult(approvedResult);
-        
-        // The order status is automatically updated in database.results.update via checkAndUpdateStatus
-        console.log('Result approved and order status automatically checked');
-      }
-      
-      // Update selected result if it's the one being approved
-      if (selectedResult && selectedResult.id === resultId) {
-        setSelectedResult(prev => prev ? { ...prev, ...data, values: prev.values } : null);
-      }
-    } catch (err) {
-      console.error('Error during result approval:', err);
-    }
-  };
-
-  const createReportForResult = async (result: Result) => {
-    try {
-      // Get patient details from Supabase
-      const { data: patient, error: patientError } = await database.patients.getById(result.patientId);
-      if (patientError || !patient) {
-        console.error('Error fetching patient for report:', patientError);
-        return;
-      }
-      
-      // Create a new report in Supabase
-      const reportData = {
-        patient_id: result.patientId,
-        result_id: result.id,
-        status: 'Generated',
-        generated_date: new Date().toISOString(),
-        doctor: result.enteredBy || user?.email || 'System',
-      };
-      
-      await database.reports.create(reportData);
-    } catch (error) {
-      console.error('Error creating report:', error);
-    }
-  };
-
-  const handleRejectResult = async (resultId: string) => {
-    const resultToUpdate = results.find(result => result.id === resultId);
-    if (!resultToUpdate) return;
-
-    const updatedResultData = {
-      status: 'Entered' as const,
-      reviewed_by: user?.email || 'System',
-      reviewed_date: new Date().toISOString().split('T'),
-    };
-
-    try {
-      const { data, error } = await database.results.update(resultId, updatedResultData);
-      if (error) {
-        console.error('Error rejecting result:', error);
-        return;
-      }
-      
-      // Update local state
-      setResults(prev => prev.map(r => r.id === resultId ? { ...r, ...data, values: r.values } : r));
-      
-      // Update selected result if it's the one being rejected
-      if (selectedResult && selectedResult.id === resultId) {
-        setSelectedResult(prev => prev ? { ...prev, ...data, values: prev.values } : null);
-      }
-    } catch (err) {
-      console.error('Error during result rejection:', err);
-    }
-  };
-
-  const handleGenerateReport = async (resultId: string) => {
-    const resultToUpdate = results.find(result => result.id === resultId);
-    if (!resultToUpdate) return;
-
-    const updatedResultData = {
-      status: 'Reported' as const,
-    };
-
-    try {
-      const { data, error } = await database.results.update(resultId, updatedResultData);
-      if (error) {
-        console.error('Error generating report (updating result status):', error);
-        return;
-      }
-      
-      // Update local state
-      setResults(prev => prev.map(r => r.id === resultId ? { ...r, ...data, values: r.values } : r));
-      
-      // Update the corresponding order status to Delivered
-      const reportedResult = results.find(r => r.id === resultId);
-      if (reportedResult) {
-        // Update order status in Supabase
-        await database.orders.update(reportedResult.orderId, {
-          status: 'Delivered'
-        });
-        
-        // Update the report status in Supabase
-        updateReportStatus(reportedResult.id);
-      }
-      
-      // Update selected result if it's the one being reported
-      if (selectedResult && selectedResult.id === resultId) {
-        setSelectedResult(prev => prev ? { ...prev, ...data, values: prev.values } : null);
-      }
-      
-      // Close modal after generating report
-      setSelectedResult(null);
-    } catch (err) {
-      console.error('Error during report generation:', err);
-    }
-  };
-
-  const updateReportStatus = async (resultId: string) => {
-    try {
-      // Find the report with this result_id
-      const { data: reports, error } = await supabase
-        .from('reports')
-        .select('id')
-        .eq('result_id', resultId)
-        .limit(1);
-      
-      if (error) {
-        console.error('Error finding report:', error);
-        return;
-      }
-      
-      if (reports && reports.length > 0) {
-        // Update the report status to Delivered
-        const { error: updateError } = await supabase
-          .from('reports')
-          .update({
-          status: 'Delivered'
-        })
-          .eq('id', reports[0].id);
-        
-        if (updateError) {
-          console.error('Error updating report status:', updateError);
-        }
-      }
-    } catch (error) {
-      console.error('Error updating report status:', error);
-    }
-  };
-
-  const handleRevertToUnderReview = async (resultId: string) => {
-    setIsReverting(true);
-    try {
-      // Update the result status back to Under Review
-      const { error } = await database.results.update(resultId, {
-        status: 'Under Review'
-      });
-      
-      if (error) {
-        console.error('Error reverting result status:', error);
-        return;
-      }
-      
-      // Find the associated report
-      const { data: reports, error: reportError } = await supabase
-        .from('reports')
-        .select('id')
-        .eq('result_id', resultId)
-        .limit(1);
-      
-      if (reportError) {
-        console.error('Error finding associated report:', reportError);
-      } else if (reports && reports.length > 0) {
-        // Update the report status back to Generated
-        const { error: updateError } = await supabase
-          .from('reports')
-          .update({
-            status: 'Generated'
-          })
-          .eq('id', reports[0].id);
-        
-        if (updateError) {
-          console.error('Error updating report status:', updateError);
-        }
-      }
-      
-      // Update local state
-      setResults(prev => prev.map(r => r.id === resultId ? { ...r, status: 'Under Review' } : r));
-      
-      // Update selected result if it's the one being reverted
-      if (selectedResult && selectedResult.id === resultId) {
-        setSelectedResult(prev => prev ? { ...prev, status: 'Under Review' } : null);
-      }
-    } catch (err) {
-      console.error('Error during status reversion:', err);
-    } finally {
-      setIsReverting(false);
-    }
-  };
-
-  const handleOpenAITools = () => {
-    setShowAITools(true);
-  };
-
-  const handleAIResultGenerated = (aiData: any) => {
-    if (selectedResult) {
-      setAIEnhancedResults(prev => ({
-        ...prev,
-        [selectedResult.id]: aiData
-      }));
-      
-      // You could also update the result in localStorage here if needed
-      console.log('AI data generated for result:', selectedResult.id, aiData);
-    }
-  };
-
-  // Bulk verification functions
-  const bulkVerifyResults = async (status: 'verified' | 'rejected' | 'needs_clarification') => {
-    if (selectedResultIds.size === 0) return;
-
-    try {
-      const action = status === 'verified' ? 'approve' : status === 'rejected' ? 'reject' : 'clarify';
-      const resultIds = Array.from(selectedResultIds);
-      
-      // Try bulk RPC first
-      try {
-        const { error: bulkError } = await supabase.rpc('bulk_verify_results', {
-          p_result_ids: resultIds,
-          p_action: action,
-          p_comment: verificationNotes
-        });
-        if (!bulkError) {
-          await fetchResults();
-          setSelectedResultIds(new Set());
-          setVerificationNotes('');
-          return;
-        }
-      } catch (e) {
-        console.warn('Bulk RPC unavailable, using individual calls');
-      }
-
-      // Fallback to individual calls
-      const promises = resultIds.map(resultId =>
-        supabase.rpc('verify_result', {
-          p_result_id: resultId,
-          p_action: action,
-          p_comment: verificationNotes
-        })
-      );
-
-      await Promise.all(promises);
+      // Refresh data and clear selection
       await fetchResults();
-      setSelectedResultIds(new Set());
-      setVerificationNotes('');
+      setSelectedForBatch(new Set());
+      setShowBatchOperations(false);
+      
     } catch (error) {
-      console.error('Error bulk verifying results:', error);
-      alert('Error verifying results. Please try again.');
+      console.error('Batch operation failed:', error);
+      throw error;
     }
   };
 
-  const statuses = ['All', 'Entered', 'Under Review', 'Approved', 'Reported'];
+  // Quick Action Handlers
+  // Quick actions removed with toolbar
 
-  // Enhanced filtering with verification-specific filters
-  const filteredResults = useMemo(() => {
-    return results.filter(result => {
-      const matchesSearch = result.patientName.toLowerCase().includes(searchTerm.toLowerCase()) ||
-                           result.orderId.toLowerCase().includes(searchTerm.toLowerCase()) ||
-                           result.testName.toLowerCase().includes(searchTerm.toLowerCase());
-      
-      const matchesStatus = selectedStatus === 'All' || result.status === selectedStatus;
-      
-      const matchesUrgency = filterUrgency === 'all' || 
-        (filterUrgency === 'urgent' && (result.critical_flag || result.priority === 'STAT')) ||
-        (filterUrgency === 'high' && result.priority === 'High') ||
-        (filterUrgency === 'normal' && result.priority === 'Normal');
+  // Utility functions
+  const downloadCSV = (data: any[]) => {
+    const csv = convertToCSV(data);
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    const url = URL.createObjectURL(blob);
+    link.setAttribute('href', url);
+    link.setAttribute('download', `results_export_${new Date().toISOString().split('T')[0]}.csv`);
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
 
-      const matchesDate = (() => {
-        if (filterDate === 'all') return true;
-        const resultDate = new Date(result.enteredDate);
-        const today = new Date();
-        const yesterday = new Date(today);
-        yesterday.setDate(yesterday.getDate() - 1);
-        
-        switch (filterDate) {
-          case 'today':
-            return resultDate.toDateString() === today.toDateString();
-          case 'yesterday':
-            return resultDate.toDateString() === yesterday.toDateString();
-          case 'week':
-            const weekAgo = new Date(today);
-            weekAgo.setDate(weekAgo.getDate() - 7);
-            return resultDate >= weekAgo;
-          default:
-            return true;
-        }
-      })();
+  const convertToCSV = (objArray: any[]) => {
+    const array = typeof objArray !== 'object' ? JSON.parse(objArray) : objArray;
+    let str = '';
+    
+    if (array.length > 0) {
+      const headers = Object.keys(array[0]);
+      str += headers.join(',') + '\r\n';
       
-      return matchesSearch && matchesStatus && matchesUrgency && matchesDate;
-    });
-  }, [results, searchTerm, selectedStatus, filterUrgency, filterDate]);
+      array.forEach((item: any) => {
+        let line = '';
+        headers.forEach((header, index) => {
+          if (index > 0) line += ',';
+          line += `"${item[header] || ''}"`;
+        });
+        str += line + '\r\n';
+      });
+    }
+    
+    return str;
+  };
 
-  // View mode components
-  const renderCardsView = () => (
-    <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-6">
-      {filteredResults.map((result) => {
-        const isAbnormal = hasAbnormalFlags(result.values.map(v => ({ 
-          ...v, 
-          reference_range: v.reference 
-        })));
-        
+  const generatePrintReports = (reportData: any[]) => {
+    // Create a new window for printing
+    const printWindow = window.open('', '_blank');
+    if (printWindow) {
+      printWindow.document.write(`
+        <html>
+          <head>
+            <title>Lab Results Report</title>
+            <style>
+              body { font-family: Arial, sans-serif; margin: 20px; }
+              .result { page-break-after: always; margin-bottom: 30px; }
+              .header { border-bottom: 2px solid #000; padding-bottom: 10px; margin-bottom: 20px; }
+              .values { margin-top: 20px; }
+              .value-row { display: flex; justify-content: space-between; padding: 5px 0; border-bottom: 1px solid #eee; }
+            </style>
+          </head>
+          <body>
+            ${reportData.map(result => `
+              <div class="result">
+                <div class="header">
+                  <h2>Lab Result Report</h2>
+                  <p><strong>Patient:</strong> ${result.patientName}</p>
+                  <p><strong>Test:</strong> ${result.testName}</p>
+                  <p><strong>Order ID:</strong> ${result.orderId}</p>
+                  <p><strong>Date:</strong> ${new Date(result.enteredDate).toLocaleDateString()}</p>
+                </div>
+                <div class="values">
+                  <h3>Results:</h3>
+                  ${result.values.map((value: any) => `
+                    <div class="value-row">
+                      <span><strong>${value.parameter}:</strong></span>
+                      <span>${value.value} ${value.unit || ''}</span>
+                      <span>${value.reference || ''}</span>
+                      <span>${value.flag || ''}</span>
+                    </div>
+                  `).join('')}
+                </div>
+              </div>
+            `).join('')}
+          </body>
+        </html>
+      `);
+      printWindow.document.close();
+      printWindow.print();
+    }
+  };
+
+  // Entry Mode Render Functions
+  const renderEntryMode = () => {
+    if (entryViewMode === 'order-based') {
+      // List-first: show only list when no selection; on selection, show full-width detail with Back
+      if (!selectedOrder) {
         return (
-          <div 
-            key={result.id} 
-            className={`bg-white border-2 rounded-lg p-4 hover:shadow-md transition-all cursor-pointer ${
-              isAbnormal ? 'border-red-200 bg-red-50' : 'border-gray-200'
-            } ${selectedResultIds.has(result.id) ? 'ring-2 ring-blue-300' : ''}`}
-            onClick={() => {
-              if (selectedResultIds.has(result.id)) {
-                setSelectedResultIds(prev => {
-                  const newSet = new Set(prev);
-                  newSet.delete(result.id);
-                  return newSet;
-                });
-              } else {
-                setSelectedResultIds(prev => new Set(prev).add(result.id));
-              }
-            }}
-          >
-            {/* Enhanced card content with verification status */}
-            <div className="flex items-start justify-between mb-3">
-              <div className="flex-1">
-                <div className="flex items-center space-x-2">
-                  {result.critical_flag && (
-                    <AlertTriangle className="h-4 w-4 text-red-500 flex-shrink-0" />
-                  )}
-                  <h4 className={`font-bold text-lg ${isAbnormal ? 'text-red-900' : 'text-gray-900'}`}>
-                    {result.testName}
-                  </h4>
-                  {result.priority === 'STAT' && (
-                    <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-orange-100 text-orange-800">
-                      STAT
-                    </span>
-                  )}
-                </div>
-              </div>
-              
-              <div className="flex items-center space-x-2">
-                <input
-                  type="checkbox"
-                  checked={selectedResultIds.has(result.id)}
-                  onChange={() => {}}
-                  className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                />
-                <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(result.status)}`}>
-                  {getStatusIcon(result.status)}
-                  <span className="ml-1">{result.status}</span>
-                </span>
-              </div>
-            </div>
-
-            {/* Patient Information */}
-            <div className="flex items-center space-x-2 mb-3">
-              <User className="h-4 w-4 text-blue-500" />
-              <span className="font-medium text-gray-900">{result.patientName}</span>
-              <span className="text-sm text-gray-500">• ID: {result.patientId}</span>
-            </div>
-
-            {/* Test Summary */}
-            <div className="bg-gray-50 rounded-lg p-3 mb-3">
-              <div className="flex items-center justify-between text-sm">
-                <div className="flex items-center space-x-4">
-                  <div className="flex items-center">
-                    <TestTube className="h-4 w-4 text-gray-400 mr-1" />
-                    <span className="text-gray-600">{result.values.length} parameters</span>
-                  </div>
-                  {abnormalCount > 0 && (
-                    <div className="flex items-center">
-                      <AlertTriangle className="h-4 w-4 text-red-500 mr-1" />
-                      <span className="text-red-600 font-medium">{abnormalCount} abnormal</span>
-                    </div>
-                  )}
-                  {normalCount > 0 && (
-                    <div className="flex items-center">
-                      <CheckCircle className="h-4 w-4 text-green-500 mr-1" />
-                      <span className="text-green-600">{normalCount} normal</span>
-                    </div>
-                  )}
-                </div>
-                
-                {/* Attachment Indicator */}
-                {result.attachmentId && (
-                  <div className="flex items-center text-blue-600">
-                    <Paperclip className="h-4 w-4 mr-1" />
-                    <span className="text-xs">Source Doc</span>
-                  </div>
-                )}
-              </div>
-              
-              {/* Expandable Parameter Details */}
-              {expandedDetails[result.id] && (
-                <div className="mt-3 pt-3 border-t border-gray-200">
-                  <div className="space-y-2">
-                    {result.values.slice(0, 5).map((value, index) => {
-                      const calculatedFlag = value.flag || calculateFlag(value.value, value.reference);
-                      return (
-                        <div key={index} className="flex items-center justify-between text-xs">
-                          <span className="font-medium text-gray-700">{value.parameter}</span>
-                          <div className="flex items-center space-x-2">
-                            <span className="font-bold">{value.value} {value.unit}</span>
-                            {calculatedFlag && (
-                              <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium ${getFlagColor(calculatedFlag)}`}>
-                                {calculatedFlag}
-                              </span>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    })}
-                    {result.values.length > 5 && (
-                      <div className="text-xs text-gray-500 text-center">
-                        +{result.values.length - 5} more parameters
+          <div className="space-y-3">
+            {/* Compact order cards */}
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+              {results
+                .filter((r: any) => (filters.searchTerm ? (r.patientName?.toLowerCase()?.includes(filters.searchTerm.toLowerCase())) : true))
+                .map((r: any) => (
+                  <button
+                    key={r.id}
+                    onClick={() => handleOrderSelect(r as any)}
+                    className="text-left p-3 border rounded-lg hover:bg-gray-50 bg-white"
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <span
+                          className="inline-block w-3 h-3 rounded-full border"
+                          style={{ backgroundColor: r.color_code || '#e5e7eb' }}
+                          title={r.color_name || 'Tube'}
+                        />
+                        <div className="font-medium text-gray-900">{r.patientName}</div>
+                        {typeof r.age === 'number' && (
+                          <div className="text-xs text-gray-500">• {r.age}y</div>
+                        )}
                       </div>
-                    )}
-                  </div>
+                      <div className="text-xs text-gray-500">{r.sampleId || 'No Sample'}</div>
+                    </div>
+                    <div className="mt-2 flex flex-wrap gap-1">
+                      {(r.testGroups || []).slice(0, 4).map((tg: any) => (
+                        <span key={tg.test_group_id} className="px-2 py-0.5 text-xs rounded-full border bg-gray-50 text-gray-700">
+                          {tg.test_group_name}
+                        </span>
+                      ))}
+                      {r.testGroups && r.testGroups.length > 4 && (
+                        <span className="px-2 py-0.5 text-xs rounded-full border bg-gray-50 text-gray-500">+{r.testGroups.length - 4} more</span>
+                      )}
+                    </div>
+                  </button>
+              ))}
+              {results.length === 0 && (
+                <div className="col-span-full text-sm text-gray-500 p-6 text-center border rounded-md bg-white">
+                  No orders for {filters.dateRange === 'today' ? 'Today' :
+                  filters.dateRange === '7d' ? 'Last 7 days' :
+                  filters.dateRange === '30d' ? 'Last 30 days' :
+                  filters.dateRange === '90d' ? 'Last 90 days' :
+                  filters.dateRange === 'all' ? 'All Dates' : 'selected range'}
+                  {filters.status === 'pending' ? ' (Pending)' : ''}
                 </div>
               )}
-              
-              {/* Toggle Details Button */}
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  toggleDetails(result.id);
-                }}
-                className="w-full mt-2 flex items-center justify-center text-xs text-gray-500 hover:text-gray-700 transition-colors"
-              >
-                {expandedDetails[result.id] ? (
-                  <>
-                    <ChevronUp className="h-3 w-3 mr-1" />
-                    Hide Details
-                  </>
-                ) : (
-                  <>
-                    <ChevronDown className="h-3 w-3 mr-1" />
-                    Show Details
-                  </>
-                )}
-              </button>
-            </div>
-
-            {/* Entry and Review Information */}
-            <div className="text-xs text-gray-600 mb-3">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center">
-                  <Activity className="h-3 w-3 mr-1" />
-                  <span>Tech: {result.enteredBy}</span>
-                </div>
-                <div className="flex items-center">
-                  <Calendar className="h-3 w-3 mr-1" />
-                  <span>{new Date(result.enteredDate).toLocaleDateString()}</span>
-                </div>
-              </div>
-              {result.reviewedBy && (
-                <div className="flex items-center justify-between mt-1">
-                  <div className="flex items-center">
-                    <CheckCircle className="h-3 w-3 mr-1 text-green-500" />
-                    <span>Reviewed: {result.reviewedBy}</span>
-                  </div>
-                  <span>{new Date(result.reviewedDate || '').toLocaleDateString()}</span>
-                </div>
-              )}
-            </div>
-
-            {/* Action Buttons */}
-            <div className="flex items-center justify-between pt-3 border-t border-gray-200">
-              <div className="flex items-center space-x-2">
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setSelectedResult(result);
-                  }}
-                  className="flex items-center px-2 py-1 text-xs bg-blue-100 text-blue-700 rounded hover:bg-blue-200 transition-colors"
-                >
-                  <Eye className="h-3 w-3 mr-1" />
-                  View
-                </button>
-                
-                <button 
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setSelectedResult(result);
-                    setShowAITools(true);
-                  }}
-                  className="flex items-center px-2 py-1 text-xs bg-purple-100 text-purple-700 rounded hover:bg-purple-200 transition-colors"
-                >
-                  <Brain className="h-3 w-3 mr-1" />
-                  AI Tools
-                </button>
-                
-                {result.attachmentId && (
-                  <button 
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setSelectedResult(result);
-                      setShowAITools(true);
-                    }}
-                    className="flex items-center px-2 py-1 text-xs bg-indigo-100 text-indigo-700 rounded hover:bg-indigo-200 transition-colors"
-                  >
-                    <Paperclip className="h-3 w-3 mr-1" />
-                    Source
-                  </button>
-                )}
-              </div>
-              
-              {/* Quick Actions */}
-              <div className="flex items-center space-x-1">
-                {result.status === 'Under Review' && (
-                  <button 
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleApproveResult(result.id);
-                    }}
-                    className="p-1 text-green-600 hover:text-green-800 hover:bg-green-100 rounded transition-colors"
-                    title="Approve Result"
-                  >
-                    <CheckCircle className="h-4 w-4" />
-                  </button>
-                )}
-              </div>
             </div>
           </div>
         );
-      })}
-    </div>
-  );
-
-  const renderVerificationView = () => (
-    <div className="flex h-[calc(100vh-300px)]">
-      {/* Left Panel - Results List */}
-      <div className="w-1/2 bg-white border-r flex flex-col">
-        <div className="flex-1 overflow-y-auto">
-          {filteredResults.map((result) => {
-            const isSelected = selectedResultIds.has(result.id);
-            const isExpanded = expandedDetails[result.id];
-            
-            return (
-              <div key={result.id} className="border-b">
-                <div className="p-4 hover:bg-gray-50">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center space-x-3">
-                      <button
-                        onClick={() => toggleDetails(result.id)}
-                        className="text-gray-400 hover:text-gray-600"
-                      >
-                        {isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
-                      </button>
-                      
-                      <input
-                        type="checkbox"
-                        checked={isSelected}
-                        onChange={(e) => {
-                          if (e.target.checked) {
-                            setSelectedResultIds(prev => new Set(prev).add(result.id));
-                          } else {
-                            setSelectedResultIds(prev => {
-                              const newSet = new Set(prev);
-                              newSet.delete(result.id);
-                              return newSet;
-                            });
-                          }
-                        }}
-                        className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                      />
-                      
-                      <div>
-                        <div className="font-medium text-gray-900">{result.testName}</div>
-                        <div className="text-sm text-gray-600">
-                          {result.patientName} • {result.orderId}
+      }
+      return (
+        <div className="space-y-6">
+          <div className="flex items-center justify-between">
+            <button
+              onClick={() => setSelectedOrder(null)}
+              className="text-sm px-3 py-1.5 border rounded-md hover:bg-gray-50"
+            >
+              ← Back to Orders
+            </button>
+            <div />
+          </div>
+          <div className="space-y-6">
+                {/* Order Header */}
+                <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
+                  <div className="flex justify-between items-start mb-4">
+                    <div>
+                      <h2 className="text-xl font-semibold text-gray-900">
+                        Result Entry - Order #{selectedOrder.id.slice(0, 8)}
+                      </h2>
+                      <div className="mt-1 text-sm text-gray-600">
+                        Patient: {selectedOrder.patient_name}
+                      </div>
+                      {selectedOrder.sample_id && (
+                        <div className="text-sm text-gray-500">
+                          Sample ID: {selectedOrder.sample_id}
                         </div>
-                      </div>
-                    </div
-                    
-                    <div className="flex items-center space-x-2">
-                      {result.critical_flag && (
-                        <span className="px-2 py-1 text-xs font-medium rounded-full text-red-600 bg-red-50">
-                          CRITICAL
-                        </span>
                       )}
-                      
-                      <div className="flex space-x-1">
-                        <button
-                          onClick={() => handleApproveResult(result.id)}
-                          className="px-2 py-1 text-xs bg-green-600 text-white rounded hover:bg-green-700"
+                    </div>
+                    <span className={`px-3 py-1 rounded-full text-sm ${
+                      selectedOrder.priority === 'STAT' 
+                        ? 'bg-red-100 text-red-700' 
+                        : selectedOrder.priority === 'Urgent'
+                        ? 'bg-orange-100 text-orange-700'
+                        : 'bg-gray-100 text-gray-700'
+                    }`}>
+                      {selectedOrder.priority}
+                    </span>
+                  </div>
+
+                  {/* Progress Overview */}
+                  <div className="mb-4">
+                    <div className="flex justify-between text-sm text-gray-600 mb-1">
+                      <span>Overall Progress</span>
+                      <span>{selectedOrder.percentComplete}%</span>
+                    </div>
+                    <div className="w-full bg-gray-200 rounded-full h-2">
+                      <div
+                        className={`h-2 rounded-full transition-all ${
+                          selectedOrder.percentComplete === 100 ? 'bg-green-500' : 'bg-blue-500'
+                        }`}
+                        style={{ width: `${selectedOrder.percentComplete}%` }}
+                      />
+                    </div>
+                  </div>
+
+                  {/* Test Groups */}
+                  <div className="space-y-2">
+                    <h4 className="font-medium text-gray-900">Test Groups</h4>
+                    <div className="grid gap-2">
+                      {selectedOrder.testGroups.map((testGroup) => (
+                        <div
+                          key={testGroup.test_group_id}
+                          className={`p-3 border rounded-lg ${
+                            testGroup.panel_status === 'completed'
+                              ? 'bg-green-50 border-green-200'
+                              : testGroup.panel_status === 'in_progress'
+                              ? 'bg-blue-50 border-blue-200'
+                              : 'bg-gray-50 border-gray-200'
+                          }`}
                         >
-                          Approve
-                        </button>
-                        <button
-                          onClick={() => handleRejectResult(result.id)}
-                          className="px-2 py-1 text-xs bg-red-600 text-white rounded hover:bg-red-700"
-                        >
-                          Reject
-                        </button>
-                      </div>
+                          <div className="flex justify-between items-center">
+                            <div>
+                              <div className="font-medium text-gray-900">
+                                {testGroup.test_group_name}
+                              </div>
+                              <div className="text-sm text-gray-600">
+                                {testGroup.department} • {testGroup.completed_analytes}/{testGroup.total_analytes} completed
+                              </div>
+                            </div>
+                            <div className="flex items-center space-x-2">
+                              {testGroup.workflow_eligible && (
+                                <span className="text-xs bg-purple-100 text-purple-700 px-2 py-1 rounded">
+                                  Workflow Ready
+                                </span>
+                              )}
+                              <span className={`text-xs px-2 py-1 rounded ${
+                                testGroup.panel_status === 'completed'
+                                  ? 'bg-green-100 text-green-700'
+                                  : testGroup.panel_status === 'in_progress'
+                                  ? 'bg-blue-100 text-blue-700'
+                                  : 'bg-gray-100 text-gray-700'
+                              }`}>
+                                {testGroup.panel_status.replace('_', ' ')}
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
                     </div>
                   </div>
                 </div>
 
-                {/* Expanded view with parameters */}
-                {isExpanded && (
-                  <div className="bg-gray-50 border-t px-8 py-3">
-                    {result.values.map((value, index) => (
-                      <div key={index} className="flex items-center justify-between py-1">
-                        <span className="font-medium text-sm">{value.parameter}</span>
-                        <div className="flex items-center space-x-2">
-                          <span className="font-bold">{value.value} {value.unit}</span>
-                          {value.flag && (
-                            <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium ${getFlagColor(value.flag)}`}>
-                              {value.flag}
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                    ))}
+                {/* Entry Method Tabs */}
+                <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
+                  <div className="flex space-x-1 mb-6 bg-gray-100 rounded-lg p-1">
+                    <button
+                      onClick={() => setEntryMethod('ai-upload')}
+                      className={`flex-1 px-4 py-2 rounded-md transition-colors ${
+                        entryMethod === 'ai-upload'
+                          ? 'bg-white shadow-sm text-gray-900'
+                          : 'text-gray-600 hover:text-gray-900'
+                      }`}
+                    >
+                      <Brain className="h-4 w-4 inline mr-2" />
+                      AI Upload
+                    </button>
+                    <button
+                      onClick={() => setEntryMethod('manual')}
+                      className={`flex-1 px-4 py-2 rounded-md transition-colors ${
+                        entryMethod === 'manual'
+                          ? 'bg-white shadow-sm text-gray-900'
+                          : 'text-gray-600 hover:text-gray-900'
+                      }`}
+                    >
+                      <TestTube className="h-4 w-4 inline mr-2" />
+                      Manual Entry
+                    </button>
+                    <button
+                      onClick={() => setEntryMethod('workflow')}
+                      className={`flex-1 px-4 py-2 rounded-md transition-colors ${
+                        entryMethod === 'workflow'
+                          ? 'bg-white shadow-sm text-gray-900'
+                          : 'text-gray-600 hover:text-gray-900'
+                      }`}
+                    >
+                      <Activity className="h-4 w-4 inline mr-2" />
+                      Workflow
+                    </button>
                   </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      </div>
 
-      {/* Right Panel - Verification Actions */}
-      <div className="w-1/2 bg-white flex flex-col">
-        <div className="p-4 border-b">
-          <h3 className="text-lg font-semibold text-gray-900">Verification Panel</h3>
-          <p className="text-sm text-gray-600">
-            {selectedResultIds.size} result(s) selected
-          </p>
+                  {/* Entry Method Content */}
+                  {entryMethod === 'ai-upload' && (
+                    <AIUploadPanel
+                      order={{
+                        id: selectedOrder.id,
+                        patient_name: selectedOrder.patient_name,
+                        patient_id: selectedOrder.patient_id || '', // Ensure patient_id is passed
+                        lab_id: selectedOrder.lab_id || currentLabId
+                      }}
+                      onUploadComplete={handleUploadComplete}
+                      onProgressUpdate={setProcessingStatus}
+                    />
+                  )}
+
+                  {entryMethod === 'manual' && selectedOrder.testGroups.length > 0 && (
+                    <ManualEntryForm
+                      order={{
+                        id: selectedOrder.id,
+                        patient_id: selectedOrder.patient_id || '',
+                        patient_name: selectedOrder.patient_name,
+                        lab_id: selectedOrder.lab_id || currentLabId
+                      }}
+                      testGroup={{
+                        id: selectedOrder.testGroups[0].test_group_id,
+                        name: selectedOrder.testGroups[0].test_group_name,
+                        department: selectedOrder.testGroups[0].department
+                      }}
+                      onSubmit={handleManualEntrySubmit}
+                    />
+                  )}
+
+                  {entryMethod === 'workflow' && selectedOrder.testGroups.length > 0 && (
+                    <WorkflowPanel
+                      order={{
+                        id: selectedOrder.id,
+                        patient_id: selectedOrder.patient_id || '',
+                        patient_name: selectedOrder.patient_name,
+                        lab_id: selectedOrder.lab_id || currentLabId
+                      }}
+                      testGroup={{
+                        id: selectedOrder.testGroups[0].test_group_id,
+                        name: selectedOrder.testGroups[0].test_group_name,
+                        department: selectedOrder.testGroups[0].department
+                      }}
+                      onComplete={handleWorkflowComplete}
+                    />
+                  )}
+                </div>
+              </div>
         </div>
-        
-        <div className="flex-1 p-4 space-y-4">
-          {/* Verification Notes */}
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-2">
-              Verification Notes
-            </label>
-            <textarea
-              value={verificationNotes}
-              onChange={(e) => setVerificationNotes(e.target.value)}
-              rows={4}
-              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-              placeholder="Add verification comments..."
-            />
-            
-            {/* Quick note buttons */}
-            <div className="flex flex-wrap gap-1 mt-2">
-              {['Normal limits', 'Repeat required', 'Critical value', 'Delta check'].map((note) => (
+      );
+    }
+
+    if (entryViewMode === 'department') {
+      return (
+        <DepartmentView
+          selectedDepartment={selectedDepartment}
+          onDepartmentSelect={setSelectedDepartment}
+          onOrderSelect={handleOrderSelect}
+          entryMethod={entryMethod}
+          onEntryMethodChange={(method: string) => setEntryMethod(method as EntryMethod)}
+        />
+      );
+    }
+
+    if (entryViewMode === 'test-group') {
+      return (
+        <div className="space-y-4">
+          <div className="bg-white rounded-lg shadow-sm border p-4">
+            <div className="flex flex-wrap gap-2">
+              {availableTestGroups.map(tg => (
                 <button
-                  key={note}
-                  onClick={() => setVerificationNotes(prev => prev + (prev ? ' ' : '') + note)}
-                  className="px-2 py-1 text-xs bg-blue-100 text-blue-700 rounded hover:bg-blue-200"
+                  key={tg.id}
+                  onClick={() => setSelectedTestGroupId(tg.id)}
+                  className={`px-3 py-1.5 text-sm rounded-full border ${selectedTestGroupId===tg.id? 'bg-blue-600 text-white border-blue-600':'bg-white text-gray-700 hover:bg-gray-50'}`}
                 >
-                  {note}
+                  {tg.name} <span className="text-xs text-gray-400 ml-1">{tg.department}</span>
                 </button>
               ))}
             </div>
           </div>
-
-          {/* Bulk Actions */}
-          <div className="space-y-2">
-            <h4 className="font-medium text-gray-900">Batch Actions</h4>
-            <div className="space-y-2">
-              <button
-                onClick={() => bulkVerifyResults('verified')}
-                disabled={selectedResultIds.size === 0}
-                className="w-full px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
-              >
-                Approve Selected ({selectedResultIds.size})
-              </button>
-              
-              <button
-                onClick={() => bulkVerifyResults('rejected')}
-                disabled={selectedResultIds.size === 0 || !verificationNotes.trim()}
-                className="w-full px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
-              >
-                Reject Selected ({selectedResultIds.size})
-              </button>
-              
-              <button
-                onClick={() => bulkVerifyResults('needs_clarification')}
-                disabled={selectedResultIds.size === 0}
-                className="w-full px-4 py-2 bg-yellow-600 text-white rounded-md hover:bg-yellow-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
-              >
-                Request Clarification ({selectedResultIds.size})
-              </button>
+          <div className="bg-white rounded-lg shadow-sm border p-4">
+            <h4 className="font-medium text-gray-900 mb-3">Orders</h4>
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+              {results
+                .filter((r: any) => !selectedTestGroupId || r.testGroups.some((tg: any) => tg.test_group_id === selectedTestGroupId))
+                .map((r: any) => (
+                  <button
+                    key={r.id}
+                    onClick={() => { setSelectedOrder(r as any); setEntryViewMode('order-based'); }}
+                    className="text-left p-3 border rounded-lg hover:bg-gray-50 bg-white"
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <span
+                          className="inline-block w-3 h-3 rounded-full border"
+                          style={{ backgroundColor: r.color_code || '#e5e7eb' }}
+                          title={r.color_name || 'Tube'}
+                        />
+                        <div className="font-medium text-gray-900">{r.patientName}</div>
+                        {typeof r.age === 'number' && (
+                          <div className="text-xs text-gray-500">• {r.age}y</div>
+                        )}
+                      </div>
+                      <div className="text-xs text-gray-500">{r.sampleId || 'No Sample'}</div>
+                    </div>
+                    <div className="mt-2 flex flex-wrap gap-1">
+                      {(r.testGroups || []).filter((tg: any) => !selectedTestGroupId || tg.test_group_id === selectedTestGroupId).slice(0, 4).map((tg: any) => (
+                        <span key={tg.test_group_id} className="px-2 py-0.5 text-xs rounded-full border bg-gray-50 text-gray-700">
+                          {tg.test_group_name}
+                        </span>
+                      ))}
+                    </div>
+                  </button>
+                ))}
+              {results.length===0 && (
+                <div className="col-span-full text-sm text-gray-500 p-6 text-center border rounded-md bg-white">No orders loaded. Use Refresh above.</div>
+              )}
             </div>
           </div>
         </div>
-      </div>
-    </div>
-  );
-
-  const getStatusColor = (status: string) => {
-    const colors = {
-      'Entered': 'bg-blue-100 text-blue-800',
-      'Under Review': 'bg-yellow-100 text-yellow-800',
-      'Approved': 'bg-green-100 text-green-800',
-      'Reported': 'bg-gray-100 text-gray-800',
-    };
-    return colors[status as keyof typeof colors] || 'bg-gray-100 text-gray-800';
-  };
-
-  const getStatusIcon = (status: string) => {
-    switch (status) {
-      case 'Entered':
-        return <ClockIcon className="h-4 w-4" />;
-      case 'Under Review':
-        return <AlertTriangle className="h-4 w-4" />;
-      case 'Approved':
-        return <CheckCircle className="h-4 w-4" />;
-      case 'Reported':
-        return <FileText className="h-4 w-4" />;
-      default:
-        return <ClockIcon className="h-4 w-4" />;
+      );
     }
+
+    // Fallback for unknown view modes
+    return (
+      <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-12 text-center">
+        <Activity className="h-16 w-16 text-gray-400 mx-auto mb-4" />
+        <h3 className="text-lg font-medium text-gray-900 mb-2">{entryViewMode} View</h3>
+        <p className="text-gray-600">
+          This view mode is not yet implemented
+        </p>
+      </div>
+    );
   };
+
+  // Note: Filtered results logic would go here for advanced filtering
+  // Currently using the main results array with basic filtering in components
 
   return (
     <div className="space-y-6">
-      {/* Enhanced Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-3xl font-bold text-gray-900">Result Management & Verification</h1>
-          <p className="text-gray-600 mt-1">Comprehensive result entry, review, and approval workflow</p>
+      {/* Compact Filters */}
+      <div className="bg-white rounded-lg border border-gray-200 p-3 flex flex-wrap items-center gap-2">
+        <div className="text-sm font-medium text-gray-800 mr-2">Date Range:</div>
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-gray-500">From:</span>
+          <input
+            type="date"
+            value={filters.dateFrom || ''}
+            onChange={(e) => handleFiltersChange({ dateFrom: e.target.value, dateRange: 'custom' }, true)}
+            className="text-xs px-2 py-1 border rounded"
+          />
+          <span className="text-xs text-gray-500">To:</span>
+          <input
+            type="date"
+            value={filters.dateTo || ''}
+            onChange={(e) => handleFiltersChange({ dateTo: e.target.value, dateRange: 'custom' }, true)}
+            className="text-xs px-2 py-1 border rounded"
+          />
         </div>
-        
-        <div className="flex items-center space-x-3">
-          {/* View Mode Toggle */}
-          <div className="flex items-center bg-gray-100 rounded-lg p-1">
-            <button
-              onClick={() => setViewMode('cards')}
-              className={`px-3 py-2 rounded-md text-sm font-medium transition-colors ${
-                viewMode === 'cards' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-600 hover:text-gray-900'
-              }`}
-            >
-              Cards
-            </button>
-            <button
-              onClick={() => setViewMode('verification')}
-              className={`px-3 py-2 rounded-md text-sm font-medium transition-colors ${
-                viewMode === 'verification' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-600 hover:text-gray-900'
-              }`}
-            >
-              Verification
-            </button>
-          </div>
-          
-          <button 
-            onClick={fetchResults}
-            disabled={loading}
-            className="flex items-center px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-50"
+        <div className="flex items-center gap-1 ml-2">
+          <button
+            className={`text-xs px-2 py-1 rounded border ${filters.dateRange==='today' ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-gray-700'}`}
+            onClick={() => handleFiltersChange({ dateRange: 'today', dateFrom: '', dateTo: '' }, true)}
           >
-            <RefreshCw className={`h-4 w-4 mr-2 ${loading ? 'animate-spin' : ''}`} />
+            Today
+          </button>
+          <button
+            className={`text-xs px-2 py-1 rounded border ${filters.dateRange==='7d' ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-gray-700'}`}
+            onClick={() => handleFiltersChange({ dateRange: '7d', dateFrom: '', dateTo: '' }, true)}
+          >
+            7 days
+          </button>
+          <button
+            className={`text-xs px-2 py-1 rounded border ${filters.dateRange==='30d' ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-gray-700'}`}
+            onClick={() => handleFiltersChange({ dateRange: '30d', dateFrom: '', dateTo: '' }, true)}
+          >
+            30 days
+          </button>
+          <button
+            className={`text-xs px-2 py-1 rounded border ${filters.dateRange==='90d' ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-gray-700'}`}
+            onClick={() => handleFiltersChange({ dateRange: '90d', dateFrom: '', dateTo: '' }, true)}
+          >
+            90 days
+          </button>
+          <button
+            className={`text-xs px-2 py-1 rounded border ${filters.dateRange==='all' ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-gray-700'}`}
+            onClick={() => handleFiltersChange({ dateRange: 'all', dateFrom: '', dateTo: '' }, true)}
+          >
+            All Dates
+          </button>
+        </div>
+        <div className="w-px h-4 bg-gray-200 mx-2" />
+        <div className="flex items-center gap-1">
+          <button
+            className={`text-xs px-2 py-1 rounded border ${filters.status==='pending' ? 'bg-amber-500 text-white border-amber-500' : 'bg-white text-gray-700'}`}
+            onClick={() => handleFiltersChange({ status: 'pending' }, true)}
+          >
+            Pending
+          </button>
+          <button
+            className={`text-xs px-2 py-1 rounded border ${filters.status==='all' ? 'bg-gray-800 text-white border-gray-800' : 'bg-white text-gray-700'}`}
+            onClick={() => handleFiltersChange({ status: 'all' }, true)}
+          >
+            All
+          </button>
+        </div>
+        <div className="ml-auto flex items-center gap-2">
+          <input
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+            placeholder="Search patient…"
+            className="text-xs px-2 py-1 border rounded"
+          />
+          <button 
+            onClick={() => fetchResults()}
+            disabled={loading}
+            className="flex items-center px-3 py-1.5 text-xs bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
+          >
+            <RefreshCw className={`h-3 w-3 mr-1 ${loading ? 'animate-spin' : ''}`} />
             Refresh
           </button>
-          
-          <button className="flex items-center px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors">
-            <Download className="h-4 w-4 mr-2" />
-            Export
+        </div>
+      </div>
+      {/* Real-time Notification */}
+      {realTimeNotification && (
+        <div className={`fixed top-4 right-4 z-50 px-4 py-2 rounded-lg shadow-lg animate-in slide-in-from-top-2 ${
+          realTimeNotification.type === 'success' ? 'bg-green-100 text-green-800 border border-green-200' :
+          realTimeNotification.type === 'warning' ? 'bg-yellow-100 text-yellow-800 border border-yellow-200' :
+          'bg-blue-100 text-blue-800 border border-blue-200'
+        }`}>
+          <div className="flex items-center space-x-2">
+            <div className="w-2 h-2 bg-current rounded-full animate-pulse"></div>
+            <span className="text-sm font-medium">{realTimeNotification.message}</span>
+            <span className="text-xs opacity-75">
+              {realTimeNotification.timestamp.toLocaleTimeString()}
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* Enhanced View Selector */}
+      <EnhancedViewSelector
+        viewMode={viewMode}
+        entryViewMode={entryViewMode}
+        filters={filters}
+        onViewModeChange={handleViewModeChange}
+        onEntryViewModeChange={handleEntryViewModeChange}
+        onFiltersChange={handleFiltersChange}
+        departments={availableDepartments}
+        resultCounts={resultCounts}
+      />
+
+      {/* Old Refresh moved into compact filters */}
+
+      {/* Statistics Dashboard (collapsible) */}
+      <div className="bg-white rounded-lg border border-gray-200">
+        <div className="flex items-center justify-between px-4 py-3">
+          <h3 className="text-base font-semibold text-gray-900">Result Statistics</h3>
+          <button
+            onClick={() => setShowStats((s) => !s)}
+            className="text-sm px-3 py-1 rounded-md border hover:bg-gray-50"
+            aria-expanded={showStats}
+          >
+            {showStats ? 'Hide' : 'Show'}
           </button>
         </div>
-      </div>
-
-      {/* Enhanced Summary Dashboard */}
-      <div className="grid grid-cols-1 md:grid-cols-6 gap-4">
-        <div className="bg-gradient-to-r from-blue-50 to-blue-100 rounded-lg shadow-sm border border-blue-200 p-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <div className="text-2xl font-bold text-blue-900">{summaryStats.total}</div>
-              <div className="text-sm text-blue-700">Total Results</div>
-            </div>
-            <TestTube className="h-5 w-5 text-blue-500" />
-          </div>
-        </div>
-        
-        <div className="bg-gradient-to-r from-yellow-50 to-yellow-100 rounded-lg shadow-sm border border-yellow-200 p-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <div className="text-2xl font-bold text-yellow-900">{summaryStats.pendingReview}</div>
-              <div className="text-sm text-yellow-700">Pending Review</div>
-            </div>
-            <ClockIcon className="h-5 w-5 text-yellow-500" />
-          </div>
-        </div>
-        
-        <div className="bg-gradient-to-r from-green-50 to-green-100 rounded-lg shadow-sm border border-green-200 p-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <div className="text-2xl font-bold text-green-900">{summaryStats.approved}</div>
-              <div className="text-sm text-green-700">Approved</div>
-            </div>
-            <CheckCircle className="h-5 w-5 text-green-500" />
-          </div>
-        </div>
-        
-        <div className="bg-gradient-to-r from-gray-50 to-gray-100 rounded-lg shadow-sm border border-gray-200 p-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <div className="text-2xl font-bold text-gray-900">{summaryStats.reported}</div>
-              <div className="text-sm text-gray-700">Reported</div>
-            </div>
-            <FileText className="h-5 w-5 text-gray-500" />
-          </div>
-        </div>
-        
-        <div className="bg-gradient-to-r from-red-50 to-red-100 rounded-lg shadow-sm border border-red-200 p-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <div className="text-2xl font-bold text-red-900">{summaryStats.critical}</div>
-              <div className="text-sm text-red-700">Critical</div>
-            </div>
-            <AlertCircle className="h-5 w-5 text-red-500" />
-          </div>
-        </div>
-        
-        <div className="bg-gradient-to-r from-purple-50 to-purple-100 rounded-lg shadow-sm border border-purple-200 p-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <div className="text-2xl font-bold text-purple-900">{summaryStats.avgTurnaround}h</div>
-              <div className="text-sm text-purple-700">Avg TAT</div>
-            </div>
-            <TrendingUp className="h-5 w-5 text-purple-500" />
-          </div>
-        </div>
-      </div>
-
-      {/* Enhanced Search and Filter Bar */}
-      <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-4">
-        <div className="flex flex-col sm:flex-row gap-4">
-          <div className="flex-1 relative">
-            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-gray-400" />
-            <input
-              type="text"
-              placeholder="Search by patient name, order ID, or test name..."
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              className="pl-10 pr-4 py-2 w-full border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+        {showStats && (
+          <div className="p-4 pt-0">
+            <ResultStatsDashboard
+              stats={summaryStats}
+              onCardClick={(cardType) => {
+                console.log('Dashboard card clicked:', cardType);
+              }}
             />
-          </div>
-          
-          <select
-            value={selectedStatus}
-            onChange={(e) => setSelectedStatus(e.target.value)}
-            className="px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-          >
-            <option value="All">All Status</option>
-            <option value="Entered">Entered</option>
-            <option value="Under Review">Under Review</option>
-            <option value="Approved">Approved</option>
-            <option value="Reported">Reported</option>
-          </select>
-          
-          <select
-            value={filterDate}
-            onChange={(e) => setFilterDate(e.target.value)}
-            className="px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-          >
-            <option value="all">All Dates</option>
-            <option value="today">Today</option>
-            <option value="yesterday">Yesterday</option>
-            <option value="week">This Week</option>
-          </select>
-          
-          <select
-            value={filterUrgency}
-            onChange={(e) => setFilterUrgency(e.target.value)}
-            className="px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-          >
-            <option value="all">All Priority</option>
-            <option value="urgent">Urgent/STAT</option>
-            <option value="high">High</option>
-            <option value="normal">Normal</option>
-          </select>
-        </div>
-
-        {/* Bulk Selection Controls */}
-        {selectedResultIds.size > 0 && (
-          <div className="mt-4 p-3 bg-blue-50 rounded-lg border border-blue-200">
-            <div className="flex items-center justify-between">
-              <span className="text-sm font-medium text-blue-900">
-                {selectedResultIds.size} result(s) selected
-              </span>
-              <div className="flex space-x-2">
-                <button
-                  onClick={() => bulkVerifyResults('verified')}
-                  className="px-3 py-1 bg-green-600 text-white text-xs rounded hover:bg-green-700"
-                >
-                  Approve All
-                </button>
-                <button
-                  onClick={() => bulkVerifyResults('rejected')}
-                  disabled={!verificationNotes.trim()}
-                  className="px-3 py-1 bg-red-600 text-white text-xs rounded hover:bg-red-700 disabled:bg-gray-400"
-                >
-                  Reject All
-                </button>
-                <button
-                  onClick={() => setSelectedResultIds(new Set())}
-                  className="px-3 py-1 bg-gray-600 text-white text-xs rounded hover:bg-gray-700"
-                >
-                  Clear Selection
-                </button>
-              </div>
-            </div>
           </div>
         )}
       </div>
 
       {/* Dynamic Content Based on View Mode */}
-      <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
-        <div className="px-6 py-4 border-b border-gray-200">
-          <h3 className="text-lg font-semibold text-gray-900">
-            Test Results ({filteredResults.length})
-            {viewMode === 'verification' && selectedResultIds.size > 0 && (
-              <span className="ml-2 text-sm text-blue-600">
-                • {selectedResultIds.size} selected for verification
-              </span>
-            )}
-          </h3>
-        </div>
-        
-        <div className="mt-6">
-          {viewMode === 'cards' ? renderCardsView() : renderVerificationView()}
-        </div>
-        
-        {/* Empty State */}
-        {filteredResults.length === 0 && !loading && (
+      {viewMode === 'entry' ? renderEntryMode() : (
+        <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
           <div className="text-center py-12">
-            <TestTube className="h-12 w-12 text-gray-300 mx-auto mb-4" />
-            <h3 className="text-lg font-medium text-gray-900 mb-2">No Results Found</h3>
-            <p className="text-gray-500">
-              {searchTerm || selectedStatus !== 'All' 
-                ? 'Try adjusting your search or filter criteria.' 
-                : 'No test results have been entered yet.'}
+            <FileText className="h-16 w-16 text-gray-400 mx-auto mb-4" />
+            <h3 className="text-lg font-medium text-gray-900 mb-2">
+              {viewMode === 'review' ? 'Review Mode' : 'Verification Mode'}
+            </h3>
+            <p className="text-gray-600">
+              This functionality will be implemented in the next phase
             </p>
           </div>
-        )}
-      </div>
-
-      {/* Result Details Modal */}
-      {selectedResult && (
-        <div className="fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-lg shadow-xl w-full max-w-4xl max-h-[90vh] overflow-y-auto">
-            <div className="flex items-center justify-between p-6 border-b border-gray-200">
-              <h2 className="text-xl font-semibold text-gray-900">Result Details</h2>
-              <button
-                onClick={() => setSelectedResult(null)}
-                className="text-gray-400 hover:text-gray-500 p-1 rounded"
-              >
-                ×
-              </button>
-            </div>
-
-            <div className="p-6 space-y-6">
-              {/* Result Header */}
-              <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
-                  <div>
-                    <div className="text-blue-600 font-medium">Result ID</div>
-                    <div className="text-blue-900">{selectedResult.id}</div>
-                  </div>
-                  <div>
-                    <div className="text-blue-600 font-medium">Patient</div>
-                    <div className="text-blue-900">{selectedResult.patientName}</div>
-                  </div>
-                  <div>
-                    <div className="text-blue-600 font-medium">Test</div>
-                    <div className="text-blue-900">{selectedResult.testName}</div>
-                  </div>
-                  <div>
-                    <div className="text-blue-600 font-medium">Status</div>
-                    <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(selectedResult.status)}`}>
-                      {selectedResult.status}
-                    </span>
-                  </div>
-                </div>
-              </div>
-
-              {/* Test Results */}
-              <div>
-                <h3 className="text-lg font-semibold text-gray-900 mb-4">Test Results</h3>
-                <div className="space-y-4">
-                  <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
-                    <div className="grid grid-cols-3 gap-4 text-sm">
-                      <div className="text-center">
-                        <div className="text-lg font-bold text-blue-900">{selectedResult.values.length}</div>
-                        <div className="text-blue-700">Total Parameters</div>
-                      </div>
-                      <div className="text-center">
-                        <div className="text-lg font-bold text-red-900">
-                          {selectedResult.values.filter(v => {
-                            const flag = v.flag || calculateFlag(v.value, v.reference);
-                            return flag === 'H' || flag === 'L' || flag === 'C';
-                          }).length}
-                        </div>
-                        <div className="text-red-700">Abnormal</div>
-                      </div>
-                      <div className="text-center">
-                        <div className="text-lg font-bold text-green-900">
-                          {selectedResult.values.filter(v => {
-                            const flag = v.flag || calculateFlag(v.value, v.reference);
-                            return !flag || flag === '';
-                          }).length}
-                        </div>
-                        <div className="text-green-700">Normal</div>
-                      </div>
-                    </div>
-                  </div>
-                  
-                  <div className="overflow-x-auto">
-                  <table className="min-w-full divide-y divide-gray-200">
-                    <thead className="bg-gray-50">
-                      <tr>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
-                          Parameter
-                        </th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
-                          Value
-                        </th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
-                          Unit
-                        </th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
-                          Reference Range
-                        </th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
-                          Flag
-                        </th>
-                      </tr>
-                    </thead>
-                    <tbody className="bg-white divide-y divide-gray-200">
-                      {selectedResult.values.map((value, index) => {
-                        const calculatedFlag = value.flag || calculateFlag(value.value, value.reference);
-                        return (
-                          <tr key={index} className="hover:bg-gray-50">
-                            <td className="px-4 py-3 text-sm font-medium text-gray-900">
-                              {value.parameter}
-                            </td>
-                            <td className="px-4 py-3 text-sm font-bold text-gray-900">
-                              {value.value}
-                            </td>
-                            <td className="px-4 py-3 text-sm text-gray-600">
-                              {value.unit}
-                            </td>
-                            <td className="px-4 py-3 text-sm text-gray-600">
-                              {value.reference}
-                            </td>
-                            <td className="px-4 py-3 text-sm">
-                              {calculatedFlag && (
-                                <span className={`inline-flex items-center px-2 py-1 rounded text-xs font-medium ${getFlagColor(calculatedFlag)}`}>
-                                  {calculatedFlag}
-                                </span>
-                              )}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                  </div>
-                </div>
-              </div>
-
-              {/* Attachment Section */}
-              {selectedResult.attachmentId && (
-                <div>
-                  <h3 className="text-lg font-semibold text-gray-900 mb-4">Attachments</h3>
-                  <div className="bg-indigo-50 border border-indigo-200 rounded-lg p-4">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center">
-                        <Paperclip className="h-5 w-5 text-indigo-500 mr-2" />
-                        <div>
-                          <div className="text-sm font-medium text-indigo-900">
-                            Lab Result Document
-                          </div>
-                          <div className="text-sm text-indigo-600">
-                            Attachment ID: {selectedResult.attachmentId}
-                          </div>
-                        </div>
-                      </div>
-                      <button
-                        onClick={() => {
-                          // This will be handled by the AI Tools modal
-                          setShowAITools(true);
-                        }}
-                        className="flex items-center px-3 py-1 text-sm bg-indigo-100 text-indigo-700 rounded-md hover:bg-indigo-200 transition-colors"
-                      >
-                        <Eye className="h-4 w-4 mr-1" />
-                        View
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {/* Actions */}
-              <div className="flex items-center justify-between pt-6 border-t border-gray-200">
-                <div className="flex items-center space-x-4">
-                  <button
-                    onClick={handleOpenAITools}
-                    className="flex items-center px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors shadow-sm"
-                  >
-                    <Brain className="h-4 w-4 mr-2" />
-                    AI Tools
-                  </button>
-                  {aiEnhancedResults[selectedResult.id] && (
-                    <div className="flex items-center text-sm text-green-600">
-                      <CheckCircle className="h-4 w-4 mr-1" />
-                      AI Enhanced
-                    </div>
-                  )}
-                </div>
-                <div className="flex items-center space-x-4">
-                <button
-                  onClick={() => setSelectedResult(null)}
-                  className="px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50 transition-colors"
-                >
-                  Close
-                </button>
-                {selectedResult.status === 'Under Review' && (
-                  <>
-                    <button 
-                      onClick={() => handleRejectResult(selectedResult.id)}
-                      className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors"
-                    >
-                      Reject
-                    </button>
-                    <button 
-                      onClick={() => handleApproveResult(selectedResult.id)}
-                      className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors"
-                    >
-                      Approve
-                    </button>
-                  </>
-                )}
-                {selectedResult.status === 'Approved' && (
-                  <button 
-                    onClick={() => handleGenerateReport(selectedResult.id)}
-                    className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors disabled:bg-gray-400 disabled:cursor-not-allowed"
-                  >
-                    Generate Report
-                  </button>
-                )}
-                {selectedResult.status === 'Reported' && (
-                  <button 
-                    onClick={() => handleRevertToUnderReview(selectedResult.id)}
-                    disabled={isReverting}
-                    className="px-4 py-2 bg-yellow-600 text-white rounded-lg hover:bg-yellow-700 transition-colors disabled:bg-gray-400 disabled:cursor-not-allowed"
-                  >
-                    {isReverting ? (
-                      <>
-                        <div className="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent mr-2 inline-block"></div>
-                        Reverting...
-                      </>
-                    ) : (
-                      'Revert to Under Review'
-                    )}
-                  </button>
-                )}
-                </div>
-              </div>
-            </div>
-          </div>
         </div>
-      )}
-
-      {/* AI Tools Modal */}
-      {showAITools && selectedResult && (
-        <AIToolsModal
-          isOpen={showAITools}
-          onClose={() => setShowAITools(false)}
-          patient={{
-            id: selectedResult.patientId,
-            name: selectedResult.patientName,
-          }}
-          result={{
-            id: selectedResult.id,
-            testName: selectedResult.testName,
-            values: selectedResult.values,
-            attachmentId: selectedResult.attachmentId,
-          }}
-          onAIResultGenerated={handleAIResultGenerated}
-        />
       )}
 
       {/* Loading Overlay */}
       {loading && (
         <div className="fixed inset-0 bg-gray-600 bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white p-6 rounded-lg shadow-lg">
+            <div className="flex items-center space-x-3">
+              <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-blue-600"></div>
+              <span>Loading...</span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Batch Operations Modal */}
+      <BatchOperations
+        selectedIds={Array.from(selectedForBatch)}
+        totalCount={results.length}
+        onSelectAll={handleSelectAllForBatch}
+        onClearSelection={handleClearBatchSelection}
+        onBatchOperation={handleBatchOperation}
+        show={showBatchOperations}
+        onClose={() => setShowBatchOperations(false)}
+      />
+
+      {/* Quick Action Toolbar disabled to avoid scroll issues */}
+    </div>
+  );
+};
+
+export default Results;

@@ -1,137 +1,166 @@
-// Status Synchronization Fix
-// This file addresses the disconnect between order status and sample collection status
+import { supabase } from './supabase';
 
-import { supabase } from '../utils/supabase';
+export interface OrderStatusUpdate {
+  orderId: string;
+  newStatus: string;
+  sampleCollectedAt?: string | null;
+  sampleCollectedBy?: string | null;
+  updatedBy?: string;
+}
 
-// Function to sync order status with sample collection status
-export const syncOrderStatusWithSampleCollection = async (orderId: string): Promise<void> => {
-  try {
-    // Get current order and sample collection info
-    const { data: order, error: orderError } = await supabase
-      .from('orders')
-      .select('id, status, sample_collected_at, sample_collected_by')
-      .eq('id', orderId)
-      .single();
+export class StatusSyncService {
+  /**
+   * Update order status with automatic sample collection sync
+   */
+  static async updateOrderStatus(update: OrderStatusUpdate): Promise<{ success: boolean; data?: any; error?: string }> {
+    try {
+      const { data: user } = await supabase.auth.getUser();
+      const updaterName = update.updatedBy || user.data.user?.user_metadata?.full_name || user.data.user?.email || 'Unknown User';
+      
+      // Prepare update payload
+      const updatePayload: any = {
+        status: update.newStatus,
+        status_updated_at: new Date().toISOString(),
+        status_updated_by: updaterName
+      };
 
-    if (orderError) {
-      console.error('Error fetching order:', orderError);
-      return;
-    }
-
-    // Determine correct status based on sample collection
-    let newStatus = order.status;
-    
-    if (order.sample_collected_at && order.sample_collected_by) {
-      // Sample is collected, but order status shows "Pending Collection"
-      if (order.status === 'Pending Collection') {
-        newStatus = 'Sample Collected';
+      // Handle sample collection status changes
+      if (update.newStatus === 'Sample Collected' || update.newStatus === 'In Progress') {
+        // If marking as collected or in progress, ensure sample collection fields are set
+        if (!update.sampleCollectedAt) {
+          updatePayload.sample_collected_at = new Date().toISOString();
+          updatePayload.sample_collected_by = updaterName;
+        }
+      } else if (update.newStatus === 'Pending Collection' || update.newStatus === 'Order Created') {
+        // If marking as pending collection, clear sample collection fields
+        updatePayload.sample_collected_at = null;
+        updatePayload.sample_collected_by = null;
       }
-    } else {
-      // Sample is not collected, but order status might be wrong
-      if (order.status === 'Sample Collected') {
-        newStatus = 'Pending Collection';
-      }
-    }
 
-    // Update order status if needed
-    if (newStatus !== order.status) {
-      const { error: updateError } = await supabase
+      // Apply the update
+      const { data, error } = await supabase
+        .from('orders')
+        .update(updatePayload)
+        .eq('id', update.orderId)
+        .select()
+        .single();
+
+      if (error) {
+        console.error('Error updating order status:', error);
+        return { success: false, error: error.message };
+      }
+
+      console.log('Order status updated successfully:', data);
+      return { success: true, data };
+    } catch (err) {
+      console.error('Error in updateOrderStatus:', err);
+      return { success: false, error: 'Failed to update order status' };
+    }
+  }
+
+  /**
+   * Mark sample as collected
+   */
+  static async markSampleCollected(orderId: string, collectedBy?: string): Promise<{ success: boolean; data?: any; error?: string }> {
+    try {
+      const { data: user } = await supabase.auth.getUser();
+      const collectorName = collectedBy || user.data.user?.user_metadata?.full_name || user.data.user?.email || 'Unknown User';
+      
+      const { data, error } = await supabase
         .from('orders')
         .update({
-          status: newStatus,
-          status_updated_at: new Date().toISOString()
+          sample_collected_at: new Date().toISOString(),
+          sample_collected_by: collectorName,
+          status: 'Sample Collected',
+          status_updated_at: new Date().toISOString(),
+          status_updated_by: collectorName
         })
-        .eq('id', orderId);
+        .eq('id', orderId)
+        .select()
+        .single();
 
-      if (updateError) {
-        console.error('Error updating order status:', updateError);
-      } else {
-        console.log(`Order ${orderId} status updated from "${order.status}" to "${newStatus}"`);
+      if (error) {
+        console.error('Error marking sample as collected:', error);
+        return { success: false, error: error.message };
       }
+
+      console.log('Sample marked as collected successfully:', data);
+      return { success: true, data };
+    } catch (err) {
+      console.error('Error in markSampleCollected:', err);
+      return { success: false, error: 'Failed to mark sample as collected' };
     }
-  } catch (error) {
-    console.error('Error in syncOrderStatusWithSampleCollection:', error);
   }
-};
 
-// Function to handle sample collection and update order status
-export const markSampleAsCollected = async (orderId: string): Promise<boolean> => {
-  try {
-    const { error } = await supabase
-      .from('orders')
-      .update({
-        sample_collected_at: new Date().toISOString(),
-        sample_collected_by: 'current_user_email', // Replace with actual user
-        status: 'Sample Collected',
-        status_updated_at: new Date().toISOString()
-      })
-      .eq('id', orderId);
+  /**
+   * Mark sample as not collected
+   */
+  static async markSampleNotCollected(orderId: string): Promise<{ success: boolean; data?: any; error?: string }> {
+    try {
+      const { data: user } = await supabase.auth.getUser();
+      const updaterName = user.data.user?.user_metadata?.full_name || user.data.user?.email || 'Unknown User';
+      
+      const { data, error } = await supabase
+        .from('orders')
+        .update({
+          sample_collected_at: null,
+          sample_collected_by: null,
+          status: 'Pending Collection',
+          status_updated_at: new Date().toISOString(),
+          status_updated_by: updaterName
+        })
+        .eq('id', orderId)
+        .select()
+        .single();
 
-    if (error) {
-      console.error('Error marking sample as collected:', error);
-      return false;
+      if (error) {
+        console.error('Error marking sample as not collected:', error);
+        return { success: false, error: error.message };
+      }
+
+      console.log('Sample marked as not collected successfully:', data);
+      return { success: true, data };
+    } catch (err) {
+      console.error('Error in markSampleNotCollected:', err);
+      return { success: false, error: 'Failed to mark sample as not collected' };
     }
-
-    return true;
-  } catch (error) {
-    console.error('Error in markSampleAsCollected:', error);
-    return false;
   }
-};
 
-// Function to handle sample uncollection (if needed)
-export const markSampleAsNotCollected = async (orderId: string): Promise<boolean> => {
-  try {
-    const { error } = await supabase
-      .from('orders')
-      .update({
-        sample_collected_at: null,
-        sample_collected_by: null,
-        status: 'Pending Collection',
-        status_updated_at: new Date().toISOString()
-      })
-      .eq('id', orderId);
-
-    if (error) {
-      console.error('Error marking sample as not collected:', error);
-      return false;
-    }
-
-    return true;
-  } catch (error) {
-    console.error('Error in markSampleAsNotCollected:', error);
-    return false;
-  }
-};
-
-// Function to get synchronized order data with correct status
-export const getOrderWithSyncedStatus = async (orderId: string) => {
-  try {
-    // First sync the status
-    await syncOrderStatusWithSampleCollection(orderId);
+  /**
+   * Check if order status is consistent with sample collection
+   */
+  static checkStatusConsistency(order: any): { isConsistent: boolean; recommendedStatus: string; issue?: string } {
+    const hasCollectedSample = !!(order.sample_collected_at && order.sample_collected_by);
     
-    // Then fetch the updated order
-    const { data: order, error } = await supabase
-      .from('orders')
-      .select('*')
-      .eq('id', orderId)
-      .single();
-
-    if (error) {
-      console.error('Error fetching synced order:', error);
-      return null;
+    if (hasCollectedSample) {
+      if (order.status === 'Pending Collection' || order.status === 'Order Created') {
+        return {
+          isConsistent: false,
+          recommendedStatus: 'Sample Collected',
+          issue: 'Sample is collected but status shows pending collection'
+        };
+      }
+      return { isConsistent: true, recommendedStatus: order.status };
+    } else {
+      if (order.status === 'Sample Collected' || order.status === 'In Progress') {
+        return {
+          isConsistent: false,
+          recommendedStatus: 'Pending Collection',
+          issue: 'Status shows collected but sample collection data is missing'
+        };
+      }
+      return { isConsistent: true, recommendedStatus: order.status };
     }
-
-    return order;
-  } catch (error) {
-    console.error('Error in getOrderWithSyncedStatus:', error);
-    return null;
   }
-};
 
-export default {
-  syncOrderStatusWithSampleCollection,
-  markSampleAsCollected,
-  markSampleAsNotCollected,
-  getOrderWithSyncedStatus
+  useEffect(() => {
+    loadOrder();
+  }, [orderId]);
+
+  return {
+    order,
+    loading,
+    error,
+    reload: loadOrder
+  };
 };

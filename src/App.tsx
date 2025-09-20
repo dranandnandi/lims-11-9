@@ -26,6 +26,9 @@ import "./styles/print.css";
 // ⬇️ New modern dashboard page
 import Dashboard2 from './pages/Dashboard2';
 
+// ⬇️ New AI-integrated results page
+import Result2 from './pages/result2';
+
 // ⬇️ Master Data Components
 import DoctorMaster from './components/Masters/DoctorMaster';
 import LocationMaster from './components/Masters/LocationMaster';
@@ -68,7 +71,8 @@ const AppRoutes: React.FC = () => {
                 <Route path="/patients" element={<Patients />} />
                 <Route path="/tests" element={<Tests />} />
                 <Route path="/orders" element={<Orders />} />
-                <Route path="/results" element={<ResultVerificationConsole />} />
+                <Route path="/results" element={<Results />} />
+                <Route path="/results2" element={<Result2 />} />
                 <Route path="/results-verification" element={<ResultVerificationConsole />} />
                 <Route path="/reports" element={<Reports />} />
                 {/* Dev workflow demo route (no DB changes) */}

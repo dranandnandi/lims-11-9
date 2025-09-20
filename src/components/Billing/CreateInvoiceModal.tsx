@@ -31,13 +31,20 @@ const CreateInvoiceModal: React.FC<CreateInvoiceModalProps> = ({ orderId, onClos
   const [tests, setTests]     = useState<OrderTest[]>([]);
   const [selectedTests, setSelectedTests] = useState<string[]>([]);
   const [discounts, setDiscounts] = useState<Record<string, DiscountInfo>>({});
-  const [globalDiscount, setGlobalDiscount] = useState<DiscountInfo | null>(null);
+  const [globalDiscount] = useState<DiscountInfo | null>(null);
   const [notes, setNotes]   = useState('');
   const [creating, setCreating] = useState(false);
   
   // NEW: Dual invoice system state
   const [invoiceType, setInvoiceType] = useState<'patient' | 'account'>('patient');
   const [billingPeriod, setBillingPeriod] = useState('');
+
+  // Helpers: numeric coercion and currency formatting (null-safe)
+  const toNum = (v: any, fallback = 0): number => {
+    const n = typeof v === 'number' ? v : Number(v);
+    return Number.isFinite(n) ? n : fallback;
+  };
+  const money = (v: any): string => toNum(v).toFixed(2);
 
   useEffect(() => { loadOrderDetails(); }, [orderId]);
 
@@ -74,8 +81,13 @@ const CreateInvoiceModal: React.FC<CreateInvoiceModalProps> = ({ orderId, onClos
       
       if (testsError) throw testsError;
 
-      setTests(orderTests || []);
-      setSelectedTests(orderTests?.map(t => t.id) || []);
+      const normalizedTests: OrderTest[] = (orderTests || []).map((t: any) => ({
+        ...t,
+        // Ensure price is a finite number (DB numeric/decimal can come as string or null)
+        price: toNum(t.price),
+      }));
+      setTests(normalizedTests);
+      setSelectedTests(normalizedTests.map(t => t.id));
 
       // Default discounts (Account > Location > Doctor) — manual always wins when user applies
       await applyDefaultDiscounts(orderData, orderTests || []);
@@ -126,24 +138,24 @@ const CreateInvoiceModal: React.FC<CreateInvoiceModalProps> = ({ orderId, onClos
 
   const calcLineTotal = (test: OrderTest) => {
     const disc = discounts[test.id];
-    let total = test.price;
+    let total = toNum(test.price);
     if (disc) {
-      total = disc.type === 'percent' ? (total - total * disc.value / 100) : (total - disc.value);
+      total = disc.type === 'percent' ? (total - total * toNum(disc.value) / 100) : (total - toNum(disc.value));
     }
     return Math.max(0, total);
   };
 
   const calcTotals = () => {
     const rows = tests.filter(t => selectedTests.includes(t.id));
-    const subtotal = rows.reduce((s, t) => s + t.price, 0);
+    const subtotal = rows.reduce((s, t) => s + toNum(t.price), 0);
     let totalDiscount = 0;
     rows.forEach(t => {
       const d = discounts[t.id];
       if (!d) return;
-      totalDiscount += d.type === 'percent' ? (t.price * d.value / 100) : d.value;
+      totalDiscount += d.type === 'percent' ? (toNum(t.price) * toNum(d.value) / 100) : toNum(d.value);
     });
     if (globalDiscount) {
-      totalDiscount += globalDiscount.type === 'percent' ? ((subtotal - totalDiscount) * globalDiscount.value / 100) : globalDiscount.value;
+      totalDiscount += globalDiscount.type === 'percent' ? ((subtotal - totalDiscount) * toNum(globalDiscount.value) / 100) : toNum(globalDiscount.value);
     }
     const total = Math.max(0, subtotal - totalDiscount);
     return { subtotal, totalDiscount, total };
@@ -223,12 +235,12 @@ const CreateInvoiceModal: React.FC<CreateInvoiceModalProps> = ({ orderId, onClos
           invoice_id: invoice.id,
           order_test_id: test.id,
           test_name: test.test_name,
-          price: test.price,
+          price: toNum(test.price),
           quantity: 1,
           total: lineTotal,
           discount_type: d?.type || null,
           discount_value: d?.value || null,
-          discount_amount: test.price - lineTotal,
+          discount_amount: toNum(test.price) - lineTotal,
           discount_reason: d?.reason || null,
         });
 
@@ -423,13 +435,13 @@ const CreateInvoiceModal: React.FC<CreateInvoiceModalProps> = ({ orderId, onClos
                     </div>
                     
                     <div className="text-right">
-                      <div className="font-bold">₹{lineTotal.toFixed(2)}</div>
+                      <div className="font-bold">₹{money(lineTotal)}</div>
                       {discount && (
                         <div className="text-sm text-green-600">
                           -{discount.type === 'percent' ? `${discount.value}%` : `₹${discount.value}`} ({discount.source})
                         </div>
                       )}
-                      <div className="text-sm text-gray-500">Original: ₹{test.price.toFixed(2)}</div>
+                      <div className="text-sm text-gray-500">Original: ₹{money(test.price)}</div>
                     </div>
                   </div>
                   
@@ -492,15 +504,15 @@ const CreateInvoiceModal: React.FC<CreateInvoiceModalProps> = ({ orderId, onClos
           <div className="space-y-2 max-w-md ml-auto">
             <div className="flex justify-between text-sm">
               <span>Subtotal:</span>
-              <span>₹{totals.subtotal.toFixed(2)}</span>
+              <span>₹{money(totals.subtotal)}</span>
             </div>
             <div className="flex justify-between text-sm text-green-600">
               <span>Total Discount:</span>
-              <span>-₹{totals.totalDiscount.toFixed(2)}</span>
+              <span>-₹{money(totals.totalDiscount)}</span>
             </div>
             <div className="flex justify-between text-lg font-bold">
               <span>Total Amount:</span>
-              <span>₹{totals.total.toFixed(2)}</span>
+              <span>₹{money(totals.total)}</span>
             </div>
           </div>
         </div>

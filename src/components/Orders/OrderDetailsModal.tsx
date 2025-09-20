@@ -40,7 +40,6 @@ import {
 } from "../../utils/supabase";
 import { useAuth } from "../../contexts/AuthContext";
 import { calculateFlagsForResults } from "../../utils/flagCalculation";
-import { ResultAudit } from "./ResultAudit"; // expects named export
 import AIProcessingProgress, { AIStep } from "./AIProcessingProgress"; // adjust path if needed
 import PopoutInput from "./PopoutInput";
 import QuickStatusButtons from "./QuickStatusButtons";
@@ -91,7 +90,7 @@ interface Order {
   order_date: string;
   expected_date: string;
   total_amount: number;
-  doctor: string;
+  doctor: string | null;
   sample_id?: string;
   color_code?: string;
   color_name?: string;
@@ -449,7 +448,6 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
   const [activeAttachment, setActiveAttachment] = React.useState<any | null>(null);
   const [progressRows, setProgressRows] = useState<any[]>([]);
   const [readonlyByTG, setReadonlyByTG] = useState<Record<string, any[]>>({});
-  const [showAudit, setShowAudit] = useState(false);
 
   // =========================================================
   // #endregion State
@@ -1743,13 +1741,6 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
               <div className="bg-white border border-gray-200 rounded-lg p-4 sm:p-6">
                 <div className="flex items-center justify-between">
                   <h3 className="text-lg font-semibold text-gray-900">Quick Status Updates</h3>
-                  <button
-                    onClick={() => setShowAudit(true)}
-                    className="inline-flex items-center text-sm px-3 py-1.5 rounded-lg bg-gray-100 hover:bg-gray-200"
-                  >
-                    <Eye className="h-4 w-4 mr-1" />
-                    Open Result Audit
-                  </button>
                 </div>
                 <div className="mt-3">
                   <QuickStatusButtons
@@ -2294,13 +2285,6 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
         suggestions={popoutInput?.suggestions}
       />
 
-      {/* Result Audit Modal */}
-      {showAudit && (
-        <ResultAudit
-          orderId={order.id}
-          onClose={() => setShowAudit(false)}
-        />
-      )}
     </div>
   );
 };

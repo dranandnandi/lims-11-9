@@ -9,6 +9,7 @@ import { database, supabase } from "../utils/supabase";
 import OrderForm from "../components/Orders/OrderForm";
 import OrderDetailsModal from "../components/Orders/OrderDetailsModal";
 import EnhancedOrdersPage from "../components/Orders/EnhancedOrdersPage";
+import OrderFiltersBar, { OrderFilters } from "../components/Orders/OrderFiltersBar";
 
 /* ===========================
    Types
@@ -112,11 +113,17 @@ const Orders: React.FC = () => {
 
   const [orders, setOrders] = useState<CardOrder[]>([]);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  const [search, setSearch] = useState("");
-  const [statusFilter, setStatusFilter] = useState<"All" | OrderStatus>("All");
   const [showOrderForm, setShowOrderForm] = useState(false);
   const [selectedOrder, setSelectedOrder] = useState<CardOrder | null>(null);
   const [viewMode, setViewMode] = useState<'standard' | 'enhanced'>('standard');
+
+  // Filter state
+  const [filters, setFilters] = useState<OrderFilters>({
+    status: "All",
+    priority: "All",
+    from: new Date().toISOString().slice(0, 10), // Today's date
+    to: new Date().toISOString().slice(0, 10)    // Today's date
+  });
 
   // Add test modal state
   const [showAddTestModal, setShowAddTestModal] = useState(false);
@@ -132,6 +139,22 @@ const Orders: React.FC = () => {
   useEffect(() => {
     fetchOrders();
   }, []);
+
+  // Update selected order when orders change (for modal refresh after status update)
+  useEffect(() => {
+    if (selectedOrder) {
+      const updatedOrder = orders.find(order => order.id === selectedOrder.id);
+      if (updatedOrder && (
+        updatedOrder.status !== selectedOrder.status ||
+        updatedOrder.sample_collected_at !== selectedOrder.sample_collected_at ||
+        updatedOrder.sample_collected_by !== selectedOrder.sample_collected_by
+      )) {
+        console.log(`Updating modal order data: ${selectedOrder.status} → ${updatedOrder.status}`);
+        console.log(`Sample collection: ${selectedOrder.sample_collected_at} → ${updatedOrder.sample_collected_at}`);
+        setSelectedOrder(updatedOrder);
+      }
+    }
+  }, [orders, selectedOrder]);
 
   // Fetch tests and packages from database
   const fetchTestsAndPackages = async () => {
@@ -434,9 +457,78 @@ const Orders: React.FC = () => {
     setSummary(s);
   };
 
+  /* ------------- filtering + grouping ------------- */
+  const filtered = useMemo(() => {
+    const q = (filters.q || "").toLowerCase();
+    return orders.filter((o) => {
+      // Search filter
+      const matchesQ = !filters.q ||
+        o.patient_name.toLowerCase().includes(q) ||
+        (o.patient_id || "").toLowerCase().includes(q) ||
+        (o.id || "").toLowerCase().includes(q) ||
+        (o.doctor || "").toLowerCase().includes(q);
+
+      // Status filter
+      const matchesStatus = !filters.status || filters.status === "All" || o.status === filters.status;
+
+      // Priority filter
+      const matchesPriority = !filters.priority || filters.priority === "All" || o.priority === filters.priority;
+
+      // Date range filter
+      const matchesDateRange = () => {
+        if (!filters.from && !filters.to) return true;
+        const orderDate = new Date(o.order_date);
+        const fromDate = filters.from ? new Date(filters.from) : null;
+        const toDate = filters.to ? new Date(filters.to) : null;
+        
+        if (fromDate && orderDate < fromDate) return false;
+        if (toDate && orderDate > toDate) return false;
+        return true;
+      };
+
+      // Doctor filter
+      const matchesDoctor = !filters.doctor || 
+        (o.doctor || "").toLowerCase().includes((filters.doctor || "").toLowerCase());
+
+      return matchesQ && matchesStatus && matchesPriority && matchesDateRange() && matchesDoctor;
+    });
+  }, [orders, filters]);
+
+  // Calculate order counts for filter bar
+  const orderCounts = useMemo(() => {
+    const total = orders.length;
+    const byStatus: Record<string, number> = {};
+    const byPriority: Record<string, number> = {};
+
+    orders.forEach(order => {
+      byStatus[order.status] = (byStatus[order.status] || 0) + 1;
+      byPriority[order.priority] = (byPriority[order.priority] || 0) + 1;
+    });
+
+    return {
+      total,
+      byStatus,
+      byPriority
+    };
+  }, [orders]);
+
+  // Calculate filtered summary stats that update based on filters
+  const filteredSummary = useMemo(() => {
+    return filtered.reduce(
+      (acc, o) => {
+        if (o.status === "Completed" || o.status === "Delivered") acc.allDone++;
+        else if (o.status === "Pending Approval") acc.awaitingApproval++;
+        else if (o.enteredTotal > 0 && o.enteredTotal >= o.expectedTotal * 0.75) acc.mostlyDone++;
+        else acc.pending++;
+        return acc;
+      },
+      { allDone: 0, mostlyDone: 0, pending: 0, awaitingApproval: 0 }
+    );
+  }, [filtered]);
+
   // Transform orders for EnhancedOrdersPage
   const transformedOrdersForEnhanced = useMemo(() => {
-    return orders.map(order => ({
+    return filtered.map(order => ({
       id: order.id,
       patient_id: order.patient_id,
       patient_name: order.patient_name,
@@ -444,26 +536,13 @@ const Orders: React.FC = () => {
       total_amount: order.total_amount,
       order_date: order.order_date,
       created_at: order.order_date,
-      sample_id: order.sample_id,
+      sample_id: order.sample_id || undefined,
       tests: order.tests,
       can_add_tests: !['Completed', 'Delivered'].includes(order.status),
       visit_group_id: order.sample_id ? `sample-${order.sample_id}` : `${order.patient_id}-${order.order_date.slice(0, 10)}`,
       order_type: 'initial' as const
     }));
-  }, [orders]);
-
-  /* ------------- filtering + grouping ------------- */
-  const filtered = useMemo(() => {
-    const q = search.toLowerCase();
-    return orders.filter((o) => {
-      const matchesQ =
-        o.patient_name.toLowerCase().includes(q) ||
-        (o.patient_id || "").toLowerCase().includes(q) ||
-        (o.id || "").toLowerCase().includes(q);
-      const matchesStatus = statusFilter === "All" || o.status === statusFilter;
-      return matchesQ && matchesStatus;
-    });
-  }, [orders, search, statusFilter]);
+  }, [filtered]);
 
   type Group = { key: string; label: string; orders: CardOrder[] };
   const groups: Group[] = useMemo(() => {
@@ -528,8 +607,8 @@ const Orders: React.FC = () => {
     }
   };
 
-  const handleUpdateStatus = async (_orderId: string, _newStatus: string) => {
-    // Implementation for updating status
+  const handleUpdateStatus = async () => {
+    // Centralized components perform the update; here we only refresh data
     await fetchOrders();
   };
 
@@ -576,6 +655,13 @@ const Orders: React.FC = () => {
           </div>
         </div>
 
+        {/* Filters Bar */}
+        <OrderFiltersBar
+          value={filters}
+          onChange={setFilters}
+          orderCounts={orderCounts}
+        />
+
         <EnhancedOrdersPage
           orders={transformedOrdersForEnhanced}
           onAddOrder={handleAddOrder}
@@ -597,16 +683,11 @@ const Orders: React.FC = () => {
           <OrderDetailsModal
             order={selectedOrder}
             onClose={() => setSelectedOrder(null)}
-            onUpdateStatus={async () => {
+            onUpdateStatus={handleUpdateStatus}
+            onSubmitResults={async (orderId: string, resultsData: any[]) => {
+              console.log('onSubmitResults called');
               await fetchOrders();
               setSelectedOrder(null);
-            }}
-            onAfterSubmit={async () => {
-              await fetchOrders();
-              setSelectedOrder(null);
-            }}
-            onAfterSaveDraft={async () => {
-              await fetchOrders();
             }}
           />
         )}
@@ -663,7 +744,7 @@ const Orders: React.FC = () => {
         <div className="bg-green-50 border border-green-200 rounded-lg p-4">
           <div className="flex items-center justify-between">
             <div>
-              <div className="text-2xl font-bold text-green-900">{summary.allDone}</div>
+              <div className="text-2xl font-bold text-green-900">{filteredSummary.allDone}</div>
               <div className="text-sm text-green-700">All Done</div>
             </div>
             <div className="bg-green-500 p-2 rounded-lg">
@@ -674,7 +755,7 @@ const Orders: React.FC = () => {
         <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
           <div className="flex items-center justify-between">
             <div>
-              <div className="text-2xl font-bold text-blue-900">{summary.mostlyDone}</div>
+              <div className="text-2xl font-bold text-blue-900">{filteredSummary.mostlyDone}</div>
               <div className="text-sm text-blue-700">Mostly Done</div>
             </div>
             <div className="bg-blue-500 p-2 rounded-lg">
@@ -685,7 +766,7 @@ const Orders: React.FC = () => {
         <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
           <div className="flex items-center justify-between">
             <div>
-              <div className="text-2xl font-bold text-yellow-900">{summary.pending}</div>
+              <div className="text-2xl font-bold text-yellow-900">{filteredSummary.pending}</div>
               <div className="text-sm text-yellow-700">Pending</div>
             </div>
             <div className="bg-yellow-500 p-2 rounded-lg">
@@ -696,7 +777,7 @@ const Orders: React.FC = () => {
         <div className="bg-orange-50 border border-orange-200 rounded-lg p-4">
           <div className="flex items-center justify-between">
             <div>
-              <div className="text-2xl font-bold text-orange-900">{summary.awaitingApproval}</div>
+              <div className="text-2xl font-bold text-orange-900">{filteredSummary.awaitingApproval}</div>
               <div className="text-sm text-orange-700">Awaiting Approval</div>
             </div>
             <div className="bg-orange-500 p-2 rounded-lg">
@@ -706,37 +787,12 @@ const Orders: React.FC = () => {
         </div>
       </div>
 
-      {/* Search / Filters */}
-      <div className="bg-white rounded-lg border border-gray-200 p-4">
-        <div className="flex flex-col sm:flex-row gap-3">
-          <div className="flex-1 relative">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-400" />
-            <input
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search by patient, order ID, or patient ID…"
-              className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500"
-            />
-          </div>
-          <select
-            value={statusFilter}
-            onChange={(e) => setStatusFilter(e.target.value as any)}
-            className="px-3 py-2 border border-gray-300 rounded-md"
-          >
-            {["All", "Order Created", "Sample Collection", "In Progress", "Pending Approval", "Completed", "Delivered"].map(
-              (s) => (
-                <option key={s} value={s}>
-                  {s}
-                </option>
-              )
-            )}
-          </select>
-          <button className="inline-flex items-center px-3 py-2 border border-gray-300 rounded-md">
-            <Filter className="h-4 w-4 mr-2" />
-            More Filters
-          </button>
-        </div>
-      </div>
+      {/* Filters Bar */}
+      <OrderFiltersBar
+        value={filters}
+        onChange={setFilters}
+        orderCounts={orderCounts}
+      />
 
       {/* Groups + Cards */}
       <div className="bg-white rounded-lg border border-gray-200">

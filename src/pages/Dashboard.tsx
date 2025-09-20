@@ -307,37 +307,40 @@ const Dashboard: React.FC = () => {
   // Add this function after the existing fetchOrders function
   const handleAddOrder = async (orderData: any) => {
     try {
-      // Get current user's lab ID
+      console.log('Dashboard: Creating new order:', orderData);
+      console.log('Dashboard: Tests array:', orderData.tests, 'Length:', orderData.tests?.length);
+      console.log('Dashboard: Test objects structure:', orderData.tests?.[0]);
+      
+      // Get current user's lab ID and add it to orderData
       const labId = await database.getCurrentUserLabId();
-
-      // Create the order (pass through optional account_id if present)
-      const { data: order, error: orderError } = await database.orders.create({
-        ...orderData,
-        lab_id: labId,
-        status: 'Order Created',
-        order_date: new Date().toISOString(),
-        expected_date: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(), // Next day
-        priority: orderData.priority || 'Normal',
-        account_id: orderData.account_id || null, // NEW: optional bill-to account
-      });
-
-      if (orderError) throw orderError;
-
+      const orderDataWithLab = { ...orderData, lab_id: labId };
+      
+      // Create the order in the database (pass through like Orders page does)
+      const { data: order, error: orderError } = await database.orders.create(orderDataWithLab);
+      if (orderError) {
+        console.error('Dashboard: Error creating order:', orderError);
+        alert('Failed to create order. Please try again.');
+        return;
+      }
+      
+      console.log('Dashboard: Order created successfully:', order);
+      
       // If the form attached a test request file, upload now (optional pattern)
       if (orderData.testRequestFile) {
-        await database.attachments.uploadForOrder(order.id, orderData.testRequestFile, {
-          file_type: 'test_request_form',
-          description: 'Test Request Form',
-        });
+        // TODO: Implement file upload once database.attachments.uploadForOrder is available
+        console.log('Dashboard: File upload requested but not implemented yet');
       }
 
       // Refresh orders
       await fetchOrders();
-
-      // Success UX
-      console.log('Order created successfully:', order);
+      
+      // Close the form
+      setShowOrderForm(false);
+      
+      // Show success message
+      alert('Order created successfully!');
     } catch (error) {
-      console.error('Error creating order:', error);
+      console.error('Dashboard: Error creating order:', error);
       alert('Failed to create order. Please try again.');
     }
   };
@@ -348,9 +351,22 @@ const Dashboard: React.FC = () => {
     setShowInvoiceModal(true);
   };
 
-  const handleRecordPayment = (invoiceId: string) => {
-    setPaymentInvoiceId(invoiceId);
-    setShowPaymentModal(true);
+  const handleRecordPayment = async (orderId: string) => {
+    try {
+      // Fetch the invoice for this order
+      const { data: invoice, error } = await database.invoices.getByOrderId(orderId);
+      
+      if (error || !invoice) {
+        alert('No invoice found for this order. Please create an invoice first.');
+        return;
+      }
+      
+      setPaymentInvoiceId(invoice.id);
+      setShowPaymentModal(true);
+    } catch (error) {
+      console.error('Error fetching invoice for order:', error);
+      alert('Failed to fetch invoice details. Please try again.');
+    }
   };
 
   // Billing badge helper
@@ -765,10 +781,9 @@ const Dashboard: React.FC = () => {
                             {/* Record Payment button - for billed orders */}
                             {o.billing_status === 'billed' && (
                               <button
-                                onClick={(e) => {
+                                onClick={async (e) => {
                                   e.stopPropagation();
-                                  // For now, use order ID - in a real implementation, we'd need the invoice ID
-                                  handleRecordPayment(o.id);
+                                  await handleRecordPayment(o.id);
                                 }}
                                 className="mt-2 inline-flex items-center px-3 py-1.5 text-sm bg-purple-600 text-white rounded-lg hover:bg-purple-700"
                               >
@@ -913,9 +928,27 @@ const Dashboard: React.FC = () => {
         <OrderDetailsModal
           order={selectedOrder}
           onClose={() => setSelectedOrder(null)}
-          onUpdateStatus={async () => {
-            await fetchOrders();
-            setSelectedOrder(null);
+          onUpdateStatus={async (orderId: string, newStatus: string) => {
+            try {
+              // Update the order status in the database
+              const { error } = await database.orders.update(orderId, { 
+                status: newStatus,
+                status_updated_at: new Date().toISOString(),
+                status_updated_by: user?.email || 'Unknown'
+              });
+              if (error) {
+                console.error('Error updating order status:', error);
+                return;
+              }
+              
+              console.log(`Order ${orderId} status updated to: ${newStatus}`);
+              
+              // Refresh the orders list and close the modal
+              await fetchOrders();
+              setSelectedOrder(null);
+            } catch (error) {
+              console.error('Error updating order status:', error);
+            }
           }}
           onAfterSubmit={async () => {
             await fetchOrders();

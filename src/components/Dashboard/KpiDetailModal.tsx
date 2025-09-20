@@ -1,6 +1,6 @@
 import React from "react";
 import { X, Search, Eye, Loader2, AlertTriangle } from "lucide-react";
-import { supabase } from "../../utils/supabase";
+import { supabase, database } from "../../utils/supabase";
 import OrderDetailsModal from "../Orders/OrderDetailsModal";
 
 export type KpiKind =
@@ -327,7 +327,24 @@ const KpiDetailModal: React.FC<Props> = ({ open, onClose, kind, title, dateRange
             sample_collected_by: null,
           }}
           onClose={() => setSelected(null)}
-          onUpdateStatus={() => setSelected(null)}
+          onUpdateStatus={async (orderId: string, newStatus: string) => {
+            try {
+              // Update the order status in the database
+              const { error } = await database.orders.update(orderId, { 
+                status: newStatus,
+                status_updated_at: new Date().toISOString()
+              });
+              if (error) {
+                console.error('Error updating order status:', error);
+                return;
+              }
+              
+              console.log(`Order ${orderId} status updated to: ${newStatus}`);
+              setSelected(null);
+            } catch (error) {
+              console.error('Error updating order status:', error);
+            }
+          }}
           onSubmitResults={() => setSelected(null)}
         />
       )}

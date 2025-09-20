@@ -2,12 +2,19 @@ import React, { useState, useEffect, useCallback } from 'react'
 import { Model } from 'survey-core'
 import { Survey } from 'survey-react-ui'
 import 'survey-core/defaultV2.min.css'
+import { supabase } from '../../utils/supabase'
 
 interface SimpleWorkflowRunnerProps {
   workflowDefinition: any
   onComplete?: (results: any) => void
   orderId?: string
   testGroupId?: string
+  patientId?: string
+  patientName?: string
+  testName?: string
+  sampleId?: string
+  labId?: string
+  testCode?: string
 }
 
 type WorkflowStatus = 'loading' | 'ready' | 'running' | 'completed' | 'error'
@@ -16,7 +23,13 @@ const SimpleWorkflowRunner: React.FC<SimpleWorkflowRunnerProps> = ({
   workflowDefinition,
   onComplete,
   orderId,
-  testGroupId
+  testGroupId,
+  patientId,
+  patientName,
+  testName,
+  sampleId,
+  labId,
+  testCode
 }) => {
   const [survey, setSurvey] = useState<Model | null>(null)
   const [status, setStatus] = useState<WorkflowStatus>('loading')
@@ -46,6 +59,23 @@ const SimpleWorkflowRunner: React.FC<SimpleWorkflowRunnerProps> = ({
       setStatus('error')
     }
   }, [workflowDefinition])
+
+  // Set survey data with context information
+  useEffect(() => {
+    if (survey && orderId) {
+      survey.data = {
+        orderId,
+        testGroupId,
+        patientId,
+        patientName,
+        testName,
+        sampleId,
+        labId,
+        testCode,
+        ...survey.data
+      };
+    }
+  }, [survey, orderId, testGroupId, patientId, patientName, testName, sampleId, labId, testCode]);
 
   // Extract measurement data from survey results
   const extractMeasurements = (results: any) => {
@@ -94,17 +124,31 @@ const SimpleWorkflowRunner: React.FC<SimpleWorkflowRunnerProps> = ({
       const workflowResult = {
         workflow_instance_id: instanceId,
         step_id: 'final_results',
+        order_id: orderId,
+        patient_id: patientId,
+        lab_id: labId,
+        test_group_id: testGroupId,
+        test_name: testName,
+        test_code: testCode,
+        review_status: 'completed',
+        sample_id: sampleId,
         status: 'done',
         payload: {
           orderId: orderId,
-          testGroupId: testGroupId || null,
+          testGroupId: testGroupId,
+          patientId: patientId,
+          patientName: patientName,
+          testName: testName,
+          sampleId: sampleId,
+          labId: labId,
+          testCode: testCode,
           results: {
-            patient_id: null, // Should come from order
-            patient_name: null, // Should come from order
-            sample_id: null, // Should come from order
-            review_status: 'submitted',
+            patient_id: patientId,
+            patient_name: patientName,
+            sample_id: sampleId,
+            review_status: 'completed',
             ...surveyResults,
-            test_name: workflowDefinition?.title || workflowDefinition?.meta?.title || 'Workflow Test',
+            test_name: testName || workflowDefinition?.title || workflowDefinition?.meta?.title || 'Workflow Test',
             measurements: extractMeasurements(surveyResults),
             qc_data: extractQCData(surveyResults)
           }
@@ -134,6 +178,69 @@ const SimpleWorkflowRunner: React.FC<SimpleWorkflowRunnerProps> = ({
       const result = await response.json()
       console.log('Workflow submitted successfully:', result)
       
+      // Also save to regular results tables for consistency
+      if (orderId && labId) {
+        try {
+          // Create or update results entry
+          const resultData = {
+            order_id: orderId,
+            patient_id: patientId,
+            patient_name: patientName,
+            test_name: testName,
+            status: 'pending_verification',
+            entered_by: 'Workflow System',
+            entered_date: new Date().toISOString().split('T')[0],
+            test_group_id: testGroupId,
+            lab_id: labId,
+            extracted_by_ai: true,
+            workflow_instance_id: instanceId,
+          };
+
+          const { data: savedResult, error: resultError } = await supabase
+            .from('results')
+            .insert(resultData)
+            .select()
+            .single();
+
+          if (!resultError && savedResult) {
+            // Extract individual analyte values from workflow results
+            const resultValues = [];
+            
+            // Common urine analysis parameters
+            const urineParams = ['ph', 'sg', 'color', 'clarity', 'glucose', 'protein', 
+                               'ketone', 'bilirubin', 'nitrite', 'leukocyte', 'urobili'];
+            
+            for (const param of urineParams) {
+              if (surveyResults[param]) {
+                resultValues.push({
+                  result_id: savedResult.id,
+                  analyte_name: param.toUpperCase(),
+                  value: surveyResults[param],
+                  unit: param === 'sg' ? '' : param === 'ph' ? '' : '',
+                  reference_range: 'Normal',
+                  order_id: orderId,
+                  test_group_id: testGroupId,
+                  lab_id: labId,
+                });
+              }
+            }
+
+            if (resultValues.length > 0) {
+              const { error: valuesError } = await supabase
+                .from('result_values')
+                .insert(resultValues);
+
+              if (valuesError) {
+                console.error('Error saving result values:', valuesError);
+              }
+            }
+          }
+        } catch (additionalSaveError) {
+          console.error('Error saving to regular results tables:', additionalSaveError);
+          // Don't fail the whole operation if additional save fails
+        }
+      }
+      
       // Update local state
       setCompletionData(surveyResults)
       setStatus('completed')
@@ -148,7 +255,7 @@ const SimpleWorkflowRunner: React.FC<SimpleWorkflowRunnerProps> = ({
     } finally {
       setIsSubmitting(false)
     }
-  }, [instanceId, orderId, testGroupId, onComplete, workflowDefinition])
+  }, [instanceId, orderId, testGroupId, patientId, patientName, testName, sampleId, labId, testCode, onComplete, workflowDefinition])
 
   // Attach completion handler
   useEffect(() => {

@@ -492,6 +492,9 @@ export const database = {
       if (!lab_id) {
         return { data: null, error: new Error('No lab_id found for current user') };
       }
+      // Get current auth user id for created_by
+      const { data: auth } = await supabase.auth.getUser();
+      const authUserId = auth?.user?.id || null;
       
       // First get the daily sequence for sample ID generation
       const orderDate = orderData.order_date || new Date().toISOString().split('T')[0];
@@ -523,6 +526,7 @@ export const database = {
         color_code,
         color_name,
         lab_id,
+        created_by: orderDetails?.created_by ?? authUserId,
         status: orderData.status || 'Order Created' // Default status
       };
       
@@ -640,6 +644,97 @@ export const database = {
       return { data, error };
     },
 
+    // NEW: Sample collection methods
+    markSampleCollected: async (orderId: string, collectedBy?: string) => {
+      try {
+        const { data: auth } = await supabase.auth.getUser();
+        const collectorName = collectedBy || auth?.user?.user_metadata?.full_name || auth?.user?.email || 'Unknown User';
+        
+        const { data, error } = await supabase
+          .from('orders')
+          .update({
+            sample_collected_at: new Date().toISOString(),
+            sample_collected_by: collectorName,
+            status: 'Sample Collection',
+            status_updated_at: new Date().toISOString(),
+            status_updated_by: collectorName
+          })
+          .eq('id', orderId)
+          .select()
+          .single();
+        
+        if (error) {
+          console.error('Error marking sample as collected:', error);
+          return { data: null, error };
+        }
+        
+        console.log('Sample marked as collected successfully:', data);
+        return { data, error: null };
+      } catch (err) {
+        console.error('Error in markSampleCollected:', err);
+        return { data: null, error: err };
+      }
+    },
+
+    markSampleNotCollected: async (orderId: string) => {
+      try {
+        const { data: auth } = await supabase.auth.getUser();
+        const updaterName = auth?.user?.user_metadata?.full_name || auth?.user?.email || 'Unknown User';
+        
+        const { data, error } = await supabase
+          .from('orders')
+          .update({
+            sample_collected_at: null,
+            sample_collected_by: null,
+            status: 'Order Created',
+            status_updated_at: new Date().toISOString(),
+            status_updated_by: updaterName
+          })
+          .eq('id', orderId)
+          .select()
+          .single();
+        
+        if (error) {
+          console.error('Error marking sample as not collected:', error);
+          return { data: null, error };
+        }
+        
+        console.log('Sample marked as not collected successfully:', data);
+        return { data, error: null };
+      } catch (err) {
+        console.error('Error in markSampleNotCollected:', err);
+        return { data: null, error: err };
+      }
+    },
+
+    updateStatus: async (orderId: string, newStatus: string, updatedBy?: string) => {
+      try {
+        const { data: auth } = await supabase.auth.getUser();
+        const updaterName = updatedBy || auth?.user?.user_metadata?.full_name || auth?.user?.email || 'Unknown User';
+        
+        const { data, error } = await supabase
+          .from('orders')
+          .update({
+            status: newStatus,
+            status_updated_at: new Date().toISOString(),
+            status_updated_by: updaterName
+          })
+          .eq('id', orderId)
+          .select()
+          .single();
+        
+        if (error) {
+          console.error('Error updating order status:', error);
+          return { data: null, error };
+        }
+        
+        console.log('Order status updated successfully:', data);
+        return { data, error: null };
+      } catch (err) {
+        console.error('Error in updateStatus:', err);
+        return { data: null, error: err };
+      }
+    },
     delete: async (id: string) => {
       const { error } = await supabase
         .from('orders')
@@ -1216,6 +1311,21 @@ export const database = {
         .update({ consolidated_invoice_id: consolidatedInvoiceId })
         .in('id', invoiceIds)
         .select();
+      
+      return { data, error };
+    },
+
+    getByOrderId: async (orderId: string) => {
+      const { data, error } = await supabase
+        .from('invoices')
+        .select(`
+          *,
+          invoice_items(*)
+        `)
+        .eq('order_id', orderId)
+        .order('invoice_date', { ascending: false })
+        .limit(1)
+        .maybeSingle();
       
       return { data, error };
     }
@@ -3268,7 +3378,8 @@ const masterDataAPI = {
   },
 
   // --- NEW Phase 4: Account-aware invoice helpers used by Billing page/PaymentCapture ---
-  invoices: {
+  // NOTE: Renamed to avoid overriding the primary invoices API above (which includes create/update/delete)
+  invoicesV4: {
     getById: async (id: string) =>
       supabase
         .from('invoices')
@@ -3305,6 +3416,15 @@ const masterDataAPI = {
 
     getByInvoice: async (invoiceId: string) =>
       supabase.from('payments').select('*').eq('invoice_id', invoiceId).order('created_at'),
+
+    getByInvoiceId: async (invoiceId: string) => {
+      const { data, error } = await supabase
+        .from('payments')
+        .select('*')
+        .eq('invoice_id', invoiceId)
+        .order('payment_date', { ascending: false });
+      return { data, error };
+    },
 
     // For Cash Reconciliation (cash-only, date + location)
     getByDateRange: async (fromDate: string, toDate: string, locationId: string) =>

@@ -26,6 +26,7 @@ const navigation = [
   { name: 'Dashboard', href: '/', icon: LayoutDashboard, category: 'core' },
   { name: 'Orders', href: '/orders', icon: ClipboardList, category: 'core' },
   { name: 'Results Entry', href: '/results', icon: Activity, category: 'core' },
+  { name: 'Results Entry 2 (AI)', href: '/results2', icon: Brain, category: 'core' },
   { name: 'Results Verification', href: '/results-verification', icon: CheckCircle2, category: 'core' },
   { name: 'Reports', href: '/reports', icon: FileText, category: 'core' }, // Moved after Results Entry per request
   
