@@ -30,39 +30,6 @@ import {
 } from './pdfProviderConfig';
 
 /**
- * Helper to build context for template rendering
- */
-const buildContextFromReportTemplate = (context: ReportTemplateContext): Record<string, any> => {
-  return {
-    // Patient info
-    patientName: context.patient?.name || 'N/A',
-    patientAge: context.patient?.age || 'N/A',
-    patientGender: context.patient?.gender || 'N/A',
-    patientId: context.patientId || 'N/A',
-    
-    // Order info
-    orderId: context.orderId || 'N/A',
-    sampleCollectedAt: context.order?.sampleCollectedAt || 'N/A',
-    sampleReceivedAt: context.order?.sampleReceivedAt || 'N/A',
-    referringDoctorName: context.order?.referringDoctorName || 'Self',
-    
-    // Lab info
-    labName: context.lab?.name || 'Laboratory',
-    labAddress: context.lab?.address || '',
-    labPhone: context.lab?.phone || '',
-    labEmail: context.lab?.email || '',
-    
-    // Test results
-    analytes: context.analytes || [],
-    testGroupIds: context.testGroupIds || [],
-    
-    // Meta
-    allAnalytesApproved: context.meta?.allAnalytesApproved || false,
-    report_generated_at: new Date().toISOString(),
-  };
-};
-
-/**
  * Helper to select the best template for a test group
  */
 const selectTemplateForTestGroup = (
@@ -297,7 +264,7 @@ export const prepareReportHtml = async (
   let finalHtml = '';
 
   if (hasMultipleTestGroups && templates && templates.length > 0) {
-    console.log(`🔀 Detected ${context.testGroupIds!.length} test groups, attempting multi-template merge`);
+    console.log(`🔀 Detected ${context.testGroupIds.length} test groups, attempting multi-template merge`);
     
     try {
       const result = renderMultipleTestGroupTemplates(
