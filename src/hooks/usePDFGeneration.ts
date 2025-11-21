@@ -71,7 +71,10 @@ export const usePDFGeneration = () => {
         setState(prev => ({ ...prev, stage: 'Starting download...', progress: 95 }));
         
         // Download the PDF
-        const { data: context } = await database.reports.getTemplateContext(orderId);
+        const { data: context, error: contextError } = await database.reports.getTemplateContext(orderId);
+        if (contextError) {
+          console.error('Failed to get context for filename:', contextError);
+        }
         const safePatientName = context?.patient?.name?.replace(/\s+/g, '_') || 'Patient';
         const isDraft = forceDraft || context?.meta?.allAnalytesApproved !== true;
         const filename = `${safePatientName}_${orderId}${isDraft ? '_DRAFT' : ''}.pdf`;

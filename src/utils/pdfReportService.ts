@@ -63,6 +63,32 @@ const buildContextFromReportTemplate = (context: ReportTemplateContext): Record<
 };
 
 /**
+ * Helper to select the best template for a test group
+ */
+const selectTemplateForTestGroup = (
+  testGroupId: string,
+  templates: LabTemplateRecord[],
+  context: ReportTemplateContext
+): LabTemplateRecord | null => {
+  // Try to find a template specifically for this test group
+  if (testGroupId !== 'ungrouped') {
+    const specificTemplate = templates.find(t => t.test_group_id === testGroupId && t.gjs_html);
+    if (specificTemplate) return specificTemplate;
+  }
+  
+  // Fall back to selecting based on context
+  const contextTemplate = selectTemplateForContext(templates, context);
+  if (contextTemplate) return contextTemplate;
+  
+  // Fall back to default template
+  const defaultTemplate = templates.find(t => t.is_default && t.gjs_html);
+  if (defaultTemplate) return defaultTemplate;
+  
+  // Last resort: any template with HTML
+  return templates.find(t => t.gjs_html) || null;
+};
+
+/**
  * Helper to group analytes by test_group_id
  */
 const groupAnalytesByTestGroup = (analytes: any[]): Map<string, any[]> => {
@@ -73,7 +99,10 @@ const groupAnalytesByTestGroup = (analytes: any[]): Map<string, any[]> => {
     if (!grouped.has(testGroupId)) {
       grouped.set(testGroupId, []);
     }
-    grouped.get(testGroupId)!.push(analyte);
+    const group = grouped.get(testGroupId);
+    if (group) {
+      group.push(analyte);
+    }
   }
   
   return grouped;
@@ -130,23 +159,8 @@ const renderMultipleTestGroupTemplates = (
       testGroupIds: [testGroupId],
     };
     
-    // Select template for this specific test group
-    let groupTemplate: LabTemplateRecord | null = null;
-    
-    // Try to find a template specifically for this test group
-    if (testGroupId !== 'ungrouped') {
-      groupTemplate = templates.find(t => t.test_group_id === testGroupId && t.gjs_html) || null;
-    }
-    
-    // Fall back to selecting based on context
-    if (!groupTemplate) {
-      groupTemplate = selectTemplateForContext(templates, groupContext);
-    }
-    
-    // Fall back to default template
-    if (!groupTemplate) {
-      groupTemplate = templates.find(t => t.is_default && t.gjs_html) || templates.find(t => t.gjs_html) || null;
-    }
+    // Select template for this specific test group using helper
+    const groupTemplate = selectTemplateForTestGroup(testGroupId, templates, groupContext);
     
     if (groupTemplate?.gjs_html) {
       const bundle = renderLabTemplateHtmlBundle(groupTemplate, {
@@ -519,7 +533,10 @@ export const generateFinalReportPDF = async (
 
     // Fallback to PDF.co (if needed)
     if (!pdfUrl) {
-      throw new Error('PDF generation failed. Please try again.');
+      const errorMsg = usePuppeteer 
+        ? 'PDF generation failed with Puppeteer. PDF.co fallback is not implemented in this simplified service. Please try again or contact support if the issue persists.'
+        : 'PDF generation is not available. Puppeteer is disabled and PDF.co fallback is not implemented. Please contact support.';
+      throw new Error(errorMsg);
     }
 
     onProgress?.('Saving PDF to storage...', 70);
