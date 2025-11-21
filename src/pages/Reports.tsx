@@ -34,12 +34,12 @@ import {
   endOfMonth,
 } from 'date-fns';
 import {
-  viewPDFReport,
   generateTemplatePreviewPDF,
   createReportDataFromContext,
   selectTemplateForContext,
 } from '../utils/pdfService';
 import type { LabTemplateRecord, ReportData, LabBrandingHtmlDefaults } from '../utils/pdfService';
+import { viewReportInBrowser } from '../utils/pdfReportService';
 import PDFProgressModal from '../components/PDFProgressModal';
 import { usePDFGeneration, isOrderReportReady } from '../hooks/usePDFGeneration';
 import QuickSendReport from '../components/WhatsApp/QuickSendReport';
@@ -405,14 +405,12 @@ const Reports: React.FC = () => {
     }
 
     try {
-      const reportData = await prepareReportData(group);
-      const pdfUrl = await viewPDFReport(orderId, reportData);
+      // Load templates for multi-test-group support
+      const { data: templates } = await database.labTemplates.list();
+      const typedTemplates = (templates as LabTemplateRecord[]) || [];
       
-      if (pdfUrl) {
-        window.open(pdfUrl, '_blank');
-      } else {
-        alert('Failed to generate or view PDF report');
-      }
+      // Use new simplified service - opens HTML in browser window
+      await viewReportInBrowser(orderId, typedTemplates);
     } catch (error) {
       console.error('View failed:', error);
       alert('Failed to view report: ' + (error instanceof Error ? error.message : 'Unknown error'));
