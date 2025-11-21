@@ -51,7 +51,7 @@ export const usePDFGeneration = () => {
       }
 
       // Load templates
-      const { data: templates, error: templateError } = await database.labTemplates.list();
+      const { data: templates } = await database.labTemplates.list();
       const allTemplates = (templates as LabTemplateRecord[]) || [];
 
       // Use new simplified service to generate PDF

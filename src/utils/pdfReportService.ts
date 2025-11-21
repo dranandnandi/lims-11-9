@@ -12,14 +12,10 @@
 import { supabase, database } from './supabase';
 import type { ReportTemplateContext, LabTemplateRecord } from './supabase';
 import {
-  buildReportHtmlBundle,
   renderLabTemplateHtmlBundle,
-  buildSampleTemplateContext,
   selectTemplateForContext,
-  createReportDataFromContext,
   savePDFToStorage,
   updateReportWithPDFInfo,
-  type ReportData,
   type LabBrandingHtmlDefaults
 } from './pdfService';
 import {
@@ -27,7 +23,6 @@ import {
   analyzePDFComplexity,
 } from './pdfServicePuppeteer';
 import {
-  getPDFConfig,
   shouldUsePuppeteer,
   shouldFallbackToPDFCO,
   logPDFEvent,
