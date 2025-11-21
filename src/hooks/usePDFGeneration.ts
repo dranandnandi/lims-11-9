@@ -1,12 +1,8 @@
 import { useState, useCallback } from 'react';
 import type { LabTemplateRecord } from '../utils/pdfService';
-import {
-  generateAndSavePDFReportWithProgress,
-  ReportData,
-  selectTemplateForContext,
-  createReportDataFromContext,
-} from '../utils/pdfService';
-import { supabase, database } from '../utils/supabase';
+import { database } from '../utils/supabase';
+import { generateFinalReportPDF, downloadReportPDF } from '../utils/pdfReportService';
+import { supabase } from '../utils/supabase';
 
 export async function isOrderReportReady(orderId: string): Promise<boolean> {
   const { data, error } = await supabase
@@ -42,52 +38,25 @@ export const usePDFGeneration = () => {
     });
 
     try {
-      setState(prev => ({ ...prev, stage: 'Loading report context...', progress: 10 }));
-
-      const { data: context, error: contextError } = await database.reports.getTemplateContext(orderId);
-      if (contextError || !context) {
-        const message = contextError?.message || 'Failed to load report context';
-        throw new Error(message);
-      }
-
-      if (!Array.isArray(context.analytes) || context.analytes.length === 0) {
-        throw new Error('No test results found for this order');
-      }
-
-      const isDraft = forceDraft || context.meta?.allAnalytesApproved !== true;
-
-      setState(prev => ({
-        ...prev,
-        stage: isDraft ? 'Draft report – pending approvals...' : 'All panels approved.',
-        progress: 30,
-      }));
-
-      let selectedTemplate: LabTemplateRecord | null = null;
-      let allTemplates: LabTemplateRecord[] = [];
-      try {
-        const { data: templates, error: templateError } = await database.labTemplates.list();
-        if (templateError) {
-          console.warn('Unable to load lab templates for PDF generation:', templateError);
-        } else if (Array.isArray(templates) && templates.length > 0) {
-          allTemplates = templates as LabTemplateRecord[];
-          selectedTemplate = selectTemplateForContext(allTemplates, context);
+      // Check if order is ready (for non-draft reports)
+      if (!forceDraft) {
+        const { data: context, error: contextError } = await database.reports.getTemplateContext(orderId);
+        if (contextError || !context) {
+          throw new Error('Failed to load report context');
         }
-      } catch (templateFetchError) {
-        console.warn('Unexpected template fetch failure:', templateFetchError);
+
+        if (!Array.isArray(context.analytes) || context.analytes.length === 0) {
+          throw new Error('No test results found for this order');
+        }
       }
 
-      setState(prev => ({ ...prev, stage: 'Preparing report data...', progress: 55 }));
+      // Load templates
+      const { data: templates } = await database.labTemplates.list();
+      const allTemplates = (templates as LabTemplateRecord[]) || [];
 
-      const reportData: ReportData = createReportDataFromContext(context, {
-        template: selectedTemplate,
-        isDraft,
-      });
-
-      setState(prev => ({ ...prev, stage: 'Generating PDF...', progress: 75 }));
-
-      const pdfUrl = await generateAndSavePDFReportWithProgress(
+      // Use new simplified service to generate PDF
+      const pdfUrl = await generateFinalReportPDF(
         orderId,
-        reportData,
         (stage: string, progress?: number) => {
           setState(prev => ({
             ...prev,
@@ -95,42 +64,33 @@ export const usePDFGeneration = () => {
             progress: progress ?? prev.progress,
           }));
         },
-        isDraft,
-        allTemplates  // Pass all templates for multi-test-group support
+        allTemplates
       );
 
       if (pdfUrl) {
         setState(prev => ({ ...prev, stage: 'Starting download...', progress: 95 }));
         
         // Download the PDF
-        const safePatientName = reportData.patient.name || 'Patient';
-        const filename = `${safePatientName.replace(/\s+/g, '_')}_${orderId}${isDraft ? '_DRAFT' : ''}.pdf`;
-        const response = await fetch(pdfUrl);
-        if (response.ok) {
-          const blob = await response.blob();
-          const downloadUrl = window.URL.createObjectURL(blob);
-          
-          const link = document.createElement('a');
-          link.href = downloadUrl;
-          link.download = filename;
-          document.body.appendChild(link);
-          link.click();
-          document.body.removeChild(link);
-          window.URL.revokeObjectURL(downloadUrl);
-          
-          setState(prev => ({
-            ...prev,
-            stage: 'PDF downloaded successfully!',
-            progress: 100
-          }));
-          
-          // Auto-hide after 2 seconds on success
-          setTimeout(() => {
-            setState(prev => ({ ...prev, isGenerating: false }));
-          }, 2000);
-        } else {
-          throw new Error('Failed to download PDF');
+        const { data: context, error: contextError } = await database.reports.getTemplateContext(orderId);
+        if (contextError) {
+          console.error('Failed to get context for filename:', contextError);
         }
+        const safePatientName = context?.patient?.name?.replace(/\s+/g, '_') || 'Patient';
+        const isDraft = forceDraft || context?.meta?.allAnalytesApproved !== true;
+        const filename = `${safePatientName}_${orderId}${isDraft ? '_DRAFT' : ''}.pdf`;
+        
+        await downloadReportPDF(pdfUrl, filename);
+        
+        setState(prev => ({
+          ...prev,
+          stage: 'PDF downloaded successfully!',
+          progress: 100
+        }));
+        
+        // Auto-hide after 2 seconds on success
+        setTimeout(() => {
+          setState(prev => ({ ...prev, isGenerating: false }));
+        }, 2000);
       } else {
         setState(prev => ({
           ...prev,
