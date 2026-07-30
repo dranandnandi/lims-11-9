@@ -69,6 +69,8 @@ const EMPTY_FORM = {
   instrument_identifier: '',
   analyzer_type: '',
   worklist_flow: 'lims_push' as 'lims_push' | 'analyzer_initiated',
+  direction: 'bidirectional' as 'bidirectional' | 'receive_only',
+  use_saved_reference_ranges: true,
   baud_rate: '9600',
   data_bits: '8',
   stop_bits: '1',
@@ -183,6 +185,8 @@ export default function AnalyzerConnectionsManager({ labId }: { labId: string })
       instrument_identifier: conn.config?.instrument_identifier ?? '',
       analyzer_type: conn.config?.type ?? '',
       worklist_flow: (conn.config?.worklist_flow ?? 'lims_push') as 'lims_push' | 'analyzer_initiated',
+      direction: (conn.config?.direction === 'receive_only' ? 'receive_only' : 'bidirectional') as 'bidirectional' | 'receive_only',
+      use_saved_reference_ranges: conn.config?.use_saved_reference_ranges !== false,
       baud_rate: conn.config?.baud_rate?.toString() ?? conn.config?.baudRate?.toString() ?? '9600',
       data_bits: conn.config?.data_bits?.toString() ?? conn.config?.dataBits?.toString() ?? '8',
       stop_bits: conn.config?.stop_bits?.toString() ?? conn.config?.stopBits?.toString() ?? '1',
@@ -206,6 +210,8 @@ export default function AnalyzerConnectionsManager({ labId }: { labId: string })
       instrument_identifier: form.instrument_identifier.trim() || undefined,
       type: form.analyzer_type.trim() || undefined,
       worklist_flow: form.worklist_flow,
+      direction: form.direction,
+      use_saved_reference_ranges: form.use_saved_reference_ranges,
       mode: form.connection_type === 'tcp'
         ? (form.host_mode === 'server' ? 'tcp_server' : 'tcp_client')
         : form.connection_type === 'serial'
@@ -720,6 +726,23 @@ export default function AnalyzerConnectionsManager({ labId }: { labId: string })
             </div>
 
             <div>
+              <label className="block text-xs font-medium text-gray-600 mb-1">Direction</label>
+              <select
+                value={form.direction}
+                onChange={e => setForm(f => ({ ...f, direction: e.target.value as any }))}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              >
+                <option value="bidirectional">Bidirectional (send orders + receive results)</option>
+                <option value="receive_only">Receive results only (never send orders)</option>
+              </select>
+              {form.direction === 'receive_only' && (
+                <p className="mt-1 text-xs text-gray-500">
+                  Creating an order will not send anything to this instrument. Results are still ingested by barcode.
+                </p>
+              )}
+            </div>
+
+            <div>
               <label className="block text-xs font-medium text-gray-600 mb-1">Instrument Identifier</label>
               <input
                 type="text"
@@ -739,6 +762,26 @@ export default function AnalyzerConnectionsManager({ labId }: { labId: string })
                 onChange={e => setForm(f => ({ ...f, analyzer_type: e.target.value }))}
                 className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
               />
+            </div>
+
+            {/* Reference range / flag source */}
+            <div className="col-span-2">
+              <label className="flex items-start gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={form.use_saved_reference_ranges}
+                  onChange={e => setForm(f => ({ ...f, use_saved_reference_ranges: e.target.checked }))}
+                  className="mt-0.5 h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+                <span className="text-xs text-gray-600">
+                  <span className="font-medium text-gray-700">Use saved reference ranges &amp; flags</span>
+                  <span className="block text-gray-500 mt-0.5">
+                    Store only the numeric result from this analyzer; take the reference range from the
+                    lab's saved analyte settings and compute the H/L flag from it. Uncheck to keep the
+                    range and flag reported by the machine.
+                  </span>
+                </span>
+              </label>
             </div>
           </div>
 

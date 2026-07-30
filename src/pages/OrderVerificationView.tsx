@@ -46,7 +46,7 @@ import {
   type OrderDeltaCheckResponse,
   LANGUAGE_DISPLAY_NAMES
 } from "../hooks/useAIResultIntelligence";
-import { supabase, database, aiAnalysis, formatAge } from "../utils/supabase";
+import { supabase, database, aiAnalysis } from "../utils/supabase";
 import { loadOrderedAnalyteRows } from "../utils/analyteDisplayOrder";
 import { runAIFlagAnalysis, analyzeAndSaveFlag } from "../utils/aiFlagAnalysis";
 import { saveClinicalSummary, toggleOrderSummaryInReport, saveClinicalSummaryOptions } from "../utils/reportExtrasService";
@@ -200,7 +200,11 @@ const fetchPanelStatusRows = async (
       .eq("lab_id", labId)
       .gte("order_date", from)
       .lte("order_date", to)
+      // order_date alone is not unique (every panel of a day shares it), so paging
+      // on it can repeat/drop rows across pages. Tie-break on the view's grain.
       .order("order_date", { ascending: false })
+      .order("order_id", { ascending: true })
+      .order("test_group_id", { ascending: true })
       .range(start, start + pageSize - 1);
 
     if (shouldFilter && locationIds.length > 0) {
@@ -284,6 +288,9 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
   // Quick preview state
   const [labPrintOptions, setLabPrintOptions] = useState<Record<string, unknown>>({});
   const [labPdfLayoutSettings, setLabPdfLayoutSettings] = useState<Record<string, any>>({});
+  // Per-lab configurable patient-field list + custom field labels (same source the PDF uses).
+  const [labPatientInfoConfig, setLabPatientInfoConfig] = useState<{ layout?: string; fields: string[] } | null>(null);
+  const [labExtraFieldConfigs, setLabExtraFieldConfigs] = useState<Array<{ field_key: string; label: string }>>([]);
   const [labSignatoryDefaults, setLabSignatoryDefaults] = useState<{ name: string; designation: string }>({ name: "", designation: "" });
   const [quickPreview, setQuickPreview] = useState<{ html: string; patientName: string } | null>(null);
   const [quickPreviewLoading, setQuickPreviewLoading] = useState<Record<string, boolean>>({});
@@ -376,7 +383,7 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
         try {
           const { data: labData } = await supabase
             .from("labs")
-            .select("pdf_layout_settings, default_signatory_name, default_signatory_designation, flag_options")
+            .select("pdf_layout_settings, default_signatory_name, default_signatory_designation, flag_options, report_patient_info_config")
             .eq("id", labId)
             .single();
           if (labData?.pdf_layout_settings) {
@@ -384,6 +391,21 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
             if (labData.pdf_layout_settings.printOptions) {
               setLabPrintOptions(labData.pdf_layout_settings.printOptions as Record<string, unknown>);
             }
+          }
+          // Patient-field config drives which patient fields the report shows (parity with PDF).
+          const patientInfoCfg = (labData as any)?.report_patient_info_config;
+          if (patientInfoCfg && Array.isArray(patientInfoCfg.fields)) {
+            setLabPatientInfoConfig(patientInfoCfg as { layout?: string; fields: string[] });
+          }
+          const { data: fieldConfigs } = await supabase
+            .from("lab_patient_field_configs")
+            .select("field_key, label, sort_order")
+            .eq("lab_id", labId)
+            .order("sort_order");
+          if (Array.isArray(fieldConfigs) && fieldConfigs.length > 0) {
+            setLabExtraFieldConfigs(
+              fieldConfigs.map((f: any) => ({ field_key: f.field_key, label: f.label })),
+            );
           }
           setLabSignatoryDefaults({
             name: labData?.default_signatory_name || "",
@@ -1206,42 +1228,62 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
       };
 
       const fetchVerifierForPreview = async () => {
-        if (allResultIds.length === 0) return { data: null as any, error: null };
+        let verifierId: string | null = null;
 
-        const rv = await supabase
-          .from("result_values")
-          .select("verified_by")
-          .in("result_id", allResultIds)
-          .not("verified_by", "is", null)
-          .limit(1)
-          .maybeSingle();
+        if (allResultIds.length > 0) {
+          const rv = await supabase
+            .from("result_values")
+            .select("verified_by")
+            .in("result_id", allResultIds)
+            .not("verified_by", "is", null)
+            .limit(1)
+            .maybeSingle();
 
-        if (rv.error || !rv.data?.verified_by) {
           if (rv.error) {
             console.warn("[QuickPreview] verifier result_values lookup failed", {
               resultIds: allResultIds,
               error: rv.error,
             });
           }
-          return { data: null as any, error: rv.error };
+          verifierId = (rv.data?.verified_by as string) ?? null;
         }
+
+        // Fall back to orders.approved_by — same as generate-pdf-letterhead — so the
+        // signatory resolves for labs that record approval at the order level rather
+        // than per result value.
+        if (!verifierId) {
+          const ord = await supabase
+            .from("orders")
+            .select("approved_by")
+            .eq("id", order.orderId)
+            .maybeSingle();
+          if (ord.error) {
+            console.warn("[QuickPreview] orders.approved_by lookup failed", {
+              orderId: order.orderId,
+              error: ord.error,
+            });
+          }
+          verifierId = ((ord.data as any)?.approved_by as string) ?? null;
+        }
+
+        if (!verifierId) return { data: null as any, error: null };
 
         const user = await supabase
           .from("users")
           .select("name, role")
-          .eq("id", rv.data.verified_by)
+          .eq("id", verifierId)
           .maybeSingle();
 
         if (user.error) {
           console.warn("[QuickPreview] verifier user lookup failed", {
-            userId: rv.data.verified_by,
+            userId: verifierId,
             error: user.error,
           });
         }
 
         return {
           data: {
-            verified_by: rv.data.verified_by,
+            verified_by: verifierId,
             users: user.data || null,
           },
           error: user.error,
@@ -1310,7 +1352,7 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
 
         const { data: labSignature, error: labSigError } = await supabase
           .from("lab_branding_assets")
-          .select("file_url, imagekit_url")
+          .select("file_url, imagekit_url, asset_metadata")
           .eq("lab_id", currentLabId)
           .eq("asset_type", "signature")
           .eq("is_active", true)
@@ -1325,6 +1367,16 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
         let sigUrl = labSignature?.imagekit_url
           ? applySignatureTransformations(labSignature.imagekit_url)
           : labSignature?.file_url || "";
+
+        // The lab default signature carries its signatory name/designation in
+        // asset_metadata — use it, same as the PDF's lab-default path.
+        if (sigUrl) {
+          const meta = (labSignature?.asset_metadata as any) || null;
+          if (meta?.signatory_name) {
+            fallback.name = meta.signatory_name;
+            fallback.designation = meta.signatory_designation || "";
+          }
+        }
 
         if (!sigUrl) {
           const { data: anyUserSignature, error: anySigError } = await supabase
@@ -1341,8 +1393,14 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
           }
 
           sigUrl = getOptimizedSignatureUrl(anyUserSignature);
-          if (sigUrl && anyUserSignature?.signature_name && !fallback.name) {
+          // Prefer the signature's own credentialed name over the generic fallback.
+          if (
+            sigUrl &&
+            anyUserSignature?.signature_name &&
+            (!fallback.name || fallback.name === "Authorized Signatory")
+          ) {
             fallback.name = anyUserSignature.signature_name;
+            fallback.designation = "";
           }
         }
 
@@ -1390,15 +1448,138 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
         }
       });
 
-      const ageFormatted = formatAge(patientRes.data?.age, patientRes.data?.age_unit);
-      const gender = patientRes.data?.gender ?? "";
-      const patientCode = patientRes.data?.display_id ?? "";
-      const sampleId = orderRes.data?.sample_id ?? "";
-      const referredBy = orderRes.data?.doctor ?? "";
-      const ageGender = [ageFormatted !== "N/A" ? ageFormatted : "", gender].filter(Boolean).join(" / ");
-      const orderDate = order.orderDate
-        ? new Date(order.orderDate).toLocaleDateString()
-        : "";
+      // ── Patient fields ──────────────────────────────────────────────────────────
+      // Resolve from the SAME source the PDF uses — the get_report_template_context RPC
+      // plus the identical enrichment queries generate-pdf-letterhead runs — so the
+      // preview's patient fields (including custom/special fields) match the PDF exactly.
+      const formatPatientAgeDisplay = (age: unknown, ageUnit?: string | null): string => {
+        if (age === null || age === undefined || age === "") return "";
+        const numAge = typeof age === "number" ? age : parseInt(String(age), 10);
+        if (Number.isNaN(numAge)) return String(age);
+        const unit = (ageUnit || "years").toLowerCase();
+        const singular: Record<string, string> = { years: "Year", months: "Month", days: "Day" };
+        const plural: Record<string, string> = { years: "Years", months: "Months", days: "Days" };
+        const word = numAge === 1 ? (singular[unit] || "Year") : (plural[unit] || "Years");
+        return `${numAge} ${word}`;
+      };
+      // Registration/order date → DD-MM-YYYY, matching the PDF's {{orderDate}} formatting.
+      const toDDMMYYYY = (raw: unknown): string => {
+        if (!raw) return "";
+        const s = String(raw);
+        const m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+        if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+        const d = new Date(s);
+        if (!Number.isNaN(d.getTime())) {
+          const dd = String(d.getDate()).padStart(2, "0");
+          const mm = String(d.getMonth() + 1).padStart(2, "0");
+          return `${dd}-${mm}-${d.getFullYear()}`;
+        }
+        return s;
+      };
+
+      let reportCtx: any = null;
+      const patientFieldValues: Record<string, string> = {};
+      let reportDateResolved = "";
+      // Seed core fields from the always-available queries so they resolve even if the
+      // RPC is unavailable. The RPC below overrides these with richer, timezone-formatted
+      // values and adds the special fields (phone, collection/received dates, B2B, etc.).
+      Object.assign(patientFieldValues, {
+        patientName: order.patientName || "",
+        patientId: patientRes.data?.display_id ?? "",
+        registrationDate: toDDMMYYYY(order.orderDate),
+        age: formatPatientAgeDisplay(patientRes.data?.age, patientRes.data?.age_unit),
+        gender: patientRes.data?.gender ?? "",
+        sampleId: orderRes.data?.sample_id ?? "",
+        referringDoctorName: orderRes.data?.doctor ?? "",
+      });
+      try {
+        const { data: ctx, error: ctxErr } = await supabase.rpc(
+          "get_report_template_context",
+          { p_order_id: order.orderId },
+        );
+        if (ctxErr) console.warn("[QuickPreview] get_report_template_context failed", ctxErr);
+        reportCtx = ctx || null;
+
+        // Same enrichment the PDF performs: patient custom fields + raw collector,
+        // B2B account name, and collection-center location name.
+        const [pEnrich, oEnrich] = await Promise.all([
+          supabase
+            .from("patients")
+            .select("custom_fields, age_unit")
+            .eq("id", (reportCtx?.patientId as string) ?? order.patientId)
+            .maybeSingle(),
+          supabase
+            .from("orders")
+            .select("sample_collected_by, account_id, location_id, collected_at_location_id")
+            .eq("id", order.orderId)
+            .maybeSingle(),
+        ]);
+
+        let b2bAccountName = "";
+        let collectionCenterName =
+          reportCtx?.order?.collectionCenter || reportCtx?.order?.locationName || "";
+        if (oEnrich.data) {
+          const accountId = (oEnrich.data as any).account_id;
+          const locId =
+            (oEnrich.data as any).collected_at_location_id || (oEnrich.data as any).location_id;
+          const [acc, loc] = await Promise.all([
+            accountId
+              ? supabase.from("accounts").select("name").eq("id", accountId).maybeSingle()
+              : Promise.resolve({ data: null } as any),
+            locId
+              ? supabase.from("locations").select("name").eq("id", locId).maybeSingle()
+              : Promise.resolve({ data: null } as any),
+          ]);
+          b2bAccountName = (acc.data as any)?.name || "";
+          collectionCenterName = (loc.data as any)?.name || collectionCenterName;
+        }
+
+        const cp = (reportCtx?.patient || {}) as any;
+        const co = (reportCtx?.order || {}) as any;
+        const ageUnit = (pEnrich.data as any)?.age_unit || "years";
+        // Mirror generate-pdf-letterhead's flatAliases resolution key-for-key.
+        Object.assign(patientFieldValues, {
+          patientName: cp.name || order.patientName || "",
+          patientId: cp.displayId || cp.id || (patientRes.data?.display_id ?? ""),
+          registrationDate: toDDMMYYYY(reportCtx?.meta?.orderDate) || toDDMMYYYY(order.orderDate),
+          age: formatPatientAgeDisplay(cp.age ?? patientRes.data?.age, ageUnit),
+          gender: cp.gender || (patientRes.data?.gender ?? ""),
+          phone: cp.phone || "",
+          sampleId: co.sampleId || (orderRes.data?.sample_id ?? ""),
+          collectionDate: co.sampleCollectedAtFormatted || co.sampleCollectedAt || "",
+          receivedAt: co.sampleReceivedAtFormatted || co.sampleReceivedAt || "",
+          collectionCenter: collectionCenterName,
+          sampleCollectedBy: co.sampleCollectedBy || (oEnrich.data as any)?.sample_collected_by || "",
+          b2bAccountName,
+          referringDoctorName: co.referringDoctorName || (orderRes.data?.doctor ?? ""),
+          approvedAt: co.approvedAtFormatted || co.approvedAt || "",
+        });
+
+        // Custom patient fields (patients.custom_fields JSONB) — same alias keys the PDF emits.
+        const customFields = ((pEnrich.data as any)?.custom_fields || {}) as Record<string, unknown>;
+        for (const [k, v] of Object.entries(customFields)) {
+          // Trim so whitespace-only stored values render blank (parity with the PDF,
+          // whose renderTemplate resolves a missing placeholder to "").
+          const val = String(v ?? "").trim();
+          patientFieldValues[`custom_${k}`] = val;
+          patientFieldValues[`custom_${k.toLowerCase()}`] = val;
+        }
+
+        reportDateResolved = reportCtx?.meta?.reportDate || co.approvedAtFormatted || "";
+      } catch (e) {
+        console.warn("[QuickPreview] patient field resolution failed; using fallbacks", e);
+      }
+
+      // Fallbacks for the default (no-config) header layout and if the RPC failed.
+      const ageFormatted =
+        patientFieldValues.age ||
+        formatPatientAgeDisplay(patientRes.data?.age, patientRes.data?.age_unit);
+      const gender = patientFieldValues.gender || (patientRes.data?.gender ?? "");
+      const patientCode = patientFieldValues.patientId || (patientRes.data?.display_id ?? "");
+      const sampleId = patientFieldValues.sampleId || (orderRes.data?.sample_id ?? "");
+      const referredBy = patientFieldValues.referringDoctorName || (orderRes.data?.doctor ?? "");
+      const ageGender = [ageFormatted, gender].filter(Boolean).join(" / ");
+      const orderDate = patientFieldValues.registrationDate || toDDMMYYYY(order.orderDate);
 
       // Build lookup: test_group_id → Map<analyte_id, { sort_order, section_heading, is_auto_calculated }>
       // Also build a name-based fallback for result_values rows where analyte_id is null.
@@ -1440,9 +1621,16 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
 	      const verifierUser = (verifierRes.data as any)?.users;
 	      const verifierUserId = (verifierRes.data as any)?.verified_by || null;
 	      const previewSignatory = await fetchSignatoryForPreview(verifierUserId, verifierUser);
-	      const signatoryName = previewSignatory.name || "";
+	      // Supplement from the RPC's resolved approver (the same signature the PDF uses via
+	      // orders.approved_by → default signature) when the direct lookups came up empty.
+	      const ctxApproverSig = String(reportCtx?.order?.approverSignature || "");
+	      const ctxApproverName = String(reportCtx?.order?.approvedByName || "");
+	      const signatoryImageUrl = previewSignatory.imageUrl || ctxApproverSig || "";
+	      let signatoryName = previewSignatory.name || "";
+	      if ((!signatoryName || signatoryName === "Authorized Signatory") && ctxApproverName) {
+	        signatoryName = ctxApproverName;
+	      }
 	      const signatoryDesignation = previewSignatory.designation || "";
-	      const signatoryImageUrl = previewSignatory.imageUrl || "";
 	      const verificationUrl = `https://app.limsapp.in/verify?id=${encodeURIComponent(order.orderId || sampleId || "")}`;
       const orderReportSettings = ((orderRes.data as any)?.report_settings || {}) as {
         groupOrderOverrideEnabled?: boolean;
@@ -1563,8 +1751,12 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
         patientCode,
         ageGender,
         orderDate,
+        reportDate: reportDateResolved || undefined,
         referredBy,
         sampleId,
+        patientInfoConfig: labPatientInfoConfig,
+        extraFieldConfigs: labExtraFieldConfigs,
+        patientFieldValues,
         testGroups,
 	        sections: reportSections,
 	        signatoryName,

@@ -12,6 +12,9 @@ import { Booking } from '../types/booking';
 // How often the phlebo's live position is written to the booking while en route
 const LOCATION_PUSH_INTERVAL_MS = 20000;
 
+// In the dedicated phlebo app build there is no staff dashboard to hand off to
+const IS_PHLEBO_APP = ((import.meta.env.VITE_APP_TARGET as string | undefined) || 'lims') === 'phlebo';
+
 const JOURNEY_STEPS = [
   { key: 'started', label: 'Start Journey', doneLabel: 'Journey Started', icon: Truck },
   { key: 'reached', label: 'Mark Reached', doneLabel: 'Reached Location', icon: MapPin },
@@ -24,8 +27,9 @@ const JOURNEY_ORDER: Record<string, number> = { assigned: 0, started: 1, reached
 
 const PhleboCollections: React.FC = () => {
   const navigate = useNavigate();
-  const { user } = useAuth();
+  const { user, signOut } = useAuth();
   const [myUserId, setMyUserId] = useState<string | null>(null);
+  const [myName, setMyName] = useState<string>('');
   const [bookings, setBookings] = useState<Booking[]>([]);
   const [loading, setLoading] = useState(true);
   const [updatingId, setUpdatingId] = useState<string | null>(null);
@@ -63,11 +67,12 @@ const PhleboCollections: React.FC = () => {
       if (!user?.email) return;
       const { data } = await supabase
         .from('users')
-        .select('id')
+        .select('id, name')
         .eq('email', user.email)
         .maybeSingle();
       if (data?.id) {
         setMyUserId(data.id);
+        setMyName(data.name || '');
         loadBookings(data.id);
       } else {
         setLoading(false);
@@ -289,7 +294,7 @@ const PhleboCollections: React.FC = () => {
               {updatingId === booking.id ? 'Updating...' : nextStep.label}
             </button>
           )}
-          {booking.status !== 'converted' && (
+          {booking.status !== 'converted' && !IS_PHLEBO_APP && (
             <button
               onClick={() => navigate('/', { state: { processBooking: booking } })}
               className="inline-flex items-center gap-1.5 px-3 py-2 text-sm font-medium bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-lg hover:bg-indigo-100 transition-colors"
@@ -311,6 +316,25 @@ const PhleboCollections: React.FC = () => {
 
   return (
     <div className="max-w-3xl mx-auto px-4 py-6 space-y-5">
+      {IS_PHLEBO_APP && (
+        <div className="flex items-center justify-between bg-blue-600 text-white rounded-xl px-4 py-3 shadow-sm">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="w-9 h-9 rounded-full bg-white/20 flex items-center justify-center flex-shrink-0">
+              <User className="h-5 w-5" />
+            </div>
+            <div className="min-w-0">
+              <p className="font-semibold leading-tight truncate">{myName || 'Phlebotomist'}</p>
+              <p className="text-xs text-blue-100 truncate">{user?.email}</p>
+            </div>
+          </div>
+          <button
+            onClick={() => signOut()}
+            className="flex-shrink-0 px-3 py-1.5 text-sm font-medium bg-white/15 hover:bg-white/25 rounded-lg transition-colors"
+          >
+            Logout
+          </button>
+        </div>
+      )}
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-xl font-bold text-gray-900">My Collections</h1>

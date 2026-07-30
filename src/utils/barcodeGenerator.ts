@@ -3,6 +3,7 @@
 
 import { jsPDF } from 'jspdf';
 import {
+  formatGenderAge,
   getActiveLabelLayout,
   getLabelContentMetrics,
   normalizeLabelLayout,
@@ -131,6 +132,13 @@ interface BarcodeLabelMetadata {
   gender?: string;
   age?: string | number;
   referredBy?: string;
+  /**
+   * Human-readable barcode number to print under the bars as crisp vector text.
+   * When set, the barcode image itself should be generated with displayValue
+   * off so the number is not baked into the anti-aliased raster (which prints
+   * faded on thermal printers).
+   */
+  barcodeNumber?: string;
 }
 
 export interface PrintableBarcodeLabel {
@@ -170,7 +178,7 @@ function drawBarcodeLabelCell(
   originY: number
 ): void {
   const metadata = label.metadata || {};
-  const genderAgeStr = [metadata.gender, metadata.age ? `${metadata.age} Y` : ''].filter(Boolean).join(' ');
+  const genderAgeStr = formatGenderAge(metadata.gender, metadata.age);
   const dateTimeStr = [metadata.collectionDate, metadata.collectionTime].filter(Boolean).join(' ');
 
   doc.setFillColor(255, 255, 255);
@@ -210,15 +218,32 @@ function drawBarcodeLabelCell(
     );
   }
 
+  // When a separate barcode number is supplied it is drawn as vector text
+  // below the bars, so the bars only occupy the upper part of the envelope.
+  const barsHeight = metadata.barcodeNumber
+    ? metrics.barcodeHeight * 0.78
+    : metrics.barcodeHeight;
   doc.addImage(
     label.barcodeDataUrl,
     'PNG',
     originX + metrics.barcodeX,
     originY + metrics.barcodeY,
     metrics.barcodeWidth,
-    metrics.barcodeHeight
+    barsHeight
   );
 
+  if (metadata.barcodeNumber) {
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(metrics.barcodeNumberFontPt);
+    doc.text(
+      cleanPdfText(metadata.barcodeNumber),
+      originX + metrics.barcodeX + metrics.barcodeWidth / 2,
+      originY + metrics.barcodeNumberBaseline,
+      { align: 'center' }
+    );
+  }
+
+  doc.setFont('helvetica', 'bold');
   doc.setFontSize(metrics.infoFontPt);
   doc.text(fitPdfText(doc, label.sampleId, metrics.sampleIdMaxWidth), left, originY + metrics.infoBaseline);
   doc.text(

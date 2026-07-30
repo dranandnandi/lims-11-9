@@ -20,6 +20,8 @@ interface InterfaceConfig {
   lims_unit: string;
   multiply_by: string;
   add_offset: string;
+  // '' = keep whatever the analyzer sent; '0' = whole number.
+  decimal_places: string;
   auto_verify: boolean;
   apply_to_ai_result_entry: boolean;
   apply_to_manual_result_entry: boolean;
@@ -50,7 +52,7 @@ export default function AnalyteInterfaceConfig({ labId }: { labId: string }) {
         .order('name'),
       supabase
         .from('lab_analyte_interface_config')
-        .select('id, lab_analyte_id, instrument_unit, lims_unit, multiply_by, add_offset, auto_verify, apply_to_ai_result_entry, apply_to_manual_result_entry, apply_to_quick_result_entry, notes')
+        .select('id, lab_analyte_id, instrument_unit, lims_unit, multiply_by, add_offset, decimal_places, auto_verify, apply_to_ai_result_entry, apply_to_manual_result_entry, apply_to_quick_result_entry, notes')
         .eq('lab_id', labId),
     ]);
 
@@ -66,6 +68,7 @@ export default function AnalyteInterfaceConfig({ labId }: { labId: string }) {
           lims_unit: c.lims_unit ?? '',
           multiply_by: String(c.multiply_by ?? '1'),
           add_offset: String(c.add_offset ?? '0'),
+          decimal_places: c.decimal_places == null ? '' : String(c.decimal_places),
           auto_verify: c.auto_verify ?? false,
           apply_to_ai_result_entry: c.apply_to_ai_result_entry ?? false,
           apply_to_manual_result_entry: c.apply_to_manual_result_entry ?? false,
@@ -91,6 +94,7 @@ export default function AnalyteInterfaceConfig({ labId }: { labId: string }) {
       lims_unit: '',
       multiply_by: '1',
       add_offset: '0',
+      decimal_places: '',
       auto_verify: false,
       apply_to_ai_result_entry: false,
       apply_to_manual_result_entry: false,
@@ -130,6 +134,7 @@ export default function AnalyteInterfaceConfig({ labId }: { labId: string }) {
       lims_unit:       cfg.lims_unit.trim()       || null,
       multiply_by:     multiplyNum,
       add_offset:      isNaN(offsetNum) ? 0 : offsetNum,
+      decimal_places:  cfg.decimal_places === '' ? null : Number(cfg.decimal_places),
       auto_verify:     cfg.auto_verify,
       apply_to_ai_result_entry: cfg.apply_to_ai_result_entry,
       apply_to_manual_result_entry: cfg.apply_to_manual_result_entry,
@@ -265,6 +270,7 @@ export default function AnalyteInterfaceConfig({ labId }: { labId: string }) {
               !cfg.apply_to_ai_result_entry &&
               !cfg.apply_to_manual_result_entry &&
               !cfg.apply_to_quick_result_entry &&
+              cfg.decimal_places === '' &&
               !cfg.instrument_unit &&
               !cfg.lims_unit;
 
@@ -290,6 +296,7 @@ export default function AnalyteInterfaceConfig({ labId }: { labId: string }) {
                     {!isExpanded && (
                       <div className="mt-1 truncate pl-6 text-xs text-gray-500">
                         Instrument: {cfg.instrument_unit || '-'} · LIMS: {cfg.lims_unit || '-'} · Multiply {cfg.multiply_by || '1'} · Offset {cfg.add_offset || '0'}
+                        {cfg.decimal_places === '' ? '' : cfg.decimal_places === '0' ? ' · Whole number' : ` · ${cfg.decimal_places} dp`}
                         {cfg.auto_verify ? ' · Auto-verify' : ''}
                       </div>
                     )}
@@ -353,6 +360,25 @@ export default function AnalyteInterfaceConfig({ labId }: { labId: string }) {
                       onChange={e => updateConfig(a.id, { add_offset: e.target.value })}
                       className="w-full border border-gray-300 rounded-lg px-2.5 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                     />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-500 mb-1">Stored precision</label>
+                    <select
+                      value={cfg.decimal_places}
+                      onChange={e => updateConfig(a.id, { decimal_places: e.target.value })}
+                      className="w-full border border-gray-300 rounded-lg px-2.5 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    >
+                      <option value="">As received</option>
+                      <option value="0">0 — whole number</option>
+                      <option value="1">1</option>
+                      <option value="2">2</option>
+                      <option value="3">3</option>
+                      <option value="4">4</option>
+                    </select>
+                    <p className="mt-1 text-[11px] text-gray-400">
+                      Trims the value <em>saved</em> from the instrument, after dilution and conversion.
+                      This is not the report format — for that use Decimal Places on the analyte.
+                    </p>
                   </div>
                 </div>
 

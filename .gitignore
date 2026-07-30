@@ -9,6 +9,8 @@ lerna-debug.log*
 
 node_modules
 dist
+dist-patient
+dist-phlebo
 dist-ssr
 *.local
 

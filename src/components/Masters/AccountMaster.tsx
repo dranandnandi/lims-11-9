@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, Search, Edit, Trash2, X, DollarSign, Lock, Package, Eye, EyeOff } from 'lucide-react';
+import { Plus, Search, Edit, Trash2, X, DollarSign, Lock, Unlock as LockOpen, Package, Eye, EyeOff } from 'lucide-react';
 import { database, supabase } from '../../utils/supabase';
+import { getUserRoleCode } from '../../utils/permissions';
 import { createB2BAccountUser } from '../../utils/b2bAuth';
 import HeaderFooterUpload from '../Settings/HeaderFooterUpload';
 
@@ -23,7 +24,20 @@ interface Account {
     is_active: boolean;
     billing_mode?: 'standard' | 'monthly' | null;
     price_master_id?: string | null;
+    is_locked?: boolean | null;
+    locked_reason?: string | null;
+    locked_at?: string | null;
+    locked_by?: string | null;
+    lock_override_until?: string | null;
 }
+
+// An account is "effectively locked" when it's locked and any temporary open
+// window has expired (or was never granted).
+const isAccountEffectivelyLocked = (account: Pick<Account, 'is_locked' | 'lock_override_until'>): boolean => {
+    if (!account.is_locked) return false;
+    if (account.lock_override_until && new Date(account.lock_override_until).getTime() > Date.now()) return false;
+    return true;
+};
 
 interface PriceMaster {
     id: string;
@@ -102,6 +116,13 @@ const AccountMaster: React.FC = () => {
     const [error, setError] = useState<string | null>(null);
     const [labId, setLabId] = useState<string | null>(null);
 
+    // Lock/Open feature — admin only
+    const [isAdminUser, setIsAdminUser] = useState(false);
+    const [currentUserId, setCurrentUserId] = useState<string | null>(null);
+    const [lockModalAccount, setLockModalAccount] = useState<Account | null>(null);
+    const [lockReason, setLockReason] = useState('');
+    const [lockSubmitting, setLockSubmitting] = useState(false);
+
     // Stored portal credential (admin-only view; readable only by lab admins via RLS)
     const [storedCredential, setStoredCredential] = useState<{ email: string; password_text: string; updated_at: string } | null>(null);
     const [storedCredentialLoading, setStoredCredentialLoading] = useState(false);
@@ -126,6 +147,18 @@ const AccountMaster: React.FC = () => {
 
     useEffect(() => {
         const init = async () => {
+            // Resolve current user + admin status (lock/open is admin-only)
+            try {
+                const { data: { user } } = await supabase.auth.getUser();
+                if (user) {
+                    setCurrentUserId(user.id);
+                    const roleCode = await getUserRoleCode(user.id, user.email || undefined);
+                    setIsAdminUser(roleCode === 'admin');
+                }
+            } catch (err) {
+                console.warn('Could not resolve current user role:', err);
+            }
+
             const id = await database.getCurrentUserLabId();
             if (id) {
                 setLabId(id);
@@ -342,6 +375,61 @@ const AccountMaster: React.FC = () => {
             setError('Failed to delete account.');
         }
     };
+
+    // --- Account Lock / Open (admin only) ---
+
+    const openLockModal = (account: Account) => {
+        setLockModalAccount(account);
+        setLockReason(account.locked_reason || '');
+        setError(null);
+    };
+
+    // Applies a lock-state change and refreshes local state
+    const applyLockUpdate = async (account: Account, payload: Partial<Account>) => {
+        setLockSubmitting(true);
+        setError(null);
+        try {
+            const { data, error } = await supabase
+                .from('accounts')
+                .update(payload)
+                .eq('id', account.id)
+                .select();
+            if (error) throw error;
+            setAccounts(prev => prev.map(a => (a.id === account.id ? { ...a, ...data[0] } : a)));
+            setLockModalAccount(null);
+            setLockReason('');
+        } catch (err: any) {
+            console.error('Error updating account lock state:', err);
+            setError(err?.message || 'Failed to update account lock state.');
+        } finally {
+            setLockSubmitting(false);
+        }
+    };
+
+    const handleLockAccount = (account: Account) =>
+        applyLockUpdate(account, {
+            is_locked: true,
+            locked_reason: lockReason.trim() || null,
+            locked_at: new Date().toISOString(),
+            locked_by: currentUserId,
+            lock_override_until: null,
+        });
+
+    // Permanent open: clear the lock entirely
+    const handleOpenAccount = (account: Account) =>
+        applyLockUpdate(account, {
+            is_locked: false,
+            lock_override_until: null,
+            locked_reason: null,
+        });
+
+    // Temporary open: keep locked, but grant an open window for N hours.
+    // After the window expires the account is treated as locked again automatically.
+    const handleTemporaryOpen = (account: Account, hours: number) =>
+        applyLockUpdate(account, {
+            is_locked: true,
+            lock_override_until: new Date(Date.now() + hours * 60 * 60 * 1000).toISOString(),
+        });
 
     // --- Price Management Logic ---
 
@@ -594,11 +682,33 @@ const AccountMaster: React.FC = () => {
                                     </span>
                                 </td>
                                 <td className="px-6 py-4">
-                                    <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${account.is_active ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}`}>
-                                        {account.is_active ? 'Active' : 'Inactive'}
-                                    </span>
+                                    <div className="flex flex-col items-start gap-1">
+                                        <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${account.is_active ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}`}>
+                                            {account.is_active ? 'Active' : 'Inactive'}
+                                        </span>
+                                        {account.is_locked && (
+                                            isAccountEffectivelyLocked(account) ? (
+                                                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-800" title={account.locked_reason || undefined}>
+                                                    <Lock className="w-3 h-3" /> Locked
+                                                </span>
+                                            ) : (
+                                                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium bg-amber-100 text-amber-800">
+                                                    <LockOpen className="w-3 h-3" /> Open till {new Date(account.lock_override_until as string).toLocaleString()}
+                                                </span>
+                                            )
+                                        )}
+                                    </div>
                                 </td>
                                 <td className="px-6 py-4 text-right space-x-2">
+                                    {isAdminUser && (
+                                        <button
+                                            onClick={() => openLockModal(account)}
+                                            className={`p-1 ${isAccountEffectivelyLocked(account) ? 'text-red-600 hover:text-red-900' : account.is_locked ? 'text-amber-600 hover:text-amber-900' : 'text-gray-500 hover:text-gray-800'}`}
+                                            title={isAccountEffectivelyLocked(account) ? 'Account locked — manage / open' : account.is_locked ? 'Temporarily open — manage' : 'Lock account'}
+                                        >
+                                            {isAccountEffectivelyLocked(account) ? <Lock className="w-4 h-4" /> : <LockOpen className="w-4 h-4" />}
+                                        </button>
+                                    )}
                                     <button onClick={() => handleManagePrices(account)} className="text-purple-600 hover:text-purple-900 p-1" title="Manage Prices">
                                         <DollarSign className="w-4 h-4" />
                                     </button>
@@ -1019,6 +1129,86 @@ const AccountMaster: React.FC = () => {
                     </div>
                 )
             }
+
+            {/* Lock / Open Modal (admin only) */}
+            {lockModalAccount && (
+                <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+                    <div className="bg-white rounded-lg shadow-xl max-w-md w-full">
+                        <div className="flex justify-between items-center p-5 border-b">
+                            <h2 className="text-lg font-bold flex items-center gap-2">
+                                {isAccountEffectivelyLocked(lockModalAccount)
+                                    ? <><Lock className="w-5 h-5 text-red-600" /> Locked Account</>
+                                    : lockModalAccount.is_locked
+                                        ? <><LockOpen className="w-5 h-5 text-amber-600" /> Temporarily Open</>
+                                        : <><Lock className="w-5 h-5 text-gray-600" /> Lock Account</>}
+                            </h2>
+                            <button onClick={() => setLockModalAccount(null)} disabled={lockSubmitting}><X className="w-6 h-6" /></button>
+                        </div>
+                        <div className="p-5 space-y-4">
+                            <div className="text-sm text-gray-700">
+                                <span className="font-medium">{lockModalAccount.name}</span>
+                                {lockModalAccount.code ? <span className="text-gray-500"> ({lockModalAccount.code})</span> : null}
+                            </div>
+
+                            {lockModalAccount.is_locked && (
+                                <div className="text-xs bg-gray-50 border rounded p-3 space-y-1 text-gray-600">
+                                    {lockModalAccount.locked_reason && <div><span className="font-medium text-gray-700">Reason:</span> {lockModalAccount.locked_reason}</div>}
+                                    {lockModalAccount.locked_at && <div><span className="font-medium text-gray-700">Locked at:</span> {new Date(lockModalAccount.locked_at).toLocaleString()}</div>}
+                                    {!isAccountEffectivelyLocked(lockModalAccount) && lockModalAccount.lock_override_until && (
+                                        <div className="text-amber-700"><span className="font-medium">Temporarily open until:</span> {new Date(lockModalAccount.lock_override_until).toLocaleString()}</div>
+                                    )}
+                                </div>
+                            )}
+
+                            {error && <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded p-2">{error}</div>}
+
+                            {!lockModalAccount.is_locked ? (
+                                // Currently open → offer to lock
+                                <>
+                                    <p className="text-sm text-gray-600">Locking this account blocks new order creation against it for everyone. Only an admin can open it again.</p>
+                                    <div>
+                                        <label className="block text-sm font-medium mb-1">Reason (optional)</label>
+                                        <textarea
+                                            value={lockReason}
+                                            onChange={e => setLockReason(e.target.value)}
+                                            rows={2}
+                                            placeholder="e.g. Payment overdue, credit on hold"
+                                            className="w-full border rounded p-2 text-sm"
+                                        />
+                                    </div>
+                                    <div className="flex justify-end gap-3 pt-1">
+                                        <button onClick={() => setLockModalAccount(null)} disabled={lockSubmitting} className="px-4 py-2 border rounded hover:bg-gray-50 text-sm">Cancel</button>
+                                        <button onClick={() => handleLockAccount(lockModalAccount)} disabled={lockSubmitting} className="px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700 disabled:opacity-50 text-sm flex items-center gap-2">
+                                            <Lock className="w-4 h-4" /> {lockSubmitting ? 'Saving…' : 'Lock Account'}
+                                        </button>
+                                    </div>
+                                </>
+                            ) : (
+                                // Currently locked → offer to open (permanent or temporary)
+                                <>
+                                    <p className="text-sm text-gray-600">Open this account to allow order creation again.</p>
+                                    <div className="grid gap-2">
+                                        <button onClick={() => handleOpenAccount(lockModalAccount)} disabled={lockSubmitting} className="w-full px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 disabled:opacity-50 text-sm flex items-center justify-center gap-2">
+                                            <LockOpen className="w-4 h-4" /> Open Permanently
+                                        </button>
+                                        <button onClick={() => handleTemporaryOpen(lockModalAccount, 24)} disabled={lockSubmitting} className="w-full px-4 py-2 bg-amber-500 text-white rounded hover:bg-amber-600 disabled:opacity-50 text-sm flex items-center justify-center gap-2">
+                                            <LockOpen className="w-4 h-4" /> Open for 24 hours (auto re-locks)
+                                        </button>
+                                        {!isAccountEffectivelyLocked(lockModalAccount) && (
+                                            <button onClick={() => handleLockAccount(lockModalAccount)} disabled={lockSubmitting} className="w-full px-4 py-2 border border-red-300 text-red-700 rounded hover:bg-red-50 disabled:opacity-50 text-sm flex items-center justify-center gap-2">
+                                                <Lock className="w-4 h-4" /> Cancel temporary window (lock now)
+                                            </button>
+                                        )}
+                                    </div>
+                                    <div className="flex justify-end pt-1">
+                                        <button onClick={() => setLockModalAccount(null)} disabled={lockSubmitting} className="px-4 py-2 border rounded hover:bg-gray-50 text-sm">Close</button>
+                                    </div>
+                                </>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            )}
         </div >
     );
 };

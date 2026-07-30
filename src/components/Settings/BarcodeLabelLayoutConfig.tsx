@@ -76,8 +76,7 @@ const BarcodeLabelLayoutConfig: React.FC<BarcodeLabelLayoutConfigProps> = ({ val
       barcodeDataUrl: generateBarcodeSync(JsBarcode, `TEST${String(i + 1).padStart(3, '0')}`, {
         width: 2,
         height: 50,
-        displayValue: true,
-        fontSize: 12,
+        displayValue: false,
         margin: 5,
       }),
       metadata: {
@@ -88,6 +87,7 @@ const BarcodeLabelLayoutConfig: React.FC<BarcodeLabelLayoutConfigProps> = ({ val
         gender: 'M',
         age: 34,
         referredBy: 'Dr. Test',
+        barcodeNumber: `TEST${String(i + 1).padStart(3, '0')}`,
       },
     }));
 

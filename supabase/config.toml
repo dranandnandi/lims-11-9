@@ -430,3 +430,9 @@ entrypoint = "./functions/create-auth-user/index.ts"
 enabled = true
 verify_jwt = false
 entrypoint = "./functions/patient-forgot-pin/index.ts"
+
+# Patient portal login - picks the right lab account when one mobile number has several
+[functions.patient-portal-login]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/patient-portal-login/index.ts"

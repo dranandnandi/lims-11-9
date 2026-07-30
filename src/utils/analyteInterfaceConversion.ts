@@ -1,6 +1,8 @@
 export interface AnalyteInterfaceConversionConfig {
   multiply_by?: number | string | null;
   add_offset?: number | string | null;
+  // null/undefined = leave the entered precision alone; 0 = whole number.
+  decimal_places?: number | string | null;
   lims_unit?: string | null;
   apply_to_ai_result_entry?: boolean | null;
   apply_to_manual_result_entry?: boolean | null;
@@ -54,5 +56,14 @@ export const applyAnalyteInterfaceConversion = (
   const safeMultiplyBy = Number.isFinite(multiplyBy) ? multiplyBy : 1;
   const safeAddOffset = Number.isFinite(addOffset) ? addOffset : 0;
 
-  return formatConvertedNumber((numericValue * safeMultiplyBy) + safeAddOffset);
+  const converted = (numericValue * safeMultiplyBy) + safeAddOffset;
+
+  // Precision is pinned after conversion, matching the analyzer ingest path.
+  const decimals = config.decimal_places == null ? null : Number(config.decimal_places);
+  if (decimals != null && Number.isInteger(decimals) && decimals >= 0 && decimals <= 6) {
+    const fixed = converted.toFixed(decimals);
+    return Number(fixed) === 0 ? (0).toFixed(decimals) : fixed;
+  }
+
+  return formatConvertedNumber(converted);
 };

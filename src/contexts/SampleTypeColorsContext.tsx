@@ -21,7 +21,7 @@ export const SampleTypeColorsProvider: React.FC<{ children: React.ReactNode }> =
 
   const fetchColors = useCallback(async () => {
     try {
-      const labId = await database.getCurrentLabId();
+      const labId = await database.getCurrentUserLabId();
       if (!labId) {
         setColors({});
         setLoading(false);

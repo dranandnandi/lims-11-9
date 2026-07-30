@@ -991,8 +991,17 @@ id,
         throw error;
       }
       fetchOrders();
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error deleting order:", error);
+      // 23503 = FK violation. The only constraint that still blocks deletion is
+      // consolidated_invoice_items, which is intentional: the order is already
+      // on an issued consolidated invoice.
+      if (error?.code === "23503") {
+        alert(
+          "This order cannot be deleted because it is already billed on a consolidated invoice.\n\nRemove it from the invoice first, or cancel the order instead of deleting it.",
+        );
+        return;
+      }
       alert("Failed to delete order. Please try again.");
     }
   };

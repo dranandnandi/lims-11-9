@@ -18,6 +18,7 @@ import AnalyzerMappingPanel from './AnalyzerMappingPanel';
 import BuiltinTemplatePreview from '../Reports/BuiltinTemplatePreview';
 import BasicTemplateFormatBuilder from '../Reports/BasicTemplateFormatBuilder';
 import { SampleTypeIndicator } from '../Common/SampleTypeIndicator';
+import { SAMPLE_TYPES } from '../../utils/sampleTypes';
 
 interface TestGroupFormProps {
   onClose: () => void;
@@ -412,7 +413,7 @@ const TestGroupForm: React.FC<TestGroupFormProps> = ({ onClose, onSubmit, testGr
             lab_specific_interpretation_low,
             lab_specific_interpretation_normal,
             lab_specific_interpretation_high,
-            value_type, expected_normal_values, expected_value_flag_map,
+            value_type, decimal_places, min_integer_digits, expected_normal_values, expected_value_flag_map,
             expected_value_codes, default_value,
             is_calculated, formula, formula_variables, formula_description, calculation_result_type,
             is_critical, normal_range_min, normal_range_max,
@@ -490,6 +491,10 @@ const TestGroupForm: React.FC<TestGroupFormProps> = ({ onClose, onSubmit, testGr
                   interpretation_normal: la.lab_specific_interpretation_normal || la.interpretation_normal,
                   interpretation_high:   la.lab_specific_interpretation_high   || la.interpretation_high,
                   value_type: la.value_type || null,
+                  // Lab-level only: null means "inherit", so do NOT fall back to the
+                  // global value here or the editor would show it as a lab override.
+                  decimal_places: la.decimal_places ?? null,
+                  min_integer_digits: la.min_integer_digits ?? null,
                   expected_normal_values: expectedNormalValues,
                   expected_value_flag_map: expectedValueFlagMap,
                   expected_value_codes: expectedValueCodes,
@@ -770,26 +775,7 @@ const TestGroupForm: React.FC<TestGroupFormProps> = ({ onClose, onSubmit, testGr
     'General',
   ];
 
-  const sampleTypes = [
-    'EDTA Blood',
-    'Serum',
-    'Plasma',
-    'Fluoride Plasma',
-    'Citrated Plasma',
-    'Capillary Blood',
-    'Urine',
-    'Stool',
-    'CSF',
-    'Sputum',
-    'Swab',
-    'Tissue',
-    'X-Ray',
-    'CT Scan',
-    'USG',
-    'Ultrasound',
-    'Sonography',
-    'Other',
-  ];
+  const sampleTypes = SAMPLE_TYPES;
 
   const handleSyncFromGlobal = async () => {
     if (!testGroup?.name || syncingGlobal) return;
@@ -2267,91 +2253,8 @@ const TestGroupForm: React.FC<TestGroupFormProps> = ({ onClose, onSubmit, testGr
             </div>
           </div>
 
-          {/* Required Patient Inputs & Pre-Conditions */}
-          <div className="space-y-4 border-t border-gray-200 pt-6">
-            <h3 className="text-lg font-medium text-gray-900 flex items-center">
-              <AlertCircle className="h-5 w-5 mr-2 text-blue-600" />
-              Required Patient Inputs & Pre-Conditions
-            </h3>
-            <p className="text-sm text-gray-500 -mt-2">
-              When checked, the order form will require these inputs before submission.
-            </p>
-
-            <div className="bg-blue-50 rounded-lg p-4">
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-                {[
-                  { key: 'pregnancy_status', label: 'Pregnancy Status' },
-                  { key: 'lmp', label: 'LMP (Last Menstrual Period)' },
-                  { key: 'weight', label: 'Weight' },
-                  { key: 'height', label: 'Height' },
-                  { key: 'blood_pressure', label: 'Blood Pressure' },
-                  { key: 'id_document', label: 'ID Document (Aadhaar etc.)' },
-                  { key: 'consent_form', label: 'Consent Form' },
-                ].map(({ key, label }) => (
-                  <label key={key} className="flex items-center px-3 py-2 border rounded-md bg-white hover:bg-blue-50 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={formData.required_patient_inputs.includes(key)}
-                      onChange={(e) => {
-                        const checked = e.target.checked;
-                        setFormData(prev => ({
-                          ...prev,
-                          required_patient_inputs: checked
-                            ? [...prev.required_patient_inputs, key]
-                            : prev.required_patient_inputs.filter(f => f !== key)
-                        }));
-                      }}
-                      className="h-4 w-4 text-blue-600 rounded"
-                    />
-                    <span className="ml-2 text-sm">{label}</span>
-                  </label>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          {/* AI Reference Range Configuration */}
-          <div className="space-y-4 border-t border-gray-200 pt-6">
-            <h3 className="text-lg font-medium text-gray-900 flex items-center">
-              <Brain className="h-5 w-5 mr-2 text-purple-600" />
-              AI Reference Range Configuration
-            </h3>
-
-            <div className="bg-purple-50 rounded-lg p-4 space-y-4">
-              <label className="flex items-center">
-                <input
-                  type="checkbox"
-                  checked={formData.ref_range_ai_config?.enabled}
-                  onChange={(e) => setFormData(prev => ({
-                    ...prev,
-                    ref_range_ai_config: { ...prev.ref_range_ai_config, enabled: e.target.checked }
-                  }))}
-                  className="h-4 w-4 text-purple-600 focus:ring-purple-500 border-gray-300 rounded"
-                />
-                <span className="ml-2 font-medium text-gray-900">Enable AI Reference Range Determination</span>
-              </label>
-
-              {formData.ref_range_ai_config?.enabled && (
-                <div className="ml-6 grid grid-cols-2 gap-4">
-                  <label className="flex items-center">
-                    <input
-                      type="checkbox"
-                      checked={formData.ref_range_ai_config?.consider_age}
-                      onChange={(e) => setFormData(prev => ({
-                        ...prev,
-                        ref_range_ai_config: { ...prev.ref_range_ai_config, consider_age: e.target.checked }
-                      }))}
-                      className="h-4 w-4 text-purple-600 rounded"
-                    />
-                    <span className="ml-2 text-sm">Consider Exact Age (Pediatric)</span>
-                  </label>
-                </div>
-              )}
-            </div>
-          </div>
-
           {/* Analyte Selection */}
-          <div className="space-y-4">
+          <div className="space-y-4 border-t border-gray-200 pt-6">
             <div className="flex items-center justify-between">
               <div>
                 <h3 className="text-lg font-medium text-gray-900">Select Analytes</h3>
@@ -2514,6 +2417,11 @@ const TestGroupForm: React.FC<TestGroupFormProps> = ({ onClose, onSubmit, testGr
                 <div className="flex items-center justify-between mb-2">
                   <h4 className="font-medium text-green-900">
                     Selected Analytes ({formData.selectedAnalytes.length}
+                    {selectedAnalyteDetails.filter((a: any) => a.is_calculated).length > 0 && (
+                      <span className="text-amber-700 ml-1 text-sm font-normal">
+                        · {selectedAnalyteDetails.filter((a: any) => a.is_calculated).length} calculated
+                      </span>
+                    )}
                     {Object.values(analyteMetadata).filter(m => !m.is_visible).length > 0 && (
                       <span className="text-orange-600 ml-1 text-sm font-normal">
                         · {Object.values(analyteMetadata).filter(m => !m.is_visible).length} hidden on report
@@ -2624,6 +2532,15 @@ const TestGroupForm: React.FC<TestGroupFormProps> = ({ onClose, onSubmit, testGr
                               {analyte.referenceRange ? `(${analyte.referenceRange})` : ''}
                               {analyte.unit ? ` [${analyte.unit}]` : ''}
                             </span>
+	                            {analyte.is_calculated && (
+	                              <span
+	                                className="inline-flex items-center gap-1 text-xs bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded font-medium border border-amber-300"
+	                                title={analyte.formula ? `Formula: ${analyte.formula}` : 'Calculated analyte (no formula configured yet)'}
+	                              >
+	                                <Calculator className="w-3 h-3" />
+	                                Calculated
+	                              </span>
+	                            )}
 	                            {isHidden && (
 	                              <span className="text-xs bg-orange-100 text-orange-700 px-1.5 py-0.5 rounded font-medium">Hidden on Report</span>
 	                            )}
@@ -2685,6 +2602,23 @@ const TestGroupForm: React.FC<TestGroupFormProps> = ({ onClose, onSubmit, testGr
                             </button>
                           </div>
 	                        </div>
+	                        {analyte.is_calculated && (
+	                          <div className="mb-2 rounded border border-amber-200 bg-amber-50 px-2 py-1.5 text-xs text-amber-800">
+	                            {analyte.formula ? (
+	                              <>
+	                                <span className="font-medium">Formula:</span>{' '}
+	                                <code className="font-mono bg-white/70 border border-amber-200 rounded px-1 py-0.5">{analyte.formula}</code>
+	                                {Array.isArray(analyte.formula_variables) && analyte.formula_variables.length > 0 && (
+	                                  <span className="ml-2 text-amber-700">
+	                                    Variables: {analyte.formula_variables.join(', ')}
+	                                  </span>
+	                                )}
+	                              </>
+	                            ) : (
+	                              <>Marked as calculated but no formula configured. Use <strong>AI Calculated</strong> or edit this analyte to set one.</>
+	                            )}
+	                          </div>
+	                        )}
 	                        {missingDependencyLabels.length > 0 && (
 	                          <div className="mb-2 rounded border border-red-200 bg-red-50 px-2 py-1.5 text-xs text-red-700">
 	                            Formula source not attached to this test group: <strong>{missingDependencyLabels.join(', ')}</strong>. Edit this analyte and choose the in-group source.
@@ -2765,6 +2699,90 @@ const TestGroupForm: React.FC<TestGroupFormProps> = ({ onClose, onSubmit, testGr
               </div>
             )}
           </div>
+
+          {/* Required Patient Inputs & Pre-Conditions */}
+          <div className="space-y-4 border-t border-gray-200 pt-6">
+            <h3 className="text-lg font-medium text-gray-900 flex items-center">
+              <AlertCircle className="h-5 w-5 mr-2 text-blue-600" />
+              Required Patient Inputs & Pre-Conditions
+            </h3>
+            <p className="text-sm text-gray-500 -mt-2">
+              When checked, the order form will require these inputs before submission.
+            </p>
+
+            <div className="bg-blue-50 rounded-lg p-4">
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                {[
+                  { key: 'pregnancy_status', label: 'Pregnancy Status' },
+                  { key: 'lmp', label: 'LMP (Last Menstrual Period)' },
+                  { key: 'weight', label: 'Weight' },
+                  { key: 'height', label: 'Height' },
+                  { key: 'blood_pressure', label: 'Blood Pressure' },
+                  { key: 'id_document', label: 'ID Document (Aadhaar etc.)' },
+                  { key: 'consent_form', label: 'Consent Form' },
+                ].map(({ key, label }) => (
+                  <label key={key} className="flex items-center px-3 py-2 border rounded-md bg-white hover:bg-blue-50 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={formData.required_patient_inputs.includes(key)}
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        setFormData(prev => ({
+                          ...prev,
+                          required_patient_inputs: checked
+                            ? [...prev.required_patient_inputs, key]
+                            : prev.required_patient_inputs.filter(f => f !== key)
+                        }));
+                      }}
+                      className="h-4 w-4 text-blue-600 rounded"
+                    />
+                    <span className="ml-2 text-sm">{label}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* AI Reference Range Configuration */}
+          <div className="space-y-4 border-t border-gray-200 pt-6">
+            <h3 className="text-lg font-medium text-gray-900 flex items-center">
+              <Brain className="h-5 w-5 mr-2 text-purple-600" />
+              AI Reference Range Configuration
+            </h3>
+
+            <div className="bg-purple-50 rounded-lg p-4 space-y-4">
+              <label className="flex items-center">
+                <input
+                  type="checkbox"
+                  checked={formData.ref_range_ai_config?.enabled}
+                  onChange={(e) => setFormData(prev => ({
+                    ...prev,
+                    ref_range_ai_config: { ...prev.ref_range_ai_config, enabled: e.target.checked }
+                  }))}
+                  className="h-4 w-4 text-purple-600 focus:ring-purple-500 border-gray-300 rounded"
+                />
+                <span className="ml-2 font-medium text-gray-900">Enable AI Reference Range Determination</span>
+              </label>
+
+              {formData.ref_range_ai_config?.enabled && (
+                <div className="ml-6 grid grid-cols-2 gap-4">
+                  <label className="flex items-center">
+                    <input
+                      type="checkbox"
+                      checked={formData.ref_range_ai_config?.consider_age}
+                      onChange={(e) => setFormData(prev => ({
+                        ...prev,
+                        ref_range_ai_config: { ...prev.ref_range_ai_config, consider_age: e.target.checked }
+                      }))}
+                      className="h-4 w-4 text-purple-600 rounded"
+                    />
+                    <span className="ml-2 text-sm">Consider Exact Age (Pediatric)</span>
+                  </label>
+                </div>
+              )}
+            </div>
+          </div>
+
 
 
 

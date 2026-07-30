@@ -1,8 +1,9 @@
 /**
  * ai-analyzer-mapping-import
  *
- * Reads an analyzer mapping image and proposes result-code mappings for the
- * analytes attached to one test group and one connected analyzer.
+ * Reads an analyzer mapping image, or a raw analyzer message/code list pasted as
+ * plain text, and proposes result-code mappings for the analytes attached to one
+ * test group and one connected analyzer.
  */
 
 const corsHeaders = {
@@ -37,6 +38,7 @@ function buildPrompt(params: {
   testGroupName: string
   analyzerName: string
   analytes: IncomingAnalyte[]
+  textContent?: string
 }): string {
   const compactAnalytes = params.analytes.map((analyte) => ({
     la: analyte.lab_analyte_id,
@@ -46,9 +48,17 @@ function buildPrompt(params: {
     u: analyte.unit || '',
   }))
 
+  const sourceInstruction = params.textContent
+    ? `Read the analyzer text below. It may be a raw instrument message (ASTM/HL7/LIS frames), a plain code list, a copy-pasted analyzer software screen, or free-form notes. Extract analyzer result codes only, then match them to the attached LIMS analytes below.
+
+--- ANALYZER TEXT START ---
+${params.textContent}
+--- ANALYZER TEXT END ---`
+    : 'Read the attached analyzer mapping/code image. Extract analyzer result codes only, then match them to the attached LIMS analytes below.'
+
   return `You are configuring a laboratory LIMS analyzer interface.
 
-Read the attached analyzer mapping/code image. Extract analyzer result codes only, then match them to the attached LIMS analytes below.
+${sourceInstruction}
 
 Test group: ${params.testGroupName || 'Unknown'}
 Connected analyzer: ${params.analyzerName || 'Unknown'}
@@ -77,22 +87,36 @@ Return ONLY JSON with this exact shape:
 }
 
 Rules:
-- Do not invent analyzer codes. Use only codes visible in the image.
+- Do not invent analyzer codes. Use only codes present in the ${params.textContent ? 'analyzer text' : 'image'}.
 - Match only to analytes listed above. Never create new analytes.
 - Analyzer codes are often short tokens such as HGB, WBC, PLT, GLU, CREA, ALT.
-- Ignore prices, ranges, units, patient values, flags, and calibration text unless they help identify the code row.
+- In raw ASTM/HL7 result frames the analyzer code is the test identifier field (for example the R|1|^^^HGB| segment or an OBX-3 identifier), not the result value.
+- Ignore prices, ranges, units, patient values, flags, timestamps, sample IDs, and calibration text unless they help identify the code row.
 - If multiple visible codes could match one analyte, choose the strongest and lower confidence.
 - Include suggestions only when confidence is at least 0.60.
 - Keep analyzer_code exactly as shown, preserving punctuation/case where meaningful.`
 }
 
-async function callAnthropicVision(params: {
-  fileBase64: string
-  mimeType: string
+async function callAnthropic(params: {
+  fileBase64?: string
+  mimeType?: string
   prompt: string
   apiKey: string
   model: string
 }): Promise<Record<string, unknown>> {
+  const content: Array<Record<string, unknown>> = []
+  if (params.fileBase64 && params.mimeType) {
+    content.push({
+      type: 'image',
+      source: {
+        type: 'base64',
+        media_type: params.mimeType,
+        data: params.fileBase64,
+      },
+    })
+  }
+  content.push({ type: 'text', text: params.prompt })
+
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -104,22 +128,7 @@ async function callAnthropicVision(params: {
       model: params.model,
       max_tokens: 4096,
       temperature: 0,
-      messages: [
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'image',
-              source: {
-                type: 'base64',
-                media_type: params.mimeType,
-                data: params.fileBase64,
-              },
-            },
-            { type: 'text', text: params.prompt },
-          ],
-        },
-      ],
+      messages: [{ role: 'user', content }],
     }),
   })
 
@@ -201,32 +210,44 @@ Deno.serve(async (req: Request) => {
     const {
       file_base64,
       file_mime_type,
+      text_content,
       test_group,
       analyzer_connection,
       analytes,
     } = body
 
-    if (!file_base64 || !file_mime_type) {
-      return new Response(JSON.stringify({ error: 'file_base64 and file_mime_type are required' }), {
+    const pastedText = typeof text_content === 'string' ? text_content.trim() : ''
+
+    if (!pastedText && (!file_base64 || !file_mime_type)) {
+      return new Response(
+        JSON.stringify({ error: 'Provide text_content, or file_base64 with file_mime_type' }),
+        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
+      )
+    }
+
+    if (pastedText && pastedText.length > 200_000) {
+      return new Response(JSON.stringify({ error: 'Analyzer text must be under 200,000 characters' }), {
         status: 400,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       })
     }
 
-    const approximateBytes = Math.ceil(String(file_base64).length * 0.75)
-    if (approximateBytes > 20 * 1024 * 1024) {
-      return new Response(JSON.stringify({ error: 'File size must be under 20 MB' }), {
-        status: 400,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      })
-    }
+    if (!pastedText) {
+      const approximateBytes = Math.ceil(String(file_base64).length * 0.75)
+      if (approximateBytes > 20 * 1024 * 1024) {
+        return new Response(JSON.stringify({ error: 'File size must be under 20 MB' }), {
+          status: 400,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        })
+      }
 
-    const supportedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif']
-    if (!supportedTypes.includes(file_mime_type)) {
-      return new Response(JSON.stringify({ error: `Unsupported file type: ${file_mime_type}` }), {
-        status: 400,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      })
+      const supportedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif']
+      if (!supportedTypes.includes(file_mime_type)) {
+        return new Response(JSON.stringify({ error: `Unsupported file type: ${file_mime_type}` }), {
+          status: 400,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        })
+      }
     }
 
     const attachedAnalytes = Array.isArray(analytes)
@@ -244,16 +265,19 @@ Deno.serve(async (req: Request) => {
       testGroupName: String(test_group?.name ?? ''),
       analyzerName: String(analyzer_connection?.name ?? ''),
       analytes: attachedAnalytes,
+      textContent: pastedText || undefined,
     })
 
     const preferredModel = Deno.env.get('ANTHROPIC_ANALYZER_MAPPING_MODEL') || CLAUDE_HAIKU_MODEL
+    const imagePayload = pastedText
+      ? {}
+      : { fileBase64: file_base64 as string, mimeType: file_mime_type as string }
     let raw: Record<string, unknown>
     let modelUsed = preferredModel
 
     try {
-      raw = await callAnthropicVision({
-        fileBase64: file_base64,
-        mimeType: file_mime_type,
+      raw = await callAnthropic({
+        ...imagePayload,
         prompt,
         apiKey: anthropicApiKey,
         model: preferredModel,
@@ -262,9 +286,8 @@ Deno.serve(async (req: Request) => {
       if (preferredModel === CLAUDE_SONNET_FALLBACK_MODEL) throw err
       console.warn('[ai-analyzer-mapping-import] Haiku failed, retrying Sonnet:', err)
       modelUsed = CLAUDE_SONNET_FALLBACK_MODEL
-      raw = await callAnthropicVision({
-        fileBase64: file_base64,
-        mimeType: file_mime_type,
+      raw = await callAnthropic({
+        ...imagePayload,
         prompt,
         apiKey: anthropicApiKey,
         model: CLAUDE_SONNET_FALLBACK_MODEL,

@@ -57,6 +57,7 @@ import {
 } from "../utils/resultPermissions";
 import { evaluateTextCalculation, normalizeCalculationResultType } from "../utils/calculationRules";
 import { calculateFlag } from "../utils/flagCalculation";
+import { FALLBACK_DECIMAL_PLACES, normalizeDecimalPlaces, roundHalfUp } from "../utils/resultValueFormat";
 
 /* =========================================
    Types
@@ -365,7 +366,11 @@ const fetchPanelStatusRows = async (
       .eq("lab_id", labId)
       .gte("order_date", from)
       .lte("order_date", to)
+      // order_date alone is not unique (every panel of a day shares it), so paging
+      // on it can repeat/drop rows across pages. Tie-break on the view's grain.
       .order("order_date", { ascending: false })
+      .order("order_id", { ascending: true })
+      .order("test_group_id", { ascending: true })
       .range(start, start + pageSize - 1);
 
     if (shouldFilter && locationIds.length > 0) {
@@ -1544,7 +1549,7 @@ const ResultVerificationConsole: React.FC = () => {
       const [{ data: labFormulas }, { data: rawDeps }, { data: srcAnalytesData }, { data: srcLabAnalytesData }] = await Promise.all([
         // Prefer lab_analytes formula over global analytes formula
         supabase.from('lab_analytes')
-          .select('analyte_id, is_calculated, formula, formula_variables, calculation_result_type')
+          .select('analyte_id, is_calculated, formula, formula_variables, calculation_result_type, decimal_places')
           .eq('lab_id', labId!)
           .in('analyte_id', calcIds),
         supabase.from('analyte_dependencies')
@@ -1573,7 +1578,7 @@ const ResultVerificationConsole: React.FC = () => {
       const labFormulaMap = new Map((labFormulas || []).map((r: any) => [r.analyte_id, r]));
       const globalFormulasNeeded = calcIds.filter(id => !labFormulaMap.has(id));
       if (globalFormulasNeeded.length > 0) {
-        const { data: globalFormulas } = await supabase.from('analytes').select('id, formula, formula_variables, calculation_result_type').in('id', globalFormulasNeeded);
+        const { data: globalFormulas } = await supabase.from('analytes').select('id, formula, formula_variables, calculation_result_type, decimal_places').in('id', globalFormulasNeeded);
         (globalFormulas || []).forEach((r: any) => labFormulaMap.set(r.id, { analyte_id: r.id, ...r }));
       }
       // Remap to match shape expected downstream ({ id, formula, formula_variables })
@@ -1582,6 +1587,7 @@ const ResultVerificationConsole: React.FC = () => {
         formula: r.formula,
         formula_variables: r.formula_variables,
         calculation_result_type: r.calculation_result_type ?? 'numeric',
+        decimal_places: r.decimal_places ?? null,
       }));
       // Deduplicate deps: prefer lab-specific over global
       const depSeen = new Set<string>();
@@ -1843,7 +1849,12 @@ const ResultVerificationConsole: React.FC = () => {
               });
               continue;
             }
-            const roundedValue = String(Math.round(Number(computed) * 100) / 100);
+            // Honour the analyte's configured precision (0 = integer) so this
+            // button cannot undo it. Unconfigured stays at 2 dp as before.
+            const roundedValue = String(roundHalfUp(
+              Number(computed),
+              normalizeDecimalPlaces(fi.decimal_places) ?? FALLBACK_DECIMAL_PLACES,
+            ));
             const recalculatedFlag = calculateFlag(roundedValue, calcRow.reference_range || '') || 'normal';
             updates.push({
               id: calcRow.id,

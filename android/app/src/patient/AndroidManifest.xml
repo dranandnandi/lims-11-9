@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Patient-flavor permission trimming.
+
+  The main manifest and the Capacitor camera plugin declare camera and media
+  permissions because the full LIMS app attaches images to records. Nothing
+  reachable in the patient app (PatientLogin, PatientPortal, VerificationPage)
+  picks a photo or opens the camera, so those permissions are stripped here.
+
+  READ_MEDIA_IMAGES in particular forces the Play Console "Photo and Video
+  Permissions" declaration, which Google only grants to apps whose core purpose
+  is photos or video. Removing it avoids the declaration entirely.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" tools:node="remove" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" tools:node="remove" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" tools:node="remove" />
+    <uses-permission android:name="android.permission.CAMERA" tools:node="remove" />
+
+</manifest>

@@ -15,6 +15,126 @@ const corsHeaders = {
 const GEMINI_VISION_MODEL = 'gemini-2.5-flash'
 const CLAUDE_HAIKU_MODEL = 'claude-haiku-4-5-20251001'
 
+/**
+ * Allowed values of the Postgres `sample_type` enum (verified against the live
+ * DB). test_groups.sample_type is enum-typed, so anything outside this list is
+ * rejected by the database — free text from the report must be mapped onto it.
+ * The client may override via `allowed_sample_types` in the request body.
+ */
+const SAMPLE_TYPE_ENUM = [
+  'EDTA Blood', 'Serum', 'Plasma', 'Urine', 'Stool', 'CSF', 'Sputum', 'Swab',
+  'Tissue', 'Other', 'Fluoride Plasma', 'Citrated Plasma', 'X-Ray', 'CT Scan',
+  'MRI', 'Ultrasound', 'Mammography', 'PET Scan', 'Fluoroscopy', 'Angiography',
+  'DEXA Scan', 'ECG', 'EEG', 'Endoscopy', 'Colonoscopy', 'Bronchoscopy',
+  'No Sample Required', 'Whole Blood', 'Capillary Blood',
+]
+
+/** How labs actually word specimens on reports → the enum value they mean. */
+const SAMPLE_TYPE_ALIASES: Record<string, string> = {
+  'whole blood edta': 'EDTA Blood',
+  'edta whole blood': 'EDTA Blood',
+  'blood edta': 'EDTA Blood',
+  'edta': 'EDTA Blood',
+  'edta blood sample': 'EDTA Blood',
+  'k2 edta blood': 'EDTA Blood',
+  'k3 edta blood': 'EDTA Blood',
+  'anticoagulated blood': 'EDTA Blood',
+  'lavender top': 'EDTA Blood',
+  'purple top': 'EDTA Blood',
+  'blood': 'Whole Blood',
+  'blood sample': 'Whole Blood',
+  'venous blood': 'Whole Blood',
+  'peripheral blood': 'Whole Blood',
+  'peripheral smear': 'Whole Blood',
+  'finger prick blood': 'Capillary Blood',
+  'fingerstick blood': 'Capillary Blood',
+  'clotted blood': 'Serum',
+  'plain blood': 'Serum',
+  'serum sample': 'Serum',
+  'sst': 'Serum',
+  'red top': 'Serum',
+  'heparinised plasma': 'Plasma',
+  'heparinized plasma': 'Plasma',
+  'lithium heparin plasma': 'Plasma',
+  'citrated blood': 'Citrated Plasma',
+  'sodium citrate': 'Citrated Plasma',
+  'sodium citrate plasma': 'Citrated Plasma',
+  'blue top': 'Citrated Plasma',
+  'fluoride blood': 'Fluoride Plasma',
+  'sodium fluoride plasma': 'Fluoride Plasma',
+  'grey top': 'Fluoride Plasma',
+  'gray top': 'Fluoride Plasma',
+  'random urine': 'Urine',
+  'spot urine': 'Urine',
+  'first morning urine': 'Urine',
+  'midstream urine': 'Urine',
+  '24 hour urine': 'Urine',
+  '24 hr urine': 'Urine',
+  '24 hrs urine': 'Urine',
+  'faeces': 'Stool',
+  'feces': 'Stool',
+  'stool sample': 'Stool',
+  'cerebrospinal fluid': 'CSF',
+  'csf fluid': 'CSF',
+  'biopsy': 'Tissue',
+  'tissue biopsy': 'Tissue',
+  'fnac': 'Tissue',
+  'usg': 'Ultrasound',
+  'sonography': 'Ultrasound',
+  'ultrasonography': 'Ultrasound',
+  'x ray': 'X-Ray',
+  'xray': 'X-Ray',
+  'radiograph': 'X-Ray',
+  'ct': 'CT Scan',
+  'cect': 'CT Scan',
+  'computed tomography': 'CT Scan',
+  'body fluid': 'Other',
+  'not applicable': 'No Sample Required',
+  'na': 'No Sample Required',
+}
+
+/** Words that carry no discriminating power when fuzzy-matching a specimen. */
+const GENERIC_SAMPLE_TOKENS = new Set(['sample', 'specimen', 'fluid', 'scan', 'type'])
+
+function sampleTypeKey(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim()
+}
+
+/**
+ * Map free-text specimen wording from a report onto the sample_type enum.
+ * Returns null when nothing matches confidently — the caller then skips the
+ * update rather than letting Postgres reject the whole test-group write.
+ */
+function normalizeSampleType(raw: string, allowed: string[]): string | null {
+  const key = sampleTypeKey(raw)
+  if (!key) return null
+
+  // 1. Exact (case/punctuation-insensitive) hit
+  const exact = allowed.find(v => sampleTypeKey(v) === key)
+  if (exact) return exact
+
+  // 2. Known lab wording
+  const alias = SAMPLE_TYPE_ALIASES[key]
+  if (alias && allowed.includes(alias)) return alias
+
+  // 3. Token containment — every word of the enum value appears in the raw text
+  //    ("Whole Blood EDTA" contains all of "EDTA Blood"). Score by discriminating
+  //    tokens; ties fall to enum declaration order, which is most-specific-first.
+  const rawTokens = new Set(key.split(' '))
+  let best: string | null = null
+  let bestScore = 0
+  for (const value of allowed) {
+    const tokens = sampleTypeKey(value).split(' ')
+    if (!tokens.every(t => rawTokens.has(t))) continue
+    const score = tokens.reduce((sum, t) => sum + (GENERIC_SAMPLE_TOKENS.has(t) ? 0.25 : 1), 0)
+    if (score > bestScore) {
+      bestScore = score
+      best = value
+    }
+  }
+  return best
+}
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 interface ExistingAnalyte {
@@ -56,14 +176,19 @@ interface GeminiExtractedData {
 
 // ─── Stage 1: Gemini 2.5 Flash vision extraction ─────────────────────────────
 
-function buildGeminiExtractionPrompt(): string {
+function buildGeminiExtractionPrompt(allowedSampleTypes: string[]): string {
   return `You are a medical laboratory data extraction specialist. Analyze this lab report image/PDF and extract all structured data.
 
 Extract the following and return ONLY a JSON object with no extra text:
 
 1. Test name / panel name (if shown)
 2. Methodology / technique (if shown, e.g., "Impedance", "Flow Cytometry", "Photometry")
-3. Sample type (if shown, e.g., "EDTA Blood", "Serum", "Urine")
+3. Sample type — you MUST return one of these exact values, or null if none applies:
+${JSON.stringify(allowedSampleTypes)}
+   Map the report's wording to the closest listed value (e.g. "Whole Blood EDTA",
+   "EDTA Whole Blood" and "Lavender top" all map to "EDTA Blood"; "Clotted blood"
+   maps to "Serum"; "USG"/"Sonography" map to "Ultrasound"). Never invent a value
+   outside the list — return null instead of guessing.
 4. ALL analytes/parameters listed, in the ORDER they appear
 
 For each analyte:
@@ -98,6 +223,9 @@ Return JSON:
 Rules:
 - Capture ALL parameters visible, including calculated ones
 - Preserve exact names as written (do not normalise)
+- Percentage and absolute forms of the same parameter are SEPARATE analytes — keep
+  the qualifier from the report (e.g. "Neutrophils %" and "Neutrophils (Absolute)"),
+  and if the report distinguishes them only by unit, append the form to the name
 - If a single unified range exists, use reference_range; if M/F split, use reference_range_male / reference_range_female
 - Section headers are bold/underlined group labels appearing above sets of analytes`
 }
@@ -105,7 +233,8 @@ Rules:
 async function callGeminiVision(
   fileBase64: string,
   mimeType: string,
-  geminiApiKey: string
+  geminiApiKey: string,
+  allowedSampleTypes: string[]
 ): Promise<GeminiExtractedData> {
   const body = {
     contents: [
@@ -113,14 +242,18 @@ async function callGeminiVision(
         role: 'user',
         parts: [
           { inlineData: { mimeType, data: fileBase64 } },
-          { text: buildGeminiExtractionPrompt() },
+          { text: buildGeminiExtractionPrompt(allowedSampleTypes) },
         ],
       },
     ],
     generationConfig: {
       temperature: 0.1,
       topP: 0.9,
-      maxOutputTokens: 16384,
+      // 2.5 Flash spends part of the output budget on thinking tokens; a long
+      // report can otherwise get cut off mid-array. Disable thinking (extraction
+      // is mechanical) and give the answer plenty of room.
+      maxOutputTokens: 65536,
+      thinkingConfig: { thinkingBudget: 0 },
       responseMimeType: 'application/json',
     },
   }
@@ -136,23 +269,26 @@ async function callGeminiVision(
   }
 
   const data = await resp.json()
-  const text: string = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? ''
+  const candidate = data?.candidates?.[0]
+  const finishReason: string = candidate?.finishReason ?? ''
 
-  if (!text) throw new Error('Gemini returned empty response')
+  // Join every text part — long JSON answers can be split across parts
+  const text: string = (candidate?.content?.parts ?? [])
+    .filter((p: Record<string, unknown>) => typeof p?.text === 'string' && !p?.thought)
+    .map((p: { text: string }) => p.text)
+    .join('')
+    .trim()
 
-  // Extract the JSON object robustly — handles leading/trailing text or code fences
-  const objMatch = text.match(/\{[\s\S]*\}/)
-  if (!objMatch) {
-    console.error('[ai-report-import] Gemini raw response (no JSON found):', text.slice(0, 500))
-    throw new Error('Could not extract JSON from Gemini response')
+  if (!text) {
+    console.error('[ai-report-import] Gemini empty response. finishReason:', finishReason)
+    throw new Error(`Gemini returned empty response (finishReason: ${finishReason || 'unknown'})`)
   }
 
-  try {
-    return JSON.parse(objMatch[0]) as GeminiExtractedData
-  } catch (e) {
-    console.error('[ai-report-import] Gemini JSON parse error. Raw (first 1000 chars):', objMatch[0].slice(0, 1000))
-    throw new Error(`Gemini response JSON parse failed: ${e instanceof Error ? e.message : String(e)}`)
+  if (finishReason && finishReason !== 'STOP') {
+    console.warn('[ai-report-import] Gemini finishReason:', finishReason, '- output may be truncated')
   }
+
+  return parseLlmJson<GeminiExtractedData>(text, 'Gemini')
 }
 
 // ─── Stage 2: Claude Haiku 4.5 matching & CRUD payload generation ─────────────
@@ -203,6 +339,14 @@ ${JSON.stringify(compactExtracted)}
 TASK: For each extracted analyte, find best match from catalog by name/code similarity.
 Handle common variants: Haemoglobin↔Hemoglobin, TLC↔WBC, Platelet Count↔PLT, etc.
 
+CRITICAL — each catalog id may be used AT MOST ONCE across the whole result:
+- Percentage vs absolute counts are DIFFERENT analytes (Neutrophils % vs Neutrophils
+  Absolute / AEC). Match each to its own catalog entry; compare units (% vs 10^3/µL)
+  to tell them apart.
+- If two extracted analytes look like the same catalog entry, keep only the better
+  match and put the other in "u" so it can be created as a new analyte.
+- Never emit two objects in "m" with the same "i".
+
 Return JSON (no markdown):
 {
   "m": [
@@ -224,59 +368,88 @@ Only include matches with confidence >= 0.75. Be concise.`
 
 /**
  * Attempt to repair truncated JSON from LLM output.
- * Handles cases where the response was cut off mid-array or mid-object.
+ *
+ * Walks the text tracking nesting, remembering the last offset at which a
+ * container element was fully closed. On failure we cut back to that point and
+ * close the still-open containers — so a response cut off mid-object loses only
+ * the trailing partial element instead of the whole extraction.
  */
 function repairTruncatedJson(text: string): string {
-  let json = text.trim()
+  const json = text.trim()
 
-  // Remove trailing incomplete elements (partial strings, numbers, etc.)
-  // Find the last complete element by looking for }, ], or complete value
-  const lastCompletePattern = /,\s*(?:"[^"]*"?\s*:?\s*)?[^,\]\}]*$/
-  json = json.replace(lastCompletePattern, '')
-
-  // Count unclosed brackets and braces
-  let braceCount = 0
-  let bracketCount = 0
+  const stack: string[] = []
   let inString = false
   let escaped = false
+  let safeEnd = -1
+  let safeStack: string[] = []
 
-  for (const char of json) {
-    if (escaped) {
-      escaped = false
+  for (let i = 0; i < json.length; i++) {
+    const char = json[i]
+
+    if (inString) {
+      if (escaped) escaped = false
+      else if (char === '\\') escaped = true
+      else if (char === '"') inString = false
       continue
     }
-    if (char === '\\') {
-      escaped = true
-      continue
-    }
+
     if (char === '"') {
-      inString = !inString
-      continue
+      inString = true
+    } else if (char === '{') {
+      stack.push('}')
+    } else if (char === '[') {
+      stack.push(']')
+    } else if (char === '}' || char === ']') {
+      stack.pop()
+      // Everything up to and including this closer is valid JSON structure
+      safeEnd = i
+      safeStack = [...stack]
     }
-    if (inString) continue
-
-    if (char === '{') braceCount++
-    else if (char === '}') braceCount--
-    else if (char === '[') bracketCount++
-    else if (char === ']') bracketCount--
   }
 
-  // If we're inside a string, close it
-  if (inString) {
-    json += '"'
+  // Nothing closed cleanly — fall back to closing whatever is open
+  if (safeEnd === -1) {
+    return (inString ? `${json}"` : json) + stack.reverse().join('')
   }
 
-  // Close unclosed brackets and braces
-  while (bracketCount > 0) {
-    json += ']'
-    bracketCount--
-  }
-  while (braceCount > 0) {
-    json += '}'
-    braceCount--
+  return json.slice(0, safeEnd + 1) + safeStack.reverse().join('')
+}
+
+/**
+ * Parse JSON emitted by an LLM: strips code fences / prose, then repairs
+ * truncated output before giving up.
+ */
+function parseLlmJson<T>(text: string, source: string): T {
+  const cleaned = text
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```\s*$/, '')
+    .trim()
+
+  const start = cleaned.indexOf('{')
+  if (start === -1) {
+    console.error(`[ai-report-import] ${source} raw response (no JSON found):`, cleaned.slice(0, 500))
+    throw new Error(`Could not extract JSON from ${source} response`)
   }
 
-  return json
+  // Take from the first brace to the end — do NOT stop at the last `}`, which
+  // would drop the closers needed to detect truncation.
+  const candidate = cleaned.slice(start)
+
+  try {
+    return JSON.parse(candidate) as T
+  } catch (_firstError) {
+    console.warn(`[ai-report-import] ${source} JSON parse failed, attempting truncation repair...`)
+    const repaired = repairTruncatedJson(candidate)
+    try {
+      const result = JSON.parse(repaired) as T
+      console.log(`[ai-report-import] ${source} JSON repair successful (recovered ${repaired.length}/${candidate.length} chars)`)
+      return result
+    } catch (e) {
+      console.error(`[ai-report-import] ${source} JSON parse error after repair. Raw (first 1500 chars):`, candidate.slice(0, 1500))
+      console.error(`[ai-report-import] ${source} raw tail (last 500 chars):`, candidate.slice(-500))
+      throw new Error(`${source} response JSON parse failed: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
 }
 
 async function callClaudeHaiku(
@@ -303,44 +476,22 @@ async function callClaudeHaiku(
   }
 
   const data = await resp.json()
-  const text: string = data?.content?.[0]?.text?.trim() ?? ''
+  const text: string = (data?.content ?? [])
+    .filter((b: Record<string, unknown>) => b?.type === 'text' && typeof b?.text === 'string')
+    .map((b: { text: string }) => b.text)
+    .join('')
+    .trim()
   const stopReason: string = data?.stop_reason ?? ''
 
   if (!text) throw new Error('Claude Haiku returned empty response')
 
   // Check if output was truncated due to token limit
-  const wasTruncated = stopReason === 'max_tokens' || stopReason === 'end_turn' && !text.endsWith('}')
+  const wasTruncated = stopReason === 'max_tokens' || (stopReason === 'end_turn' && !text.endsWith('}'))
   if (wasTruncated) {
     console.warn('[ai-report-import] Claude response may be truncated (stop_reason:', stopReason, ')')
   }
 
-  const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')
-  const objMatch = cleaned.match(/\{[\s\S]*\}?/)
-  if (!objMatch) {
-    console.error('[ai-report-import] Claude Haiku raw response (no JSON found):', text.slice(0, 500))
-    throw new Error('Could not extract JSON from Claude Haiku response')
-  }
-
-  let jsonText = objMatch[0]
-
-  // First try direct parse
-  try {
-    return JSON.parse(jsonText)
-  } catch (_firstError) {
-    // Try to repair truncated JSON
-    console.warn('[ai-report-import] Initial JSON parse failed, attempting repair...')
-    const repaired = repairTruncatedJson(jsonText)
-
-    try {
-      const result = JSON.parse(repaired)
-      console.log('[ai-report-import] JSON repair successful')
-      return result
-    } catch (e) {
-      console.error('[ai-report-import] Claude Haiku JSON parse error after repair. Raw (first 1500 chars):', jsonText.slice(0, 1500))
-      console.error('[ai-report-import] Repaired attempt (last 500 chars):', repaired.slice(-500))
-      throw new Error(`Claude Haiku response JSON parse failed: ${e instanceof Error ? e.message : String(e)}`)
-    }
-  }
+  return parseLlmJson<unknown>(text, 'Claude Haiku')
 }
 
 // ─── Handler ──────────────────────────────────────────────────────────────────
@@ -392,7 +543,8 @@ function buildDeterministicResult(
   extracted: GeminiExtractedData,
   existingAnalytes: ExistingAnalyte[],
   existingTga: ExistingTGA[],
-  currentTestGroup: { methodology: string; sample_type: string }
+  currentTestGroup: { methodology: string; sample_type: string },
+  allowedSampleTypes: string[]
 ): Record<string, unknown> {
   const catalogByLabId = new Map(existingAnalytes.map(a => [a.lab_analyte_id, a]))
   const extractedByName = new Map((extracted.analytes ?? []).map(a => [comparable(a.extracted_name), a]))
@@ -408,7 +560,34 @@ function buildDeterministicResult(
 
   const { matches } = normalizeAiResponse(rawResult)
 
+  // A catalog analyte may be claimed only once per import: test_group_analytes has
+  // UNIQUE (test_group_id, analyte_id), so two extracted rows pointing at the same
+  // analyte (typically "Neutrophils %" and "Neutrophils Absolute" both matching
+  // "Neutrophils") would fail the second attach. Keep the strongest claim; the
+  // losers fall through to unmatched_analytes so they can be created separately.
+  const winnerByAnalyteId = new Map<string, typeof matches[number]>()
+  const claimedExtracted = new Set<string>()
+  const duplicateNotes: string[] = []
+
+  for (const match of [...matches].sort((a, b) => b.match_confidence - a.match_confidence)) {
+    const catalog = catalogByLabId.get(match.lab_analyte_id)
+    if (!catalog) continue
+    const extractedKey = comparable(match.extracted_name)
+    if (claimedExtracted.has(extractedKey)) continue
+
+    const incumbent = winnerByAnalyteId.get(catalog.id)
+    if (incumbent) {
+      duplicateNotes.push(`"${match.extracted_name}" also matched ${catalog.name}, already claimed by "${incumbent.extracted_name}" — listed as a new analyte instead.`)
+      continue
+    }
+    winnerByAnalyteId.set(catalog.id, match)
+    claimedExtracted.add(extractedKey)
+  }
+
+  const acceptedMatches = new Set(winnerByAnalyteId.values())
+
   for (const match of matches) {
+    if (!acceptedMatches.has(match)) continue
     const labAnalyteId = match.lab_analyte_id
     const catalog = catalogByLabId.get(labAnalyteId)
     const extractedName = comparable(match.extracted_name)
@@ -491,12 +670,29 @@ function buildDeterministicResult(
   })
 
   const testGroupUpdates: Record<string, string> = {}
+  const notes: string[] = []
+
   if (extracted.methodology && comparable(extracted.methodology) !== comparable(currentTestGroup.methodology)) {
     testGroupUpdates.methodology = extracted.methodology.trim()
   }
-  if (extracted.sample_type && comparable(extracted.sample_type) !== comparable(currentTestGroup.sample_type)) {
-    testGroupUpdates.sample_type = extracted.sample_type.trim()
+
+  // sample_type is an enum column — only propose a value the DB will accept
+  if (extracted.sample_type) {
+    const raw = extracted.sample_type.trim()
+    const normalized = normalizeSampleType(raw, allowedSampleTypes)
+    if (!normalized) {
+      notes.push(`Sample type "${raw}" from the report does not map to a known sample type — left unchanged.`)
+    } else if (comparable(normalized) !== comparable(currentTestGroup.sample_type)) {
+      testGroupUpdates.sample_type = normalized
+      if (comparable(normalized) !== comparable(raw)) {
+        notes.push(`Sample type "${raw}" mapped to "${normalized}".`)
+      }
+    }
   }
+
+  notes.push(...duplicateNotes)
+  const aiNote = rawResult.extraction_notes ?? rawResult.notes
+  if (typeof aiNote === 'string' && aiNote.trim()) notes.unshift(aiNote.trim())
 
   return {
     test_group_updates: testGroupUpdates,
@@ -504,7 +700,7 @@ function buildDeterministicResult(
     analyte_changes: analyteChanges,
     unmatched_analytes: unmatched,
     missing_attached_analytes: missingAttached,
-    extraction_notes: rawResult.extraction_notes ?? rawResult.notes,
+    extraction_notes: notes.length > 0 ? notes.join(' ') : undefined,
   }
 }
 
@@ -538,6 +734,12 @@ Deno.serve(async (req: Request) => {
     const body = await req.json()
     const { file_base64, file_mime_type, test_group, existing_analytes, existing_tga } = body
 
+    // Client may supply the live enum values; fall back to the known list
+    const allowedSampleTypes: string[] =
+      Array.isArray(body.allowed_sample_types) && body.allowed_sample_types.length > 0
+        ? body.allowed_sample_types.map(String)
+        : SAMPLE_TYPE_ENUM
+
     if (!file_base64 || !file_mime_type) {
       return new Response(JSON.stringify({ error: 'file_base64 and file_mime_type are required' }), {
         status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
@@ -555,7 +757,7 @@ Deno.serve(async (req: Request) => {
     }
 
     console.log(`[ai-report-import] Stage 1: Gemini vision (${file_mime_type})`)
-    const extracted = await callGeminiVision(file_base64, file_mime_type, geminiApiKey)
+    const extracted = await callGeminiVision(file_base64, file_mime_type, geminiApiKey, allowedSampleTypes)
     console.log(`[ai-report-import] Extracted ${extracted.analytes?.length ?? 0} analytes`)
 
     const currentTestGroup = {
@@ -578,7 +780,8 @@ Deno.serve(async (req: Request) => {
       extracted,
       existing_analytes ?? [],
       existing_tga ?? [],
-      currentTestGroup
+      currentTestGroup,
+      allowedSampleTypes
     )
 
     const enriched = {

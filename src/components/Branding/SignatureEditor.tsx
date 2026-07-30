@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { database } from '../../utils/supabase';
 import type { SignatureSummary } from './SignatureCard';
 
@@ -31,8 +31,19 @@ export const SignatureEditor: React.FC<SignatureEditorProps> = ({
 }) => {
   const [signatureName, setSignatureName] = useState(signature.signature_name || '');
   const [file, setFile] = useState<File | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!file) {
+      setPreviewUrl(null);
+      return;
+    }
+    const url = URL.createObjectURL(file);
+    setPreviewUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [file]);
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -108,7 +119,25 @@ export const SignatureEditor: React.FC<SignatureEditorProps> = ({
           </div>
 
           <div>
-            <label className="mb-1 block text-sm font-medium text-gray-700">Replace signature file</label>
+            <label className="mb-1 block text-sm font-medium text-gray-700">
+              {previewUrl ? 'New signature file' : 'Current signature'}
+            </label>
+
+            {(previewUrl || signature.file_url || signature.text_signature) && (
+              <div className="mb-2 overflow-hidden rounded-md border border-gray-200 bg-gray-50">
+                {previewUrl || signature.file_url ? (
+                  <img
+                    src={previewUrl || signature.file_url}
+                    alt={signatureName || 'Signature'}
+                    className="h-24 w-full object-contain"
+                  />
+                ) : (
+                  <p className="p-2 text-sm text-gray-700">{signature.text_signature}</p>
+                )}
+              </div>
+            )}
+
+            <label className="mt-1 mb-1 block text-sm font-medium text-gray-700">Replace signature file</label>
             <input
               type="file"
               accept="image/*"

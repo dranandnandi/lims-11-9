@@ -977,6 +977,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                   lab_analyte_interface_config(
                     multiply_by,
                     add_offset,
+                    decimal_places,
                     lims_unit,
                     apply_to_ai_result_entry,
                     apply_to_manual_result_entry,
@@ -1046,6 +1047,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                   lab_analyte_interface_config(
                     multiply_by,
                     add_offset,
+                    decimal_places,
                     lims_unit,
                     apply_to_ai_result_entry,
                     apply_to_manual_result_entry,

@@ -7,6 +7,13 @@
  */
 
 import { supabase } from "./supabase";
+import {
+  buildTrendChartSvg,
+  formatTrendAxisDate,
+  formatTrendAxisTime,
+  getTrendPointColor as getSharedPointColor,
+  type TrendSvgPoint,
+} from "./trendChartSvg";
 
 // ============ Types ============
 
@@ -32,11 +39,8 @@ const getPointStatus = (
   return "normal";
 };
 
-const getPointColor = (status: "high" | "low" | "normal") => {
-  if (status === "high") return "#ef4444";
-  if (status === "low") return "#3b82f6";
-  return "#22c55e";
-};
+const getPointColor = (status: "high" | "low" | "normal") =>
+  getSharedPointColor(status);
 
 export interface TrendDataPoint {
   order_date: string;
@@ -66,10 +70,10 @@ export interface TrendChartOptions {
 }
 
 const DEFAULT_OPTIONS: TrendChartOptions = {
-  width: 400,
-  height: 200,
-  backgroundColor: "transparent",
-  lineColor: "#3b82f6",
+  width: 500,
+  height: 250,
+  backgroundColor: "#ffffff",
+  lineColor: "#2563eb",
   showReferenceRange: true,
   maxDataPoints: 10,
 };
@@ -251,172 +255,61 @@ export const parseReferenceRange = (
 // ============ SVG Chart Generation ============
 
 /**
- * Generate a simple SVG line chart for trend data
- * This creates a pure SVG string that can be embedded in HTML
+ * Convert report trend rows into the shared chart point format
+ */
+export const toTrendSvgPoints = (
+  data: TrendDataPoint[],
+  fallbackReferenceRange?: string,
+  fallbackUnit?: string,
+): TrendSvgPoint[] =>
+  (data || [])
+    .map((d) => {
+      const numericValue = parseFloat(String(d.value));
+      if (!Number.isFinite(numericValue)) return null;
+
+      const refRange = parseReferenceRange(
+        d.reference_range || fallbackReferenceRange,
+      );
+      const status = getPointStatus(numericValue, d.flag, refRange);
+      const unit = d.unit || fallbackUnit || "";
+      const label = formatTrendAxisDate(d.order_date);
+      const time = formatTrendAxisTime(d.order_date);
+
+      return {
+        label,
+        value: numericValue,
+        status,
+        tooltip: `${label}${time ? ` ${time}` : ""}: ${numericValue}${
+          unit ? ` ${unit}` : ""
+        }`,
+      } as TrendSvgPoint;
+    })
+    .filter((point): point is TrendSvgPoint => point !== null);
+
+/**
+ * Generate the "Previous History" line chart for trend data as an SVG string.
+ * Shares its renderer with the Result Verification UI so screen and PDF match.
  */
 export const generateTrendSVG = (
   data: TrendDataPoint[],
   options: TrendChartOptions = {},
 ): string => {
   const opts = { ...DEFAULT_OPTIONS, ...options };
-  const { width, height, lineColor, showReferenceRange } = opts;
+  const points = toTrendSvgPoints(data);
+  const refRange = parseReferenceRange(data?.[0]?.reference_range);
 
-  if (!data || data.length === 0) {
-    return `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
-      <text x="${width! / 2}" y="${
-      height! / 2
-    }" text-anchor="middle" fill="#666" font-size="14">No trend data available</text>
-    </svg>`;
-  }
-
-  // Parse numeric values
-  const numericData = data
-    .map((d, i) => ({
-      ...d,
-      numericValue: parseFloat(String(d.value)),
-      index: i,
-    }))
-    .filter((d) => !isNaN(d.numericValue));
-
-  if (numericData.length === 0) {
-    return `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
-      <text x="${width! / 2}" y="${
-      height! / 2
-    }" text-anchor="middle" fill="#666" font-size="14">No numeric data</text>
-    </svg>`;
-  }
-
-  // Calculate bounds
-  const values = numericData.map((d) => d.numericValue);
-  const refRange = parseReferenceRange(numericData[0]?.reference_range);
-
-  let minVal = Math.min(...values);
-  let maxVal = Math.max(...values);
-
-  // Extend range to include reference range if shown
-  if (showReferenceRange) {
-    if (refRange.min !== null) minVal = Math.min(minVal, refRange.min);
-    if (refRange.max !== null) maxVal = Math.max(maxVal, refRange.max);
-  }
-
-  // Add padding
-  const padding = (maxVal - minVal) * 0.1 || 1;
-  minVal -= padding;
-  maxVal += padding;
-
-  // Chart dimensions
-  const chartPadding = { top: 20, right: 40, bottom: 40, left: 50 };
-  const chartWidth = width! - chartPadding.left - chartPadding.right;
-  const chartHeight = height! - chartPadding.top - chartPadding.bottom;
-
-  // Scale functions
-  const xScale = (i: number) =>
-    chartPadding.left + (i / (numericData.length - 1 || 1)) * chartWidth;
-  const yScale = (v: number) =>
-    chartPadding.top + chartHeight -
-    ((v - minVal) / (maxVal - minVal)) * chartHeight;
-
-  // Generate path
-  const pathPoints = numericData.map((d, i) =>
-    `${i === 0 ? "M" : "L"} ${xScale(i)} ${yScale(d.numericValue)}`
-  ).join(" ");
-
-  // Reference range band
-  let refRangeSVG = "";
-  if (showReferenceRange && (refRange.min !== null || refRange.max !== null)) {
-    const y1 = refRange.max !== null ? yScale(refRange.max) : chartPadding.top;
-    const y2 = refRange.min !== null
-      ? yScale(refRange.min)
-      : chartPadding.top + chartHeight;
-    refRangeSVG =
-      `<rect x="${chartPadding.left}" y="${y1}" width="${chartWidth}" height="${
-        y2 - y1
-      }" fill="rgba(34, 197, 94, 0.15)" stroke="none"/>`;
-  }
-
-	  // Data points
-	  const points = numericData.map((d, i) => {
-	    const color = getPointColor(getPointStatus(d.numericValue, d.flag, refRange));
-	    return `<circle cx="${xScale(i)}" cy="${
-	      yScale(d.numericValue)
-	    }" r="3.5" fill="${color}" stroke="white" stroke-width="1.5"/>`;
-	  }).join("");
-
-	  // Value labels
-	  const labels = numericData.map((d, i) => {
-	    const status = getPointStatus(d.numericValue, d.flag, refRange);
-	    const color = status === "normal" ? "#374151" : getPointColor(status);
-    return `<text x="${xScale(i)}" y="${
-      yScale(d.numericValue) - 10
-    }" text-anchor="middle" fill="${color}" font-size="11" font-weight="600">${d.numericValue}</text>`;
-  }).join("");
-
-  // Date labels - show all dates when <= 6 points, otherwise show first, middle, last
-  const dateLabels = numericData
-    .filter((_, i) => {
-      // Show all dates when 6 or fewer points
-      if (numericData.length <= 6) return true;
-      // For more points, show first, middle, and last
-      return i === 0 || i === numericData.length - 1 ||
-        i === Math.floor(numericData.length / 2);
-    })
-    .map((d) => {
-      const i = numericData.indexOf(d);
-      const date = new Date(d.order_date);
-      const formatted = date.toLocaleDateString("en-IN", {
-        day: "2-digit",
-        month: "short",
-      });
-      return `<text x="${xScale(i)}" y="${
-        height! - 8
-      }" text-anchor="middle" fill="#666" font-size="10">${formatted}</text>`;
-    }).join("");
-
-  // Y-axis labels
-  const yAxisLabels = [minVal, (minVal + maxVal) / 2, maxVal].map((v) => {
-    return `<text x="${chartPadding.left - 8}" y="${
-      yScale(v) + 4
-    }" text-anchor="end" fill="#666" font-size="10">${v.toFixed(1)}</text>`;
-  }).join("");
-
-  // Unit label
-  const unit = numericData[0]?.unit || "";
-  const unitLabel = unit
-    ? `<text x="${
-      chartPadding.left - 8
-    }" y="14" text-anchor="end" fill="#666" font-size="10" font-style="italic">${unit}</text>`
-    : "";
-
-  return `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg" style="background: ${opts.backgroundColor}">
-    <!-- Reference range band -->
-    ${refRangeSVG}
-    
-    <!-- Grid lines -->
-    <line x1="${chartPadding.left}" y1="${chartPadding.top}" x2="${chartPadding.left}" y2="${
-    chartPadding.top + chartHeight
-  }" stroke="#e5e7eb" stroke-width="1"/>
-    <line x1="${chartPadding.left}" y1="${
-    chartPadding.top + chartHeight
-  }" x2="${chartPadding.left + chartWidth}" y2="${
-    chartPadding.top + chartHeight
-  }" stroke="#e5e7eb" stroke-width="1"/>
-    
-    <!-- Trend line -->
-    <path d="${pathPoints}" fill="none" stroke="${lineColor}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
-    
-    <!-- Data points -->
-    ${points}
-    
-    <!-- Value labels -->
-    ${labels}
-    
-    <!-- Date labels -->
-    ${dateLabels}
-    
-    <!-- Y-axis labels -->
-    ${yAxisLabels}
-    ${unitLabel}
-  </svg>`;
+  return buildTrendChartSvg(points, {
+    width: opts.width,
+    height: opts.height,
+    unit: data?.[0]?.unit,
+    refMin: refRange.min,
+    refMax: refRange.max,
+    showReferenceRange: opts.showReferenceRange,
+    background: opts.backgroundColor === "transparent"
+      ? "#ffffff"
+      : opts.backgroundColor,
+    lineColor: opts.lineColor,
+  });
 };
 
 // ============ Image Generation & Storage ============
@@ -758,11 +651,7 @@ const generateCompactTrendHistoryTableHtml = (
       const status = Number.isFinite(numericValue)
         ? getPointStatus(numericValue, d.flag, refRange)
         : "normal";
-      const valueColor = status === "high"
-        ? "#b91c1c"
-        : status === "low"
-        ? "#1d4ed8"
-        : "#111827";
+      const valueColor = status === "normal" ? "#111827" : getPointColor(status);
 
       return `<tr>
         <td style="padding: 3px 6px; border: 1px solid #d1d5db; white-space: nowrap;">${formatTrendDateTime(d.order_date)}</td>

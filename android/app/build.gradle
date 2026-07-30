@@ -30,6 +30,32 @@ android {
             ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+    // Three apps from one codebase: full LIMS (default), patient portal, phlebo collections.
+    // Web assets must be built with the matching VITE_APP_TARGET before cap sync
+    // (see the android:build:* scripts in package.json).
+    // Each flavor is a separate Play Store listing, so each keeps its own
+    // versionCode/versionName counter. Bump the flavor's own numbers when
+    // shipping an update to that listing; the defaultConfig values above only
+    // apply to the lims flavor.
+    flavorDimensions = ["app"]
+    productFlavors {
+        lims {
+            dimension "app"
+            applicationId "com.lims.builder"
+        }
+        patient {
+            dimension "app"
+            applicationId "com.anpro.patient"
+            versionCode 3
+            versionName "1.0.2"
+        }
+        phlebo {
+            dimension "app"
+            applicationId "com.anpro.phlebo"
+            versionCode 3
+            versionName "1.0.2"
+        }
+    }
     buildTypes {
         release {
             minifyEnabled true
@@ -77,6 +103,21 @@ try {
     def servicesJSON = file('google-services.json')
     if (servicesJSON.text) {
         apply plugin: 'com.google.gms.google-services'
+
+        // google-services.json must contain an entry per applicationId. Skip Firebase
+        // processing for flavors not registered yet so their builds still succeed
+        // (push notifications won't work in those flavors until they are added in
+        // the Firebase console and google-services.json is re-downloaded).
+        def registeredPackages = servicesJSON.text
+        android.applicationVariants.all { variant ->
+            if (!registeredPackages.contains("\"${variant.applicationId}\"")) {
+                def taskName = "process${variant.name.capitalize()}GoogleServices"
+                tasks.matching { it.name == taskName }.configureEach {
+                    it.enabled = false
+                    logger.warn("${variant.applicationId} not in google-services.json — Firebase disabled for ${variant.name}")
+                }
+            }
+        }
     }
 } catch(Exception e) {
     logger.info("google-services.json not found, google-services plugin not applied. Push Notifications won't work")

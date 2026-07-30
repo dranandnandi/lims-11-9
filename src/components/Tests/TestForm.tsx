@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { X, TestTube, DollarSign, Clock, Settings } from 'lucide-react';
+import { SAMPLE_TYPES } from '../../utils/sampleTypes';
 
 interface TestFormProps {
   onClose: () => void;
@@ -54,23 +55,7 @@ const TestForm: React.FC<TestFormProps> = ({ onClose, onSubmit, test }) => {
     'Radiology',
   ];
 
-  const sampleTypes = [
-    'EDTA Blood',
-    'Serum',
-    'Plasma',
-    'Urine',
-    'Stool',
-    'CSF',
-    'Sputum',
-    'Swab',
-    'Tissue',
-    'X-Ray',
-    'CT Scan',
-    'USG',
-    'Ultrasound',
-    'Sonography',
-    'Other',
-  ];
+  const sampleTypes = SAMPLE_TYPES;
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();

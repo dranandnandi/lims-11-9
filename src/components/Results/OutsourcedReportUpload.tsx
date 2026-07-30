@@ -17,6 +17,11 @@ interface OutsourcedReportUploadProps {
   patientId?: string | null;
   /** Returns the result record id for this order + test group, creating it if needed */
   ensureResultId: () => Promise<string | null>;
+  /**
+   * Renders as a one-line link that expands on click. Use on dense screens that
+   * show every test group at once. Auto-expands when a file is already attached.
+   */
+  collapsible?: boolean;
 }
 
 /**
@@ -31,8 +36,10 @@ const OutsourcedReportUpload: React.FC<OutsourcedReportUploadProps> = ({
   labId,
   patientId,
   ensureResultId,
+  collapsible = false,
 }) => {
   const { user } = useAuth();
+  const [expanded, setExpanded] = useState(!collapsible);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [outsourcedLabName, setOutsourcedLabName] = useState<string | null>(null);
   const [isOutsourced, setIsOutsourced] = useState(false);
@@ -44,7 +51,9 @@ const OutsourcedReportUpload: React.FC<OutsourcedReportUploadProps> = ({
     let active = true;
 
     const load = async () => {
-      // Only render for outsourced tests
+      // Detect whether this test was outsourced (for labelling only). The
+      // upload box itself is shown for every test — an in-house test may have
+      // been sent out on a given day and still needs the external report attached.
       const { data: orderTest } = await supabase
         .from('order_tests')
         .select('outsourced_lab_id, outsourced_labs(name)')
@@ -53,12 +62,13 @@ const OutsourcedReportUpload: React.FC<OutsourcedReportUploadProps> = ({
         .maybeSingle();
 
       if (!active) return;
-      if (!orderTest?.outsourced_lab_id) {
+      if (orderTest?.outsourced_lab_id) {
+        setIsOutsourced(true);
+        setOutsourcedLabName((orderTest as any).outsourced_labs?.name || null);
+      } else {
         setIsOutsourced(false);
-        return;
+        setOutsourcedLabName(null);
       }
-      setIsOutsourced(true);
-      setOutsourcedLabName((orderTest as any).outsourced_labs?.name || null);
 
       // List already-attached files (result record may not exist yet — that's fine)
       const { data: result } = await supabase
@@ -79,6 +89,12 @@ const OutsourcedReportUpload: React.FC<OutsourcedReportUploadProps> = ({
       active = false;
     };
   }, [orderId, testGroupId]);
+
+  // Never hide a file that is already attached — the technician needs to see it
+  // without hunting for a collapsed link.
+  useEffect(() => {
+    if (reports.length > 0) setExpanded(true);
+  }, [reports.length]);
 
   const handleUpload = async () => {
     if (!selectedFile) return;
@@ -126,21 +142,46 @@ const OutsourcedReportUpload: React.FC<OutsourcedReportUploadProps> = ({
     toast.success('Outsourced report removed');
   };
 
-  if (!isOutsourced) return null;
+  if (collapsible && !expanded) {
+    return (
+      <button
+        type="button"
+        onClick={() => setExpanded(true)}
+        className="flex items-center gap-1.5 text-xs font-medium text-purple-700 hover:text-purple-900 hover:underline"
+      >
+        <Upload className="h-3.5 w-3.5" />
+        {isOutsourced
+          ? `Attach report from ${outsourcedLabName || 'the external lab'}`
+          : 'Attach external / outsourced report'}
+      </button>
+    );
+  }
 
   return (
     <div className="bg-purple-50 border border-purple-200 rounded-lg p-4 space-y-3">
-      <div className="flex items-center justify-between">
+      <div className="flex items-start justify-between gap-3">
         <div>
           <h4 className="font-medium text-purple-900 flex items-center">
             <Send className="h-4 w-4 mr-2" />
-            Outsourced Test{outsourcedLabName ? ` — ${outsourcedLabName}` : ''}
+            {isOutsourced
+              ? `Outsourced Test${outsourcedLabName ? ` — ${outsourcedLabName}` : ''}`
+              : 'Attach External / Outsourced Report'}
           </h4>
           <p className="text-xs text-purple-700 mt-0.5">
-            Attach the report received from the external lab. It will be saved and appended
-            after your letterhead pages when the report PDF is generated.
+            {isOutsourced
+              ? 'Attach the report received from the external lab. It will be saved and appended after your letterhead pages when the report PDF is generated.'
+              : 'If this test was sent out on this day, attach the external lab report here. It will be saved and appended after your letterhead pages when the report PDF is generated.'}
           </p>
         </div>
+        {collapsible && reports.length === 0 && (
+          <button
+            type="button"
+            onClick={() => setExpanded(false)}
+            className="flex-shrink-0 text-xs text-purple-600 hover:text-purple-900 hover:underline"
+          >
+            Hide
+          </button>
+        )}
       </div>
 
       {reports.length > 0 && (

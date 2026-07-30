@@ -19,6 +19,30 @@ interface BulkResult {
   error?: string;
 }
 
+// Supabase Auth only keeps the bcrypt hash, so a PIN is unrecoverable once this
+// response is gone. Record it in portal_credentials (admin-read-only via RLS) so the
+// lab can re-read it from the patient page instead of resetting.
+async function recordPin(
+  supabaseAdmin: ReturnType<typeof createClient>,
+  args: { labId: string; authUserId: string; email: string; pin: string }
+): Promise<void> {
+  try {
+    const { error } = await supabaseAdmin
+      .from('portal_credentials')
+      .upsert({
+        lab_id: args.labId,
+        credential_type: 'patient_portal',
+        auth_user_id: args.authUserId,
+        email: args.email,
+        password_text: args.pin,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'lab_id,credential_type,email' });
+    if (error) console.warn('[BULK-PATIENT-PORTAL] Could not store PIN:', error.message);
+  } catch (err) {
+    console.warn('[BULK-PATIENT-PORTAL] PIN store failed:', err);
+  }
+}
+
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders });
 
@@ -103,8 +127,20 @@ Deno.serve(async (req) => {
 
               await supabaseAdmin
                 .from('patients')
-                .update({ portal_pin_reset_at: new Date().toISOString() })
+                .update({
+                  portal_pin_reset_at: new Date().toISOString(),
+                  portal_pin_self_set_at: null,
+                })
                 .eq('id', patient.id);
+
+              // The stored email may predate a phone edit, so use what auth holds.
+              const { data: authUser } = await supabaseAdmin.auth.admin.getUserById(patient.patient_auth_id);
+              await recordPin(supabaseAdmin, {
+                labId: patient.lab_id,
+                authUserId: patient.patient_auth_id,
+                email: authUser?.user?.email || email,
+                pin,
+              });
             } else {
               // Create new auth user
               const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
@@ -128,8 +164,16 @@ Deno.serve(async (req) => {
                   patient_auth_id: authData.user!.id,
                   portal_access_enabled: true,
                   portal_access_sent_at: new Date().toISOString(),
+                  portal_pin_self_set_at: null,
                 })
                 .eq('id', patient.id);
+
+              await recordPin(supabaseAdmin, {
+                labId: patient.lab_id,
+                authUserId: authData.user!.id,
+                email,
+                pin,
+              });
             }
 
             results.push({ patient_id: patient.id, name: patient.name, phone: patient.phone, pin });

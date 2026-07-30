@@ -1,10 +1,16 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Stethoscope, Phone, KeyRound, LogIn, AlertCircle, ArrowLeft, CheckCircle, MessageCircle } from 'lucide-react';
-import { isPatientUser, resolvePatientByPhone, patientSignIn } from '../patientAuth';
+import {
+  isPatientUser,
+  countPatientPortalAccounts,
+  resolvePatientPortalLogin,
+  patientSignIn,
+  type PortalAccountOption,
+} from '../patientAuth';
 import { SUPABASE_URL, SUPABASE_ANON_KEY } from '../supabase';
 
-type Step = 'phone' | 'pin';
+type Step = 'phone' | 'pin' | 'choose';
 
 const PatientLogin: React.FC = () => {
   const navigate = useNavigate();
@@ -14,10 +20,12 @@ const PatientLogin: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Resolved from step 1 — used for step 2 sign-in
-  const [resolvedEmail, setResolvedEmail] = useState('');
-  const [patientName, setPatientName] = useState('');
-  const [labName, setLabName] = useState('');
+  // How many labs this number is registered at — shown at the PIN step so a patient
+  // with accounts at several labs knows to use that lab's PIN
+  const [accountCount, setAccountCount] = useState(0);
+
+  // Set when one PIN happens to match accounts at more than one lab
+  const [accountChoices, setAccountChoices] = useState<PortalAccountOption[]>([]);
 
   // Forgot PIN state
   const [forgotLoading, setForgotLoading] = useState(false);
@@ -38,17 +46,15 @@ const PatientLogin: React.FC = () => {
     setLoading(true);
 
     try {
-      const result = await resolvePatientByPhone(phone);
+      const count = await countPatientPortalAccounts(phone);
 
-      if (!result) {
+      if (count === 0) {
         setError('No portal access found for this mobile number. Please contact your lab to activate access.');
         setLoading(false);
         return;
       }
 
-      setResolvedEmail(result.email);
-      setPatientName(result.patient_name);
-      setLabName(result.lab_name);
+      setAccountCount(count);
       setStep('pin');
     } catch {
       setError('Unable to verify mobile number. Please try again.');
@@ -77,13 +83,13 @@ const PatientLogin: React.FC = () => {
       } else {
         setForgotMessage({
           type: 'error',
-          text: json.message || `Could not send a new PIN. Please contact ${labName || 'your lab'} for help.`,
+          text: json.message || 'Could not send a new PIN. Please contact your lab for help.',
         });
       }
     } catch {
       setForgotMessage({
         type: 'error',
-        text: `Could not send a new PIN. Please contact ${labName || 'your lab'} for help.`,
+        text: 'Could not send a new PIN. Please contact your lab for help.',
       });
     } finally {
       setForgotLoading(false);
@@ -93,13 +99,43 @@ const PatientLogin: React.FC = () => {
   const handlePinSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setForgotMessage(null);
     setLoading(true);
 
     try {
-      await patientSignIn(resolvedEmail, pin);
+      // The PIN identifies which of the number's lab accounts to open — the phone
+      // alone cannot, since the same number may be registered at several labs.
+      const result = await resolvePatientPortalLogin(phone, pin);
+
+      if (result.status === 'failed') {
+        setError(result.message);
+        setLoading(false);
+        return;
+      }
+
+      if (result.status === 'choose') {
+        setAccountChoices(result.accounts);
+        setStep('choose');
+        setLoading(false);
+        return;
+      }
+
+      await patientSignIn(result.email, pin);
       navigate('/portal');
     } catch {
       setError('Invalid PIN. Please check the PIN sent to your mobile and try again.');
+      setLoading(false);
+    }
+  };
+
+  const handleAccountChoice = async (account: PortalAccountOption) => {
+    setError(null);
+    setLoading(true);
+    try {
+      await patientSignIn(account.email, pin);
+      navigate('/portal');
+    } catch {
+      setError('Could not sign in to that lab. Please try again.');
       setLoading(false);
     }
   };
@@ -120,18 +156,31 @@ const PatientLogin: React.FC = () => {
         {/* Step indicator */}
         <div className="flex items-center justify-center gap-3 mb-6">
           <div className={`flex items-center gap-1.5 text-sm font-medium ${step === 'phone' ? 'text-teal-700' : 'text-teal-500'}`}>
-            {step === 'pin' ? (
-              <CheckCircle className="h-4 w-4" />
-            ) : (
+            {step === 'phone' ? (
               <span className="w-5 h-5 rounded-full bg-teal-600 text-white text-xs flex items-center justify-center">1</span>
+            ) : (
+              <CheckCircle className="h-4 w-4" />
             )}
             Mobile Number
           </div>
           <div className="h-px w-8 bg-gray-300" />
-          <div className={`flex items-center gap-1.5 text-sm font-medium ${step === 'pin' ? 'text-teal-700' : 'text-gray-400'}`}>
-            <span className={`w-5 h-5 rounded-full text-xs flex items-center justify-center ${step === 'pin' ? 'bg-teal-600 text-white' : 'bg-gray-200 text-gray-500'}`}>2</span>
+          <div className={`flex items-center gap-1.5 text-sm font-medium ${step === 'phone' ? 'text-gray-400' : 'text-teal-700'}`}>
+            {step === 'choose' ? (
+              <CheckCircle className="h-4 w-4" />
+            ) : (
+              <span className={`w-5 h-5 rounded-full text-xs flex items-center justify-center ${step === 'pin' ? 'bg-teal-600 text-white' : 'bg-gray-200 text-gray-500'}`}>2</span>
+            )}
             Enter PIN
           </div>
+          {step === 'choose' && (
+            <>
+              <div className="h-px w-8 bg-gray-300" />
+              <div className="flex items-center gap-1.5 text-sm font-medium text-teal-700">
+                <span className="w-5 h-5 rounded-full bg-teal-600 text-white text-xs flex items-center justify-center">3</span>
+                Choose Lab
+              </div>
+            </>
+          )}
         </div>
 
         {/* Card */}
@@ -196,12 +245,18 @@ const PatientLogin: React.FC = () => {
           {/* Step 2: PIN */}
           {step === 'pin' && (
             <form onSubmit={handlePinSubmit} className="space-y-6">
-              {/* Patient greeting */}
+              {/* Which number we're signing in — the name is only known once the PIN
+                  has identified which lab account this is */}
               <div className="bg-teal-50 rounded-lg p-4 border border-teal-100">
                 <p className="text-sm text-teal-800">
-                  Welcome, <span className="font-semibold">{patientName}</span>
+                  Signing in with <span className="font-semibold">{phone}</span>
                 </p>
-                <p className="text-xs text-teal-600 mt-1">{labName}</p>
+                {accountCount > 1 && (
+                  <p className="text-xs text-teal-600 mt-1">
+                    This number is registered at {accountCount} labs. Enter the PIN for the lab whose
+                    reports you want — we'll open the right one.
+                  </p>
+                )}
               </div>
 
               <div>
@@ -255,7 +310,7 @@ const PatientLogin: React.FC = () => {
               <div className="flex gap-3">
                 <button
                   type="button"
-                  onClick={() => { setStep('phone'); setPin(''); setError(null); setForgotMessage(null); }}
+                  onClick={() => { setStep('phone'); setPin(''); setError(null); }}
                   className="flex items-center px-4 py-3 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition-colors font-medium"
                 >
                   <ArrowLeft className="h-4 w-4 mr-2" />
@@ -280,6 +335,47 @@ const PatientLogin: React.FC = () => {
                 </button>
               </div>
             </form>
+          )}
+
+          {/* Step 3: the PIN matched accounts at more than one lab — let the patient pick */}
+          {step === 'choose' && (
+            <div className="space-y-5">
+              <div>
+                <h2 className="text-base font-semibold text-gray-900">Which lab's reports?</h2>
+                <p className="text-sm text-gray-600 mt-1">
+                  This PIN works for {accountChoices.length} of your lab accounts. Choose the one you
+                  want to open.
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                {accountChoices.map((account) => (
+                  <button
+                    key={account.email}
+                    type="button"
+                    onClick={() => handleAccountChoice(account)}
+                    disabled={loading}
+                    className="w-full flex items-center justify-between px-4 py-3 border border-gray-300 rounded-lg hover:border-teal-500 hover:bg-teal-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-left"
+                  >
+                    <span>
+                      <span className="block text-sm font-medium text-gray-900">{account.lab_name}</span>
+                      <span className="block text-xs text-gray-500 mt-0.5">{account.patient_name}</span>
+                    </span>
+                    <ArrowLeft className="h-4 w-4 text-gray-400 rotate-180 flex-shrink-0" />
+                  </button>
+                ))}
+              </div>
+
+              <button
+                type="button"
+                onClick={() => { setStep('pin'); setAccountChoices([]); setError(null); }}
+                disabled={loading}
+                className="w-full flex items-center justify-center px-4 py-3 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 disabled:opacity-50 transition-colors font-medium"
+              >
+                <ArrowLeft className="h-4 w-4 mr-2" />
+                Back
+              </button>
+            </div>
           )}
         </div>
 

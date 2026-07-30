@@ -5,6 +5,12 @@ import {
   dedupeDependenciesForSave,
   selectPreferredCalculatedDependencies,
 } from '../../utils/calculatedDependencies';
+import {
+  DECIMAL_PLACES_OPTIONS,
+  INTEGER_WIDTH_OPTIONS,
+  normalizeDecimalPlaces,
+  normalizeIntegerWidth,
+} from '../../utils/resultValueFormat';
 
 interface SourceAnalyte {
   id: string;
@@ -89,6 +95,10 @@ interface SimpleAnalyteEditorProps {
     expected_normal_values?: string[];
     expected_value_flag_map?: Record<string, string>;
     value_type?: string;
+    /** Report precision for this lab: null = inherit lab default, 0 = integer. */
+    decimal_places?: number | null;
+    /** Leading-zero width: null = inherit lab default, 0 = off, 2 = "03". */
+    min_integer_digits?: number | null;
     expected_value_codes?: Record<string, string>;
     default_value?: string | null;
     // Calculated parameter fields
@@ -124,6 +134,17 @@ export const SimpleAnalyteEditor: React.FC<SimpleAnalyteEditorProps> = ({
     analyte.expected_normal_values?.join('\n') || ''
   );
   const [valueType, setValueType] = useState<string>(analyte.value_type || '');
+  // Kept as a string so '' (inherit lab default) stays distinct from '0' (integer).
+  const [decimalPlaces, setDecimalPlaces] = useState<string>(
+    analyte.decimal_places === null || analyte.decimal_places === undefined
+      ? ''
+      : String(analyte.decimal_places)
+  );
+  const [integerWidth, setIntegerWidth] = useState<string>(
+    analyte.min_integer_digits === null || analyte.min_integer_digits === undefined
+      ? ''
+      : String(analyte.min_integer_digits)
+  );
   const [defaultValue, setDefaultValue] = useState<string>(analyte.default_value || '');
   const [refRangeKnowledgeText, setRefRangeKnowledgeText] = useState(
     formatRefRangeKnowledge(analyte.ref_range_knowledge)
@@ -158,6 +179,16 @@ export const SimpleAnalyteEditor: React.FC<SimpleAnalyteEditorProps> = ({
     setFormData(analyte);
     setExpectedNormalValuesText(analyte.expected_normal_values?.join('\n') || '');
     setValueType(analyte.value_type || '');
+    setDecimalPlaces(
+      analyte.decimal_places === null || analyte.decimal_places === undefined
+        ? ''
+        : String(analyte.decimal_places)
+    );
+    setIntegerWidth(
+      analyte.min_integer_digits === null || analyte.min_integer_digits === undefined
+        ? ''
+        : String(analyte.min_integer_digits)
+    );
     setDefaultValue(analyte.default_value || '');
     setRefRangeKnowledgeText(formatRefRangeKnowledge(analyte.ref_range_knowledge));
     setQuickCodes(
@@ -190,6 +221,8 @@ export const SimpleAnalyteEditor: React.FC<SimpleAnalyteEditorProps> = ({
     add_offset: '0',
     dilution_factor: '1',
     dilution_mode: 'auto',
+    // '' = keep the value as received; '0' = whole number.
+    decimal_places: '',
     auto_verify: false,
     apply_to_ai_result_entry: false,
     apply_to_manual_result_entry: false,
@@ -220,7 +253,7 @@ export const SimpleAnalyteEditor: React.FC<SimpleAnalyteEditorProps> = ({
       try {
         const { data } = await supabase
           .from('lab_analyte_interface_config')
-          .select('id, instrument_unit, lims_unit, multiply_by, add_offset, dilution_factor, dilution_mode, auto_verify, apply_to_ai_result_entry, apply_to_manual_result_entry, apply_to_quick_result_entry, notes')
+          .select('id, instrument_unit, lims_unit, multiply_by, add_offset, dilution_factor, dilution_mode, decimal_places, auto_verify, apply_to_ai_result_entry, apply_to_manual_result_entry, apply_to_quick_result_entry, notes')
           .eq('lab_analyte_id', labAnalyteId)
           .maybeSingle();
         if (data) {
@@ -232,6 +265,7 @@ export const SimpleAnalyteEditor: React.FC<SimpleAnalyteEditorProps> = ({
             add_offset: String(data.add_offset ?? 0),
             dilution_factor: String(data.dilution_factor ?? 1),
             dilution_mode: data.dilution_mode || 'auto',
+            decimal_places: data.decimal_places == null ? '' : String(data.decimal_places),
             auto_verify: data.auto_verify ?? false,
             apply_to_ai_result_entry: data.apply_to_ai_result_entry ?? false,
             apply_to_manual_result_entry: data.apply_to_manual_result_entry ?? false,
@@ -515,6 +549,10 @@ export const SimpleAnalyteEditor: React.FC<SimpleAnalyteEditorProps> = ({
           ),
           // Value type (numeric, qualitative, semi_quantitative, descriptive)
           value_type: valueType || null,
+          // Report precision: null = inherit lab default, 0 = round to integer
+          decimal_places: normalizeDecimalPlaces(decimalPlaces),
+          // Leading-zero width for fixed-width formats: null = inherit, 0 = off
+          min_integer_digits: normalizeIntegerWidth(integerWidth),
           // Default pre-fill value for result entry
           default_value: defaultValue.trim() || null,
           // Dropdown options for qualitative/dropdown values
@@ -559,6 +597,7 @@ export const SimpleAnalyteEditor: React.FC<SimpleAnalyteEditorProps> = ({
           add_offset: parseFloat(interfaceConfig.add_offset) || 0,
           dilution_factor: Math.max(1, parseFloat(interfaceConfig.dilution_factor) || 1),
           dilution_mode: interfaceConfig.dilution_mode || 'auto',
+          decimal_places: interfaceConfig.decimal_places === '' ? null : Number(interfaceConfig.decimal_places),
           auto_verify: interfaceConfig.auto_verify,
           apply_to_ai_result_entry: interfaceConfig.apply_to_ai_result_entry,
           apply_to_manual_result_entry: interfaceConfig.apply_to_manual_result_entry,
@@ -610,6 +649,8 @@ export const SimpleAnalyteEditor: React.FC<SimpleAnalyteEditorProps> = ({
         ...formData,
         lab_analyte_id: resolvedLabAnalyteId,
         value_type: valueType || null,
+        decimal_places: normalizeDecimalPlaces(decimalPlaces),
+        min_integer_digits: normalizeIntegerWidth(integerWidth),
         default_value: defaultValue.trim() || null,
         expected_normal_values,
         expected_value_flag_map: valueType === 'qualitative' ? {} : expectedValueFlagMap,
@@ -733,6 +774,48 @@ export const SimpleAnalyteEditor: React.FC<SimpleAnalyteEditorProps> = ({
                 </select>
                 <p className="text-xs text-gray-500 mt-1">
                   <strong>Qualitative</strong>: use for Blood Group, Culture results, etc. Supports quick-code shortcuts and optional ref range display. No auto flag calculation.
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Decimal Places
+                  <span className="ml-1 text-xs text-gray-400 font-normal">(how the value prints on the report)</span>
+                </label>
+                <select
+                  value={decimalPlaces}
+                  onChange={(e) => setDecimalPlaces(e.target.value)}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                >
+                  {DECIMAL_PLACES_OPTIONS.map(option => (
+                    <option key={option.value || 'inherit'} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+                <p className="text-xs text-gray-500 mt-1">
+                  Pick <strong>0 — Integer</strong> for counts that should never show a decimal (Platelet, WBC).
+                  <strong> Lab default</strong> follows the Decimal Places setting in Settings &rarr; Report Format.
+                  Only numeric values are affected — text results like <code>&lt;0.01</code> or <code>1:160</code> always print as entered.
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Leading Zeros
+                  <span className="ml-1 text-xs text-gray-400 font-normal">(fixed-width printouts)</span>
+                </label>
+                <select
+                  value={integerWidth}
+                  onChange={(e) => setIntegerWidth(e.target.value)}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                >
+                  {INTEGER_WIDTH_OPTIONS.map(option => (
+                    <option key={option.value || 'inherit'} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+                <p className="text-xs text-gray-500 mt-1">
+                  Pads the whole-number part so every value has the same width, for referring
+                  hospitals or exports that expect a fixed column. Affects printing only — the
+                  saved value stays <code>3</code>, not <code>03</code>.
                 </p>
               </div>
 
@@ -1539,6 +1622,30 @@ export const SimpleAnalyteEditor: React.FC<SimpleAnalyteEditorProps> = ({
                     <option value="auto">Auto — analyzer dilutes automatically</option>
                     <option value="manual">Manual — technician dilutes before loading</option>
                   </select>
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    Stored Precision
+                    <span className="ml-1 text-xs text-gray-400 font-normal">(what gets saved from the instrument)</span>
+                  </label>
+                  <select
+                    value={interfaceConfig.decimal_places}
+                    onChange={(e) => setInterfaceConfig(prev => ({ ...prev, decimal_places: e.target.value }))}
+                    className="w-full px-3 py-2 border border-teal-300 rounded-md focus:ring-2 focus:ring-teal-500 focus:border-transparent"
+                  >
+                    <option value="">As received — keep analyzer precision</option>
+                    <option value="0">0 — whole number (integer)</option>
+                    <option value="1">1 decimal</option>
+                    <option value="2">2 decimals</option>
+                    <option value="3">3 decimals</option>
+                    <option value="4">4 decimals</option>
+                  </select>
+                  <p className="text-xs text-teal-700 mt-1">
+                    Trims the value saved from the analyzer, after dilution and conversion. This is
+                    separate from <strong>Decimal Places</strong> above, which controls how the value
+                    prints on the report.
+                  </p>
                 </div>
 
                 <div>

@@ -296,6 +296,9 @@ export interface LabelContentMetrics {
   barcodeY: number;
   barcodeWidth: number;
   barcodeHeight: number;
+  /** Baseline for the human-readable barcode number drawn under the bars. */
+  barcodeNumberBaseline: number;
+  barcodeNumberFontPt: number;
   infoBaseline: number;
   infoFontPt: number;
   sampleIdMaxWidth: number;
@@ -330,6 +333,9 @@ export function getLabelContentMetrics(layout: LabelLayout): LabelContentMetrics
   const left = layout.paddingXMm;
   const right = width - layout.paddingXMm;
 
+  const barcodeY = height * FRAC.barcodeY;
+  const barcodeHeight = layout.barcodeHeightMm ?? height * FRAC.barcodeHeight;
+
   return {
     left,
     right,
@@ -340,9 +346,13 @@ export function getLabelContentMetrics(layout: LabelLayout): LabelContentMetrics
     genderAgeMaxWidth: width * FRAC.genderAgeMaxWidth,
     nameGap: width * FRAC.nameGap,
     barcodeX: width * FRAC.barcodeX,
-    barcodeY: height * FRAC.barcodeY,
+    barcodeY,
     barcodeWidth: width * FRAC.barcodeWidth,
-    barcodeHeight: layout.barcodeHeightMm ?? height * FRAC.barcodeHeight,
+    barcodeHeight,
+    // The number sits in the bottom slice of the barcode envelope, so bars +
+    // number occupy the same footprint the baked-in raster number used to.
+    barcodeNumberBaseline: barcodeY + barcodeHeight,
+    barcodeNumberFontPt: 5.5 * fontScale,
     infoBaseline: height * FRAC.infoBaseline,
     infoFontPt: 6.8 * fontScale,
     sampleIdMaxWidth: width * FRAC.sampleIdMaxWidth,
@@ -442,4 +452,20 @@ export function setActiveLabelLayout(layout: LabelLayout | null | undefined): vo
 
 export function getActiveLabelLayout(): LabelLayout {
   return activeLabelLayout;
+}
+
+/**
+ * Compose the gender + age string drawn next to the patient name.
+ *
+ * The gender/age slot on a label is narrow (~12mm on a 2" label), so the full
+ * word "Female" alone fills it and the age gets truncated away. Lab tube labels
+ * conventionally show the gender as a single initial (M / F / O), which leaves
+ * room for the age — matching the "M 34 Y" format the ZPL renderer documents.
+ */
+export function formatGenderAge(gender?: unknown, age?: unknown): string {
+  const initial = String(gender ?? '').trim().charAt(0).toUpperCase();
+  const ageStr = age === null || age === undefined || String(age).trim() === ''
+    ? ''
+    : `${String(age).trim()} Y`;
+  return [initial, ageStr].filter(Boolean).join(' ');
 }

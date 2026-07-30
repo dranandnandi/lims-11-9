@@ -2,6 +2,13 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { TrendingUp, TrendingDown, Minus, Save, AlertCircle, Loader2, FileText, CheckCircle } from 'lucide-react';
 import { useTrendGraphs, type TrendGraphData, type TrendAnalyte, type TrendDataPoint } from '../../hooks/useTrendGraphs';
 import { aiAnalysis } from '../../utils/supabase';
+import {
+  buildTrendChartSvg,
+  formatTrendAxisDate,
+  formatTrendAxisTime,
+  getTrendPointColor,
+  TREND_COLORS,
+} from '../../utils/trendChartSvg';
 
 interface TrendGraphPanelProps {
   orderId: string;
@@ -36,11 +43,7 @@ const getPointStatus = (
   return 'normal';
 };
 
-const getPointColor = (status: 'high' | 'low' | 'normal') => {
-  if (status === 'high') return '#ef4444';
-  if (status === 'low') return '#3b82f6';
-  return '#22c55e';
-};
+const getPointColor = (status: 'high' | 'low' | 'normal') => getTrendPointColor(status);
 
 const TrendGraphPanel: React.FC<TrendGraphPanelProps> = ({
   orderId,
@@ -410,47 +413,74 @@ const TrendGraphPanel: React.FC<TrendGraphPanelProps> = ({
   );
 };
 
-// Proper Line Chart Component with X/Y axes
+// "Previous History" chart - renders the exact SVG that goes into the PDF report,
+// with the matching Date/Result table beside it.
 const TrendLineChart: React.FC<{
   analyte: TrendAnalyte;
   getTrendIcon: (trend: TrendAnalyte['trend']) => React.ReactNode;
   getTrendBadgeColor: (trend: TrendAnalyte['trend']) => string;
 }> = ({ analyte, getTrendIcon, getTrendBadgeColor }) => {
-  const chartHeight = 180;
-  const paddingLeft = 50;
-  const paddingRight = 20;
-  const paddingTop = 20;
-  const paddingBottom = 40;
-  
-  const { dataPoints, yAxisLabels, yMin, yMax, refMinY, refMaxY } = useMemo(() => {
-    const points = analyte.dataPoints || [];
-    if (points.length === 0) {
-      return { dataPoints: [], yAxisLabels: [], yMin: 0, yMax: 100, refMinY: 0, refMaxY: 0 };
-    }
-    
-    const values = points.map(p => p.value);
-    const allValues = [...values, analyte.reference_range.min, analyte.reference_range.max];
-    const minVal = Math.min(...allValues);
-    const maxVal = Math.max(...allValues);
-    
-    // Add 20% padding to range
-    const range = maxVal - minVal || 1;
-    const yMin = Math.max(0, minVal - range * 0.1);
-    const yMax = maxVal + range * 0.2;
-    
-    // Generate Y axis labels
-    const stepCount = 5;
-    const step = (yMax - yMin) / stepCount;
-    const yAxisLabels = Array.from({ length: stepCount + 1 }, (_, i) => 
-      Math.round((yMin + step * i) * 10) / 10
-    );
-    
-    // Calculate reference range Y positions as percentages
-    const refMinY = ((analyte.reference_range.min - yMin) / (yMax - yMin)) * 100;
-    const refMaxY = ((analyte.reference_range.max - yMin) / (yMax - yMin)) * 100;
-    
-    return { dataPoints: points, yAxisLabels, yMin, yMax, refMinY, refMaxY };
-  }, [analyte]);
+  const dataPoints = analyte.dataPoints || [];
+
+  const referenceBounds = useMemo(() => {
+    const isUsable = (value?: number) =>
+      typeof value === 'number' && Number.isFinite(value) && Math.abs(value) < 1e9;
+    const min = analyte.reference_range?.min;
+    const max = analyte.reference_range?.max;
+    return {
+      min: isUsable(min) ? min : null,
+      max: isUsable(max) && (max as number) > 0 ? max : null,
+    };
+  }, [analyte.reference_range]);
+
+  const chartSvg = useMemo(() => {
+    const points = dataPoints.map((point) => {
+      const when = point.timestamp || point.date;
+      const label = formatTrendAxisDate(when);
+      const time = formatTrendAxisTime(when);
+      const sameDayEntries = dataPoints.filter(
+        (other) => formatTrendAxisDate(other.timestamp || other.date) === label
+      ).length;
+      const status = getPointStatus(point, analyte.reference_range);
+
+      return {
+        label,
+        sublabel: sameDayEntries > 1 && time ? time : undefined,
+        value: point.value,
+        status,
+        tooltip: `${label}${time ? ` ${time}` : ''}: ${point.value}${
+          analyte.unit ? ` ${analyte.unit}` : ''
+        }${point.flag ? ` (${point.flag})` : ''}`,
+      };
+    });
+
+    return buildTrendChartSvg(points, {
+      width: 520,
+      height: 240,
+      unit: analyte.unit,
+      refMin: referenceBounds.min,
+      refMax: referenceBounds.max,
+      responsive: true,
+    });
+  }, [dataPoints, analyte.unit, analyte.reference_range, referenceBounds]);
+
+  const historyRows = useMemo(
+    () =>
+      dataPoints
+        .slice()
+        .reverse()
+        .map((point, idx) => {
+          const when = point.timestamp || point.date;
+          const status = getPointStatus(point, analyte.reference_range);
+          return {
+            key: `${when}-${idx}`,
+            when: `${formatTrendAxisDate(when)} ${formatTrendAxisTime(when)}`.trim(),
+            value: point.value,
+            status,
+          };
+        }),
+    [dataPoints, analyte.reference_range]
+  );
 
   if (dataPoints.length === 0) {
     return (
@@ -460,28 +490,19 @@ const TrendLineChart: React.FC<{
     );
   }
 
-  // Calculate point positions
-  const getPointPosition = (point: TrendDataPoint, index: number) => {
-    const xPercent = dataPoints.length === 1 ? 50 : (index / (dataPoints.length - 1)) * 100;
-    const yPercent = ((point.value - yMin) / (yMax - yMin)) * 100;
-    return { x: xPercent, y: 100 - yPercent }; // Invert Y for SVG
-  };
-
-  // Generate SVG path for line
-  const linePath = dataPoints.map((point, idx) => {
-    const { x, y } = getPointPosition(point, idx);
-    return `${idx === 0 ? 'M' : 'L'} ${x} ${y}`;
-  }).join(' ');
-
   return (
     <div className="border rounded-lg p-4 bg-gray-50">
       {/* Analyte Header */}
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex items-center justify-between mb-3">
         <div>
-          <h4 className="font-semibold text-gray-900">{analyte.analyte_name}</h4>
-          <p className="text-xs text-gray-500 mt-0.5">
-            Reference: {analyte.reference_range.min} - {analyte.reference_range.max} {analyte.unit}
-          </p>
+          <h4 className="font-semibold text-gray-900">
+            {analyte.analyte_name} Previous History
+          </h4>
+          {(referenceBounds.min !== null || referenceBounds.max !== null) && (
+            <p className="text-xs text-gray-500 mt-0.5">
+              Reference: {analyte.reference_range.min} - {analyte.reference_range.max} {analyte.unit}
+            </p>
+          )}
         </div>
         <div className="flex items-center gap-2">
           {getTrendIcon(analyte.trend)}
@@ -491,206 +512,66 @@ const TrendLineChart: React.FC<{
         </div>
       </div>
 
-      {/* Chart Container */}
-      <div className="relative bg-white rounded-lg border border-gray-200 p-2" style={{ height: chartHeight }}>
-        {/* Y-Axis Labels */}
-        <div 
-          className="absolute left-0 top-0 bottom-0 flex flex-col justify-between text-xs text-gray-500 pr-2"
-          style={{ width: paddingLeft - 8, paddingTop: paddingTop - 10, paddingBottom: paddingBottom - 10 }}
-        >
-          {[...yAxisLabels].reverse().map((label, idx) => (
-            <span key={idx} className="text-right">{label}</span>
-          ))}
-        </div>
-
-        {/* Chart Area */}
-        <div 
-          className="absolute"
-          style={{ 
-            left: paddingLeft, 
-            right: paddingRight, 
-            top: paddingTop, 
-            bottom: paddingBottom 
-          }}
-        >
-          {/* Reference Range Shading */}
-          <div 
-            className="absolute left-0 right-0 bg-green-100 opacity-50 border-y border-green-300 border-dashed"
-            style={{ 
-              bottom: `${refMinY}%`, 
-              height: `${refMaxY - refMinY}%`
-            }}
+      {/* Chart + history table, same layout as the printed report */}
+      <div className="grid grid-cols-1 lg:grid-cols-5 gap-3">
+        <div className="lg:col-span-3">
+          <div
+            className="bg-white rounded-lg border border-gray-200 overflow-hidden"
+            style={{ height: 240 }}
+            dangerouslySetInnerHTML={{ __html: chartSvg }}
           />
-          
-          {/* Grid Lines */}
-          {yAxisLabels.map((_, idx) => (
-            <div 
-              key={idx}
-              className="absolute left-0 right-0 border-t border-gray-100"
-              style={{ bottom: `${(idx / (yAxisLabels.length - 1)) * 100}%` }}
-            />
-          ))}
-
-          {/* SVG Line Chart */}
-          <svg 
-            className="absolute inset-0 w-full h-full" 
-            viewBox="0 0 100 100" 
-            preserveAspectRatio="none"
-          >
-            {/* Reference range lines */}
-            <line 
-              x1="0" y1={100 - refMaxY} 
-              x2="100" y2={100 - refMaxY} 
-              stroke="#16a34a" 
-              strokeWidth="0.5" 
-              strokeDasharray="2,2"
-            />
-            <line 
-              x1="0" y1={100 - refMinY} 
-              x2="100" y2={100 - refMinY} 
-              stroke="#16a34a" 
-              strokeWidth="0.5" 
-              strokeDasharray="2,2"
-            />
-            
-            {/* Trend Line */}
-            <path 
-              d={linePath} 
-              fill="none" 
-              stroke="#3b82f6" 
-              strokeWidth="2" 
-              vectorEffect="non-scaling-stroke"
-            />
-            
-	            {/* Data Points */}
-	            {dataPoints.map((point, idx) => {
-	              const { x, y } = getPointPosition(point, idx);
-	              const status = getPointStatus(point, analyte.reference_range);
-	              const color = getPointColor(status);
-
-	              return (
-	                <g key={idx}>
-	                  <ellipse
-	                    cx={x}
-	                    cy={y}
-	                    rx="0.75"
-	                    ry="2.4"
-	                    fill={color}
-	                    stroke="white"
-	                    strokeWidth="0.8"
-	                    vectorEffect="non-scaling-stroke"
-	                    className="cursor-pointer"
-	                  />
-                </g>
-              );
-            })}
-          </svg>
-
-          {/* Hover Tooltips - positioned outside SVG for proper sizing */}
-          {dataPoints.map((point, idx) => {
-            const { x, y } = getPointPosition(point, idx);
-            const displayDate = point.timestamp 
-              ? new Date(point.timestamp)
-              : new Date(point.date);
-            return (
-              <div 
-                key={`tooltip-${idx}`}
-                className="absolute w-3 h-3 cursor-pointer group"
-                style={{ 
-                  left: `calc(${x}% - 6px)`, 
-                  top: `calc(${y}% - 6px)`
-                }}
-                title={`${displayDate.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })} ${point.timestamp ? displayDate.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) : ''}: ${point.value} ${analyte.unit}${point.flag ? ` (${point.flag})` : ''}`}
-              >
-                <div className="hidden group-hover:block absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2 py-1 bg-gray-900 text-white text-xs rounded whitespace-nowrap z-10">
-                  <div className="font-medium">{point.value} {analyte.unit}</div>
-	                  <div className="text-gray-300">
-	                    {displayDate.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })}
-	                    {point.timestamp && ` ${displayDate.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}`}
-	                  </div>
-	                  <div className={getPointStatus(point, analyte.reference_range) === 'high' ? 'text-red-300' : getPointStatus(point, analyte.reference_range) === 'low' ? 'text-blue-300' : 'text-green-300'}>
-	                    {getPointStatus(point, analyte.reference_range) === 'high' ? 'High' : getPointStatus(point, analyte.reference_range) === 'low' ? 'Low' : 'Normal'}
-	                    {point.flag ? ` (${point.flag})` : ''}
-	                  </div>
-	                </div>
-	              </div>
-            );
-          })}
         </div>
 
-        {/* X-Axis Labels */}
-        <div 
-          className="absolute left-0 right-0 bottom-0 flex justify-between text-xs text-gray-500"
-          style={{ 
-            left: paddingLeft, 
-            right: paddingRight, 
-            height: paddingBottom - 5,
-            paddingTop: 5 
-          }}
-        >
-          {dataPoints.map((point, idx) => {
-            // Use timestamp if available for better distinction, fallback to date
-            const displayDate = point.timestamp 
-              ? new Date(point.timestamp)
-              : new Date(point.date);
-            // For same-day entries, show time as well
-            const sameDayEntries = dataPoints.filter(p => p.date === point.date).length;
-            const showTime = sameDayEntries > 1 && point.timestamp;
-            
-            return (
-              <span 
-                key={idx} 
-                className="text-center whitespace-nowrap"
-                style={{ 
-                  position: 'absolute',
-                  left: `${dataPoints.length === 1 ? 50 : (idx / (dataPoints.length - 1)) * 100}%`,
-                  transform: 'translateX(-50%)',
-                  fontSize: dataPoints.length > 5 ? '9px' : '11px'
-                }}
-              >
-                {displayDate.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })}
-                {showTime && (
-                  <span className="block text-gray-400" style={{ fontSize: '8px' }}>
-                    {displayDate.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}
-                  </span>
-                )}
-              </span>
-            );
-          })}
-        </div>
-
-        {/* Y-Axis Title */}
-        <div 
-          className="absolute text-xs text-gray-500 font-medium"
-          style={{ 
-            left: 2, 
-            top: '50%', 
-            transform: 'rotate(-90deg) translateX(-50%)',
-            transformOrigin: 'left center'
-          }}
-        >
-          {analyte.unit}
+        <div className="lg:col-span-2">
+          <div className="bg-white rounded-lg border border-gray-200 overflow-auto" style={{ maxHeight: 240 }}>
+            <table className="w-full text-xs border-collapse">
+              <thead className="sticky top-0 bg-gray-100">
+                <tr>
+                  <th className="text-left font-bold text-gray-700 px-2 py-1.5 border border-gray-200">Date Time</th>
+                  <th className="text-right font-bold text-gray-700 px-2 py-1.5 border border-gray-200">Result</th>
+                </tr>
+              </thead>
+              <tbody>
+                {historyRows.map((row) => (
+                  <tr key={row.key}>
+                    <td className="px-2 py-1 border border-gray-200 text-gray-600 whitespace-nowrap">{row.when}</td>
+                    <td
+                      className="px-2 py-1 border border-gray-200 text-right font-semibold"
+                      style={{ color: row.status === 'normal' ? '#111827' : getPointColor(row.status) }}
+                    >
+                      {row.value}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
 
       {/* Legend */}
-      <div className="flex items-center justify-center gap-4 mt-3 text-xs">
+      <div className="flex flex-wrap items-center justify-center gap-4 mt-3 text-xs">
         <div className="flex items-center gap-1">
-          <div className="w-3 h-3 rounded-full bg-green-500"></div>
+          <span className="w-3 h-3 rounded-full" style={{ background: getPointColor('normal') }} />
           <span className="text-gray-600">Normal</span>
         </div>
         <div className="flex items-center gap-1">
-          <div className="w-3 h-3 rounded-full bg-red-500"></div>
+          <span className="w-3 h-3 rounded-full" style={{ background: getPointColor('high') }} />
           <span className="text-gray-600">High</span>
         </div>
         <div className="flex items-center gap-1">
-          <div className="w-3 h-3 rounded-full bg-blue-500"></div>
+          <span className="w-3 h-3 rounded-full" style={{ background: getPointColor('low') }} />
           <span className="text-gray-600">Low</span>
         </div>
-        <div className="flex items-center gap-1">
-          <div className="w-8 h-2 bg-green-100 border border-green-300"></div>
-          <span className="text-gray-600">Reference Range</span>
-        </div>
+        {(referenceBounds.min !== null || referenceBounds.max !== null) && (
+          <div className="flex items-center gap-1">
+            <span
+              className="w-8 h-2 inline-block"
+              style={{ background: TREND_COLORS.band, border: `1px solid ${TREND_COLORS.bandEdge}` }}
+            />
+            <span className="text-gray-600">Reference Range</span>
+          </div>
+        )}
       </div>
 
       {/* Data point count */}

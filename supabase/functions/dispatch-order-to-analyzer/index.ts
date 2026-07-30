@@ -88,6 +88,22 @@ function formatHl7Dob(dob?: string): string {
   return `${parsed.toISOString().slice(0, 10).replace(/-/g, '')}000000`
 }
 
+// Strip whitespace and stray segment/field breaks from a single HL7 component.
+// Analyzer-side code matching is usually exact-string, so trailing spaces in
+// OBR-4 (e.g. "Random Blood Sugar ^...") silently break mapping on the instrument.
+function cleanHl7Component(value: unknown): string {
+  return String(value ?? '').replace(/[\r\n|]+/g, ' ').trim()
+}
+
+// Trim each component of a caret-composite code ("code^display^system") without
+// collapsing the composite itself.
+function cleanHl7Composite(value: unknown): string {
+  return String(value ?? '')
+    .split('^')
+    .map((component) => cleanHl7Component(component))
+    .join('^')
+}
+
 function getProfileSetting(profile: any, key: string, fallback = ''): string {
   return String(profile?.connection_settings?.[key] ?? profile?.[key] ?? fallback)
 }
@@ -120,10 +136,11 @@ function specimenField(mapping?: SpecimenMapping): string {
 
 function specimenCode(mapping?: SpecimenMapping): string {
   if (!mapping) return ''
-  if (mapping.analyzer_code.includes('^')) return mapping.analyzer_code
-  const display = mapping.analyzer_display || mapping.lims_code
-  const system = mapping.analyzer_code_system || 'LOCAL'
-  return `${mapping.analyzer_code}^${display}^${system}`
+  if (mapping.analyzer_code.includes('^')) return cleanHl7Composite(mapping.analyzer_code)
+  const code = cleanHl7Component(mapping.analyzer_code)
+  const display = cleanHl7Component(mapping.analyzer_display || mapping.lims_code)
+  const system = cleanHl7Component(mapping.analyzer_code_system || 'LOCAL')
+  return `${code}^${display}^${system}`
 }
 
 function supportsSpecimenField(protocol: string, mapping?: SpecimenMapping): boolean {
@@ -132,14 +149,69 @@ function supportsSpecimenField(protocol: string, mapping?: SpecimenMapping): boo
   return ['OBR-15', 'SPM-4', 'OBX-3'].includes(field)
 }
 
+interface ValidationWarning {
+  type: 'low_confidence_mapping' | 'empty_analyzer_code' | 'unresolved_specimen'
+  message: string
+  lims_code?: string
+  analyzer_code?: string
+  confidence?: number
+  sample_type?: string
+}
+
+// Non-blocking pre-send validation. Surfaces the exact conditions that produce a
+// weak outbound message (fallback/AI-only mappings, empty codes, unmapped
+// specimens) so they are visible on the queue entry and comm log instead of
+// silently going out. The message is still staged/sent.
+function validateOutboundMessage(
+  mappedTests: TestMapping[],
+  unresolvedSpecimenTypes: string[],
+): ValidationWarning[] {
+  const warnings: ValidationWarning[] = []
+
+  for (const test of mappedTests) {
+    const code = cleanHl7Component(test.analyzer_code)
+    if (!code) {
+      warnings.push({
+        type: 'empty_analyzer_code',
+        lims_code: test.lims_code,
+        message: `Test "${test.lims_code}" has no analyzer code — OBR-4 will be empty.`,
+      })
+    }
+    if (test.source === 'fallback' || test.source === 'ai' || (test.confidence ?? 1) < 0.9) {
+      warnings.push({
+        type: 'low_confidence_mapping',
+        lims_code: test.lims_code,
+        analyzer_code: code,
+        confidence: test.confidence,
+        message: `Test "${test.lims_code}" resolved via ${test.source ?? 'unknown'} mapping (confidence ${test.confidence}). ` +
+          `Configure an explicit order_service mapping to the analyzer's master test code.`,
+      })
+    }
+  }
+
+  for (const sampleType of unresolvedSpecimenTypes) {
+    warnings.push({
+      type: 'unresolved_specimen',
+      sample_type: sampleType,
+      message: `Specimen "${sampleType}" has no specimen_mode mapping — the specimen field (e.g. OBR-15) will be blank.`,
+    })
+  }
+
+  return warnings
+}
+
 function universalServiceId(test: TestMapping, profile: any): string {
   const fromMetadata = test.metadata?.universal_service_id
-  if (typeof fromMetadata === 'string' && fromMetadata) return fromMetadata
-  if (test.analyzer_code.includes('^')) return test.analyzer_code
+  if (typeof fromMetadata === 'string' && fromMetadata) return cleanHl7Composite(fromMetadata)
 
-  const display = test.analyzer_display || test.lims_code
-  const system = test.analyzer_code_system || getProfileSetting(profile, 'obr4_coding_system', 'LOCAL')
-  return `${test.analyzer_code}^${display}^${system}`
+  const code = cleanHl7Component(test.analyzer_code)
+  if (code.includes('^')) return cleanHl7Composite(code)
+
+  const display = cleanHl7Component(test.analyzer_display || test.lims_code)
+  const system = cleanHl7Component(
+    test.analyzer_code_system || getProfileSetting(profile, 'obr4_coding_system', 'LOCAL'),
+  )
+  return `${code}^${display}^${system}`
 }
 
 function buildHl7Payload(
@@ -442,8 +514,8 @@ function astmDelimiter(value: unknown, fallback = ''): string {
 
 function astmTestCode(test: TestMapping): string {
   const fromMetadata = test.metadata?.astm_test_code
-  if (typeof fromMetadata === 'string' && fromMetadata) return fromMetadata
-  return test.analyzer_code || test.lims_code
+  if (typeof fromMetadata === 'string' && fromMetadata) return cleanHl7Component(fromMetadata)
+  return cleanHl7Component(test.analyzer_code || test.lims_code)
 }
 
 function astmTestField(test: TestMapping, componentDelimiter: string): string {
@@ -451,7 +523,7 @@ function astmTestField(test: TestMapping, componentDelimiter: string): string {
   if (typeof fromMetadata === 'string' && fromMetadata) return fromMetadata
 
   const code = astmTestCode(test)
-  const display = test.analyzer_display || test.lims_code || code
+  const display = cleanHl7Component(test.analyzer_display || test.lims_code || code)
   return [code, '', '', display].join(componentDelimiter)
 }
 
@@ -770,10 +842,10 @@ async function mapTestCodesWithAI(
 
   const pushMapping = (limsCode: string, row: any, source: TestMapping['source'], labAnalyteId?: string) => {
     mappedTests.push({
-      lims_code: limsCode,
-      analyzer_code: row.analyzer_code,
-      analyzer_display: row.analyzer_display ?? null,
-      analyzer_code_system: row.analyzer_code_system ?? null,
+      lims_code: cleanHl7Component(limsCode),
+      analyzer_code: cleanHl7Component(row.analyzer_code),
+      analyzer_display: row.analyzer_display == null ? null : cleanHl7Component(row.analyzer_display),
+      analyzer_code_system: row.analyzer_code_system == null ? null : cleanHl7Component(row.analyzer_code_system),
       mapping_type: row.mapping_type ?? 'order_service',
       direction: row.direction ?? 'outbound',
       hl7_field: row.hl7_field ?? null,
@@ -970,10 +1042,10 @@ OUTPUT ONLY valid JSON:
           )
 
           mappedTests.push({
-            lims_code: mapping.lims_code,
-            analyzer_code: mapping.analyzer_code,
-            analyzer_display: mapping.analyzer_display || mapping.lims_code,
-            analyzer_code_system: mapping.analyzer_code_system || 'LOCAL',
+            lims_code: cleanHl7Component(mapping.lims_code),
+            analyzer_code: cleanHl7Component(mapping.analyzer_code),
+            analyzer_display: cleanHl7Component(mapping.analyzer_display || mapping.lims_code),
+            analyzer_code_system: cleanHl7Component(mapping.analyzer_code_system || 'LOCAL'),
             mapping_type: 'order_service',
             direction: 'outbound',
             value_map: {},
@@ -1001,10 +1073,11 @@ OUTPUT ONLY valid JSON:
         const matchedLa = unmappedLabAnalytes.find(
           (la) => String(la.code).toUpperCase() === String(code).toUpperCase()
         )
+        const cleanCode = cleanHl7Component(code)
         mappedTests.push({
-          lims_code: code,
-          analyzer_code: code,
-          analyzer_display: code,
+          lims_code: cleanCode,
+          analyzer_code: cleanCode,
+          analyzer_display: cleanCode,
           analyzer_code_system: 'LOCAL',
           mapping_type: 'order_service',
           direction: 'outbound',
@@ -1060,6 +1133,20 @@ Deno.serve(async (req) => {
 
     const baseProfile = connection.profile ?? {}
     const connectionConfig = connection.config ?? {}
+
+    // Receive-only analyzers must never have an order/worklist staged for them.
+    // Results are still ingested by barcode via process-analyzer-result.
+    if (connectionConfig.direction === 'receive_only') {
+      return new Response(JSON.stringify({
+        success: true,
+        skipped: true,
+        reason: 'Receive-only analyzer — orders are not sent to this instrument',
+        analyzer_connection_id: payload.analyzer_connection_id,
+      }), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      })
+    }
+
     const profile = {
       ...baseProfile,
       connection_settings: {
@@ -1159,6 +1246,7 @@ Deno.serve(async (req) => {
         ? generateHL7WorklistResponse(payload, mappedTests, messageControlId, profile)
         : generateHL7Order(payload, mappedTests, messageControlId, profile)
     const messageType = initialMessageType
+    const validationWarnings = validateOutboundMessage(mappedTests, unresolvedSpecimenTypes)
 
     await supabase
       .from('analyzer_order_queue')
@@ -1179,6 +1267,7 @@ Deno.serve(async (req) => {
           ai_mappings: mappedTests.filter((t) => !t.from_cache).length,
           average_confidence: mappedTests.reduce((sum, t) => sum + t.confidence, 0) / mappedTests.length,
           unresolved_specimen_types: unresolvedSpecimenTypes,
+          validation_warnings: validationWarnings,
         },
       })
       .eq('id', queueEntry.id)
@@ -1196,6 +1285,11 @@ Deno.serve(async (req) => {
         success: true,
         order_id: payload.order_id,
         queue_id: queueEntry.id,
+        // Summarised into error_message so warnings are visible in the log stream
+        // without a schema change; success stays true (non-blocking).
+        error_message: validationWarnings.length
+          ? `${validationWarnings.length} validation warning(s): ${validationWarnings.map((w) => w.type).join(', ')}`
+          : null,
       })
 
     return new Response(JSON.stringify({
@@ -1204,6 +1298,7 @@ Deno.serve(async (req) => {
       message_control_id: messageControlId,
       mapped_tests: mappedTests,
       unresolved_specimen_types: unresolvedSpecimenTypes,
+      validation_warnings: validationWarnings,
       hl7_message: generated.hl7Message,
       hl7_payload: generated.hl7Payload,
       flow_type: analyzerInitiated ? 'analyzer_initiated' : 'lims_push',

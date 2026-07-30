@@ -87,8 +87,9 @@ export function printBarcodeLabelsInBrowser(
       barcodeDataUrl: generateBarcodeSync(JsBarcode, label.sampleId, {
         width: 2 * barcodeScale,
         height: 50 * barcodeScale,
-        displayValue: true,
-        fontSize: 12 * barcodeScale,
+        // The number is drawn separately as crisp vector text so it prints
+        // solid black on thermal printers instead of a faded raster.
+        displayValue: false,
         margin: 5 * barcodeScale,
       }),
       metadata: {
@@ -99,6 +100,7 @@ export function printBarcodeLabelsInBrowser(
         gender: label.gender,
         age: label.age,
         referredBy: label.referredBy,
+        barcodeNumber: label.sampleId,
       },
     };
   });

@@ -13,6 +13,7 @@ import {
   buildHeaderHtml,
   buildFooterHtml,
 } from "./headerFooterHelper.ts";
+import { formatAnalyteDisplayValue } from "./resultValueFormat.ts";
 
 function formatIndianNumber(val: string | number): string {
   const str = String(val).replace(/,/g, "").trim();
@@ -1330,6 +1331,23 @@ function formatSignatureNameForPdf(value: unknown): string {
     .join("<br/>");
 }
 
+/**
+ * Return the list of signatories to render in the report footer.
+ * The multi-signature footer config (pdf_layout_settings.reportSignatures) is
+ * resolved upstream into signatoryInfo._signatories. When present and non-empty
+ * we render those; otherwise we fall back to the single resolved signatoryInfo
+ * so existing single-signature reports are unchanged.
+ */
+function getReportSignatories(signatoryInfo: any): any[] {
+  const list = Array.isArray(signatoryInfo?._signatories)
+    ? signatoryInfo._signatories.filter(
+      (s: any) => s && (s.signatoryImageUrl || s.signatoryName),
+    )
+    : [];
+  if (list.length > 0) return list;
+  return signatoryInfo ? [signatoryInfo] : [];
+}
+
 function resolveSignatureImageSize(printOptions?: Record<string, unknown> | null) {
   const clamp = (value: unknown, fallback: number, min: number, max: number) => {
     const numeric = Number(value);
@@ -2060,7 +2078,8 @@ interface PatientInfoConfig {
 const PATIENT_INFO_FIELD_MAP: Record<string, { label: string; placeholder: string }> = {
   patientName:          { label: 'Patient Name',     placeholder: '{{patientName}}' },
   patientId:            { label: 'Patient ID',       placeholder: '{{patientId}}' },
-  age:                  { label: 'Age',              placeholder: '{{patientAge}}' },
+  registrationDate:     { label: 'Reg. Date',        placeholder: '{{orderDate}}' },
+  age:                  { label: 'Age',              placeholder: '{{patientAgeFormatted}}' },
   gender:               { label: 'Gender',           placeholder: '{{patientGender}}' },
   collectionDate:       { label: 'Collected On',     placeholder: '{{collectionDate}}' },
   sampleId:             { label: 'Sample ID',        placeholder: '{{sampleId}}' },
@@ -2347,7 +2366,7 @@ function generateClassicDefaultTemplateHtml(
           </tr>
           <tr>
             <td style="padding: 8px 12px; border: 1px solid #e5e7eb; background: #f9fafb; font-weight: 500;">Age / Gender</td>
-            <td style="padding: 8px 12px; border: 1px solid #e5e7eb;">{{patientAge}} / {{patientGender}}</td>
+            <td style="padding: 8px 12px; border: 1px solid #e5e7eb;">{{patientAgeFormatted}} / {{patientGender}}</td>
             <td style="padding: 8px 12px; border: 1px solid #e5e7eb; background: #f9fafb; font-weight: 500;">Collected On</td>
             <td style="padding: 8px 12px; border: 1px solid #e5e7eb;">{{collectionDate}}</td>
           </tr>
@@ -2422,11 +2441,8 @@ function generateClassicDefaultTemplateHtml(
       for (const analyte of block.analytes) {
         const rowBg = rowIndexGlobal++ % 2 === 0 ? "#ffffff" : "#f8fafc";
         const parameterName = analyte.parameter || analyte.name || analyte.test_name || "";
-        const _isCalc = analyte.is_auto_calculated || analyte.is_calculated;
         const rawValue = analyte.value ?? "";
-        const value = _isCalc && rawValue !== "" && !isNaN(Number(rawValue))
-          ? String(parseFloat(Number(rawValue).toFixed(2)))
-          : rawValue;
+        const value = formatAnalyteDisplayValue(analyte, printOptions, rawValue);
         const unit = analyte.unit || "";
         const refRange = (analyte.reference_range || "").replace(/\n/g, "<br>");
         const flag = analyte.flag || "";
@@ -2632,13 +2648,37 @@ function generateClassicDefaultTemplateHtml(
   const sigImageUrl = signatoryInfo?.signatoryImageUrl || "";
   const signatureSize = resolveSignatureImageSize(printOptions);
 
-  const signatoryHtml = `
+  const _defaultSigList = getReportSignatories(signatoryInfo);
+  const signatoryHtml = (() => {
+    if (_defaultSigList.length <= 1) {
+      return `
     <div class="signatures" style="margin-top: 20px; text-align: right; page-break-inside: avoid;">
       ${sigImageUrl ? `<img src="${sigImageUrl}" alt="" style="max-height: ${signatureSize.maxHeight}px; max-width: ${signatureSize.maxWidth}px; width: auto; height: auto; object-fit: contain; margin-bottom: 5px;" onerror="this.style.display='none'" />` : ""}
       ${sigName ? `<p style="margin: 0; font-weight: 600; font-size: 14px;">${sigName}</p>` : ""}
       ${sigDesignation ? `<p style="margin: 4px 0 0 0; color: #64748b; font-size: 12px;">${sigDesignation}</p>` : ""}
     </div>
   `;
+    }
+    const n = _defaultSigList.length;
+    const maxH = Math.min(signatureSize.maxHeight, n >= 3 ? 48 : 54);
+    const maxW = Math.min(signatureSize.maxWidth, n >= 3 ? 120 : 145);
+    const boxes = _defaultSigList.map((s) => {
+      const nm = formatSignatureNameForPdf(s?.signatoryName || "");
+      const dg = s?.signatoryDesignation || "";
+      const img = s?.signatoryImageUrl || "";
+      return `
+      <div style="text-align:center;">
+        ${img ? `<img src="${img}" alt="" style="max-height:${maxH}px; max-width:${maxW}px; width:auto; height:auto; object-fit:contain; margin:0 auto 5px; display:block;" onerror="this.style.display='none'" />` : ""}
+        ${nm ? `<p style="margin:0; font-weight:600; font-size:13px;">${nm}</p>` : ""}
+        ${dg ? `<p style="margin:4px 0 0 0; color:#64748b; font-size:11px;">${dg}</p>` : ""}
+      </div>`;
+    }).join("");
+    return `
+    <div class="signatures" style="margin-top: 20px; page-break-inside: avoid; display:flex; gap:20px; align-items:flex-end; justify-content:flex-end;">
+      ${boxes}
+    </div>
+  `;
+  })();
 
   let reportSectionsHtml = "";
   // Only render separate "Report Sections" block when there ARE analytes
@@ -2770,6 +2810,9 @@ function renderSectionContentForTemplate(
  *  - Footer: flex layout â€” "Authenticated Electronic Report" left, signature right
  *  - Font size controllable via printOptions.baseFontSize (lab-level setting)
  */
+const DEFAULT_BASIC_REPORT_DISCLAIMER =
+  "This report is electronically generated and authenticated. Results relate only to the specimen received and should be correlated clinically. This report is not valid for medico-legal purposes.";
+
 function generateBasicDefaultTemplateHtml(
   _context: unknown,
   testGroupNames: Map<string, string>,
@@ -2823,6 +2866,12 @@ function generateBasicDefaultTemplateHtml(
   const colorsEnabled = resultColors?.enabled !== false;
   const highColor = colorsEnabled ? (String(resultColors?.high || "") || "#dc2626") : "#000000";
   const lowColor = colorsEnabled ? (String(resultColors?.low || "") || "#000000") : "#000000";
+
+  // Report disclaimer — printed by default just above the QR/signature footer.
+  const showReportDisclaimer = printOptions?.showReportDisclaimer !== false;
+  const reportDisclaimerText = (typeof printOptions?.reportDisclaimer === "string"
+    ? printOptions.reportDisclaimer as string
+    : DEFAULT_BASIC_REPORT_DISCLAIMER).trim();
 
   const noColorCss = `
 <style>
@@ -3316,6 +3365,17 @@ function generateBasicDefaultTemplateHtml(
   line-height: 1.55 !important;
 }
 
+.basic-report-template .report-disclaimer {
+  margin-top: 10px !important;
+  padding-top: 6px !important;
+  border-top: 0.5px solid #bbb !important;
+  font-size: ${smallPx}px !important;
+  color: #444 !important;
+  font-style: italic !important;
+  line-height: 1.4 !important;
+  page-break-inside: avoid !important;
+}
+
 .basic-report-template .report-footer {
   margin-top: auto !important;  /* pushes footer to bottom of available page space */
   padding-top: 30px !important; /* minimum breathing room above footer */
@@ -3408,7 +3468,7 @@ function generateBasicDefaultTemplateHtml(
       const ageIdx = configFields.findIndex(f => f.key === 'age');
       const genderIdx = configFields.findIndex(f => f.key === 'gender');
       if (ageIdx >= 0 && genderIdx >= 0) {
-        configFields[ageIdx] = { label: 'Age / Sex', placeholder: '{{patientAge}} / {{patientGender}}', key: 'ageGender' };
+        configFields[ageIdx] = { label: 'Age / Sex', placeholder: '{{patientAgeFormatted}} / {{patientGender}}', key: 'ageGender' };
         configFields.splice(genderIdx > ageIdx ? genderIdx : ageIdx + 1, 1);
       }
 
@@ -3439,7 +3499,7 @@ function generateBasicDefaultTemplateHtml(
             <th>Reg. No</th><td>: {{patientId}}</td>
           </tr>
           <tr>
-            <th>Age / Sex</th><td>: {{patientAge}} / {{patientGender}}</td>
+            <th>Age / Sex</th><td>: {{patientAgeFormatted}} / {{patientGender}}</td>
             <th>Reg. Date</th><td>: {{orderDate}}</td>
           </tr>
           <tr>
@@ -3696,10 +3756,11 @@ function generateBasicDefaultTemplateHtml(
 	        const parameterName = analyte.parameter || analyte.name || analyte.test_name || "";
         const isCalculated = analyte.is_auto_calculated || analyte.is_calculated;
         const rawValue = analyte.value ?? "";
-        const value = formatIndianNumber(
-          isCalculated && rawValue !== "" && !isNaN(Number(rawValue))
-            ? String(parseFloat(Number(rawValue).toFixed(2)))
-            : rawValue
+        const value = formatAnalyteDisplayValue(
+          analyte,
+          printOptions,
+          rawValue,
+          formatIndianNumber,
         );
         const unit = analyte.unit || "";
         const refRange = (analyte.reference_range || "").replace(/\n/g, "<br>");
@@ -3792,12 +3853,11 @@ function generateBasicDefaultTemplateHtml(
 	        const siblingValueHtml = siblingAnalyte
 	          ? (() => {
 	              const siblingRawValue = siblingAnalyte.value ?? "";
-	              const siblingValue = formatIndianNumber(
-	                (siblingAnalyte.is_auto_calculated || siblingAnalyte.is_calculated) &&
-	                  siblingRawValue !== "" &&
-	                  !isNaN(Number(siblingRawValue))
-	                  ? String(parseFloat(Number(siblingRawValue).toFixed(2)))
-	                  : siblingRawValue
+	              const siblingValue = formatAnalyteDisplayValue(
+	                siblingAnalyte,
+	                printOptions,
+	                siblingRawValue,
+	                formatIndianNumber,
 	              );
 		              const siblingUnit = siblingAnalyte.unit || "";
 		              if (!siblingValue && !siblingUnit) return "";
@@ -3904,7 +3964,17 @@ function generateBasicDefaultTemplateHtml(
   const sigImageUrl = signatoryInfo?.signatoryImageUrl || "";
   const signatureSize = resolveSignatureImageSize(printOptions);
 
-  const signatoryHtml = `
+  const escapeDisclaimer = (s: string) =>
+    s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, "<br />");
+  const disclaimerHtml = (showReportDisclaimer && reportDisclaimerText)
+    ? `<div class="report-disclaimer">${escapeDisclaimer(reportDisclaimerText)}</div>`
+    : "";
+
+  const _basicSigList = getReportSignatories(signatoryInfo);
+  const signatoryHtml = (() => {
+    // Single signature: keep the exact original markup (backward compatible)
+    if (_basicSigList.length <= 1) {
+      return `
     <div class="report-footer">
       <div class="auth-text">Authenticated Electronic Report</div>
       <div class="signature-box">
@@ -3916,6 +3986,34 @@ function generateBasicDefaultTemplateHtml(
       </div>
     </div>
   `;
+    }
+    // Multiple signatures: render side-by-side boxes, scaled down to fit
+    const n = _basicSigList.length;
+    const maxH = Math.min(signatureSize.maxHeight, n >= 3 ? 48 : 54);
+    const maxW = Math.min(signatureSize.maxWidth, n >= 3 ? 120 : 145);
+    const namePx = Math.max(9, sigPx - (n >= 3 ? 1 : 0));
+    const boxes = _basicSigList.map((s) => {
+      const nm = formatSignatureNameForPdf(s?.signatoryName || "");
+      const dg = s?.signatoryDesignation || "";
+      const img = s?.signatoryImageUrl || "";
+      return `
+        <div style="text-align:center; flex:0 1 auto;">
+          ${img
+            ? `<img src="${img}" alt="" style="max-height:${maxH}px; max-width:${maxW}px; width:auto; height:auto; object-fit:contain; margin:0 auto 4px; display:block;" onerror="this.style.display='none'" />`
+            : ""}
+          ${nm ? `<div style="font-weight:700; font-size:${namePx}px; line-height:1.18;">${nm}</div>` : ""}
+          ${dg ? `<div style="font-size:${basePx - 2}px; margin-top:2px; line-height:1.15;">${dg}</div>` : ""}
+        </div>`;
+    }).join("");
+    return `
+    <div class="report-footer">
+      <div class="auth-text">Authenticated Electronic Report</div>
+      <div class="signature-box" style="display:flex; gap:16px; align-items:flex-end; justify-content:flex-end; text-align:center;">
+        ${boxes}
+      </div>
+    </div>
+  `;
+  })();
 
   const buildSectionLabel = (key: string) => {
     if (sectionLabels?.[key]) return sectionLabels[key];
@@ -3974,6 +4072,7 @@ function generateBasicDefaultTemplateHtml(
       ${printOptions?._suppressPatientHeader ? '' : '<div class="patient-test-separator"></div>'}
       ${testResultsHtml}
       ${reportSectionsHtml}
+      ${printOptions?._suppressSignature ? '' : disclaimerHtml}
       ${printOptions?._suppressSignature ? '' : signatoryHtml}
     </div>
   `;
@@ -4239,7 +4338,7 @@ function generateDefaultTemplateHtml(
       </div>
       <div style="display: flex; flex-wrap: wrap; gap: 12px; font-size: 12px; color: #374151;">
         <span><strong>Patient ID:</strong> {{patientId}}</span>
-        <span><strong>Age:</strong> {{patientAge}}</span>
+        <span><strong>Age:</strong> {{patientAgeFormatted}}</span>
         <span><strong>Gender:</strong> {{patientGender}}</span>
         <span><strong>Physician:</strong> {{referringDoctorName}}</span>
         <span><strong>Collected:</strong> {{collectionDate}}</span>
@@ -4504,27 +4603,29 @@ function generateDefaultTemplateHtml(
   const sigImageUrl = signatoryInfo?.signatoryImageUrl || "";
   const signatureSize = resolveSignatureImageSize(printOptions);
 
-  const signatoryHtml = `
-    <div class="signatures" style="margin-top: 30px; text-align: right; page-break-inside: avoid;">
-      <div style="display: inline-block; text-align: center; min-width: 200px;">
-        ${
-    sigImageUrl
-      ? `<img src="${sigImageUrl}" alt="" style="max-height: ${signatureSize.maxHeight}px; max-width: ${signatureSize.maxWidth}px; width: auto; height: auto; object-fit: contain; margin-bottom: 5px;" onerror="this.style.display='none'" />`
-      : ""
-  }
-        ${
-    sigName
-      ? `<div style="border-bottom: 1px solid #374151; padding-bottom: 4px; margin-bottom: 4px; font-size: 14px; font-weight: 600; color: #1f2937;">${sigName}</div>`
-      : ""
-  }
-        ${
-    sigDesignation
-      ? `<div style="font-size: 11px; color: #6b7280;">${sigDesignation}</div>`
-      : ""
-  }
-      </div>
+  const _classicSigList = getReportSignatories(signatoryInfo);
+  const signatoryHtml = (() => {
+    const n = _classicSigList.length;
+    const isMulti = n >= 2;
+    const maxH = isMulti ? Math.min(signatureSize.maxHeight, n >= 3 ? 48 : 54) : signatureSize.maxHeight;
+    const maxW = isMulti ? Math.min(signatureSize.maxWidth, n >= 3 ? 120 : 145) : signatureSize.maxWidth;
+    const boxes = _classicSigList.map((s) => {
+      const nm = formatSignatureNameForPdf(s?.signatoryName || "");
+      const dg = s?.signatoryDesignation || "";
+      const img = s?.signatoryImageUrl || "";
+      return `
+      <div style="display: inline-block; text-align: center; min-width: ${isMulti ? 150 : 200}px;">
+        ${img ? `<img src="${img}" alt="" style="max-height: ${maxH}px; max-width: ${maxW}px; width: auto; height: auto; object-fit: contain; margin: 0 auto 5px; display: block;" onerror="this.style.display='none'" />` : ""}
+        ${nm ? `<div style="border-bottom: 1px solid #374151; padding-bottom: 4px; margin-bottom: 4px; font-size: ${isMulti ? 13 : 14}px; font-weight: 600; color: #1f2937;">${nm}</div>` : ""}
+        ${dg ? `<div style="font-size: 11px; color: #6b7280;">${dg}</div>` : ""}
+      </div>`;
+    }).join("");
+    return `
+    <div class="signatures" style="margin-top: 30px; text-align: right; page-break-inside: avoid; ${isMulti ? "display:flex; gap:20px; align-items:flex-end; justify-content:flex-end;" : ""}">
+      ${boxes}
     </div>
   `;
+  })();
 
   const buildSectionLabel = (key: string) => {
     if (sectionLabels?.[key]) return sectionLabels[key];
@@ -6233,6 +6334,25 @@ function escapeTrendHtml(value: any): string {
     .replace(/'/g, "&#39;");
 }
 
+// Format a patient's age with its unit word, e.g. 7 -> "7 Years", 1 -> "1 Year",
+// 6 months -> "6 Months". Falls back to the raw value if it isn't numeric and to
+// an empty string when no age is set.
+function formatPatientAgeDisplay(
+  age: unknown,
+  ageUnit?: string | null,
+): string {
+  if (age === null || age === undefined || age === "") return "";
+  const numAge = typeof age === "number" ? age : parseInt(String(age), 10);
+  if (Number.isNaN(numAge)) return String(age);
+  const unit = (ageUnit || "years").toLowerCase();
+  const singular: Record<string, string> = { years: "Year", months: "Month", days: "Day" };
+  const plural: Record<string, string> = { years: "Years", months: "Months", days: "Days" };
+  const word = numAge === 1
+    ? (singular[unit] || "Year")
+    : (plural[unit] || "Years");
+  return `${numAge} ${word}`;
+}
+
 function formatTrendDateTime(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return escapeTrendHtml(value);
@@ -7405,7 +7525,7 @@ serve(async (req) => {
       const [patientContextResult, orderContextResult] = await Promise.all([
         supabaseClient
           .from("patients")
-          .select("custom_fields")
+          .select("custom_fields, age_unit")
           .eq("id", context.patientId)
           .maybeSingle(),
         supabaseClient
@@ -7426,6 +7546,7 @@ serve(async (req) => {
         context.patient = {
           ...(context.patient || {}),
           custom_fields: patientContextResult.data?.custom_fields || {},
+          age_unit: patientContextResult.data?.age_unit || "years",
         };
       }
 
@@ -8430,6 +8551,126 @@ serve(async (req) => {
         hasImage: !!signatoryInfo.signatoryImageUrl,
       });
 
+      // ========================================
+      // Step 5c: Resolve multi-signature footer slots
+      // pdf_layout_settings.reportSignatures = { enabled, maxCount, duplicatePolicy, slots[] }
+      // Each active slot resolves to a signatory box in the footer.
+      // ========================================
+      try {
+        const reportSig = (pdfSettings?.reportSignatures ?? null) as
+          | Record<string, any>
+          | null;
+
+        if (
+          reportSig && reportSig.enabled !== false &&
+          Array.isArray(reportSig.slots)
+        ) {
+          const maxCount = Math.max(
+            1,
+            Math.min(3, Number(reportSig.maxCount ?? 1)),
+          );
+          const activeSlots = reportSig.slots.slice(0, maxCount);
+
+          // Helper: pick best URL for a lab_user_signatures row
+          const pickSigUrl = (sig: any): string => {
+            if (!sig) return "";
+            if (sig.variants) {
+              try {
+                const variants = typeof sig.variants === "string"
+                  ? JSON.parse(sig.variants)
+                  : sig.variants;
+                if (variants?.optimized) return variants.optimized;
+              } catch (_e) { /* ignore malformed variants */ }
+            }
+            if (sig.imagekit_url) {
+              return applySignatureTransformations(sig.imagekit_url);
+            }
+            if (sig.file_url) return sig.file_url;
+            return "";
+          };
+
+          // Batch-fetch all fixed signatures referenced by the slots
+          const fixedIds = activeSlots
+            .filter((s: any) =>
+              s?.source === "fixed_signature" && s.signatureId
+            )
+            .map((s: any) => s.signatureId as string);
+
+          const fixedSigMap = new Map<string, any>();
+          if (fixedIds.length) {
+            const { data: fixedSigs } = await supabaseClient
+              .from("lab_user_signatures")
+              .select("id, imagekit_url, file_url, signature_name, variants")
+              .eq("lab_id", job.lab_id)
+              .in("id", fixedIds);
+            for (const fs of (fixedSigs || [])) fixedSigMap.set(fs.id, fs);
+          }
+
+          const resolved: Array<
+            {
+              signatoryName: string;
+              signatoryDesignation: string;
+              signatoryImageUrl: string;
+            }
+          > = [];
+
+          for (const slot of activeSlots) {
+            if (!slot || slot.source === "empty") continue;
+
+            if (slot.source === "approver_signature") {
+              // Use the verifier/approver signature resolved above
+              if (
+                signatoryInfo.signatoryImageUrl ||
+                (signatoryInfo.signatoryName &&
+                  signatoryInfo.signatoryName !== "Authorized Signatory")
+              ) {
+                resolved.push({
+                  signatoryName: signatoryInfo.signatoryName,
+                  signatoryDesignation: signatoryInfo.signatoryDesignation,
+                  signatoryImageUrl: signatoryInfo.signatoryImageUrl,
+                });
+              }
+            } else if (slot.source === "fixed_signature" && slot.signatureId) {
+              const fs = fixedSigMap.get(slot.signatureId);
+              if (fs) {
+                resolved.push({
+                  signatoryName: fs.signature_name || "Authorized Signatory",
+                  signatoryDesignation: "",
+                  signatoryImageUrl: pickSigUrl(fs),
+                });
+              }
+            }
+          }
+
+          // Optionally drop duplicate signatures (same name + image)
+          let finalList = resolved;
+          if (reportSig.duplicatePolicy !== "allow_duplicates") {
+            const seen = new Set<string>();
+            finalList = resolved.filter((s) => {
+              const key = `${(s.signatoryName || "").trim().toLowerCase()}|${
+                (s.signatoryImageUrl || "").trim()
+              }`;
+              if (seen.has(key)) return false;
+              seen.add(key);
+              return true;
+            });
+          }
+
+          if (finalList.length > 0) {
+            (signatoryInfo as any)._signatories = finalList;
+            console.log(
+              `  âœ… Resolved ${finalList.length} footer signature(s):`,
+              finalList.map((s) => s.signatoryName),
+            );
+          }
+        }
+      } catch (multiSigError) {
+        console.error(
+          "  âŒ Error resolving multi-signature slots:",
+          multiSigError,
+        );
+      }
+
       await updateProgress(
         supabaseClient,
         job.id,
@@ -9114,6 +9355,10 @@ serve(async (req) => {
           patientId: baseContext.patient?.displayId ||
             baseContext.patient?.id || "",
           patientAge: baseContext.patient?.age || "",
+          patientAgeFormatted: formatPatientAgeDisplay(
+            baseContext.patient?.age,
+            baseContext.patient?.age_unit,
+          ),
           patientGender: baseContext.patient?.gender || "",
           patientPhone: baseContext.patient?.phone || "",
 

@@ -1,5 +1,6 @@
 import { database, supabase } from './supabase';
 import {
+  formatGenderAge,
   getActiveLabelLayout,
   getLabelZplMetrics,
   normalizeLabelLayout,
@@ -106,8 +107,9 @@ export function generateBarcodeLabelZPL(data: BarcodeLabelData, layoutOverride?:
   const barcodeValue = fit(sampleId, 32);
   const displayType = fit(sampleType || 'Sample', 20);
 
-  // Format patient name with gender and age (e.g., "Mr. Bhavik Pate M 34 Y")
-  const genderAgeStr = [gender, age ? `${age} Y` : ''].filter(Boolean).join(' ');
+  // Format patient name with gender and age (e.g., "Mr. Bhavik Pate M 34 Y").
+  // Gender is abbreviated to its initial so the age fits the narrow slot.
+  const genderAgeStr = formatGenderAge(gender, age);
   const displayName = fit(patientName || 'Patient', 24);
   const displayGenderAge = fit(genderAgeStr, 12);
 

@@ -104,6 +104,7 @@ type CardOrder = {
   sample_collected_by: string | null;
 
   patient?: { name?: string | null; age?: string | null; gender?: string | null } | null;
+  samples?: { id: string; barcode: string | null; sample_type?: string | null; created_at?: string | null }[];
   tests: string[];
   order_tests?: any[]; // Full order_tests array with outsourcing details
 
@@ -609,6 +610,7 @@ const Orders: React.FC = () => {
         order_number, sample_id, color_code, color_name, sample_collected_at, sample_collected_by,
         accounts(name, billing_mode),
         patients(name, age, gender),
+        samples(id, barcode, sample_type, created_at),
         order_tests(
           id, test_group_id, test_name, outsourced_lab_id,
           outsourced_labs(name),
@@ -809,6 +811,10 @@ const Orders: React.FC = () => {
         sample_collected_by: o.sample_collected_by,
 
         patient: o.patients,
+        samples: [...(o.samples || [])].sort((a: any, b: any) =>
+          String(a.created_at || '').localeCompare(String(b.created_at || '')) ||
+          String(a.barcode || '').localeCompare(String(b.barcode || ''))
+        ),
         tests: (o.order_tests || []).map((t: any) => t.test_name),
         order_tests: o.order_tests || [], // ✅ Include full order_tests with outsourcing data
 
@@ -1565,7 +1571,17 @@ const Orders: React.FC = () => {
                                 </div>
                                 <div className="text-xs md:text-base text-gray-700">
                                   {formatAge(o.patient?.age, (o.patient as any)?.age_unit)} • {o.patient?.gender || "N/A"}
-	                                  <span className="hidden sm:inline"> • ID: {o.patient_id}</span>
+	                                  {(() => {
+	                                    const barcodes = (o.samples || [])
+	                                      .map((s) => s.barcode)
+	                                      .filter((b): b is string => !!b);
+	                                    if (barcodes.length === 0) return null;
+	                                    return (
+	                                      <span className="font-mono font-semibold text-gray-800 select-all cursor-text" title="Sample barcode(s)">
+	                                        {" • "}{barcodes.join("/")}
+	                                      </span>
+	                                    );
+	                                  })()}
 	                                </div>
 	                                {o.account_name && (
 	                                  <div className="mt-1 inline-flex items-center gap-1 rounded-md border border-indigo-200 bg-indigo-50 px-2 py-0.5 text-xs font-medium text-indigo-700">

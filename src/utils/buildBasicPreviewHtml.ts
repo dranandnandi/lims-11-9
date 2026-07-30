@@ -9,6 +9,8 @@
  * Pure function - no DB calls, no external deps.
  */
 
+import { formatAnalyteDisplayValue } from './resultValueFormat';
+
 export interface PreviewAnalyte {
   parameter: string;
   value: string | null;
@@ -17,6 +19,12 @@ export interface PreviewAnalyte {
   flag: string | null;
   section_heading?: string | null;
   is_auto_calculated?: boolean;
+  is_calculated?: boolean;
+  value_type?: string | null;
+  /** Resolved report precision: null/undefined = as entered, 0 = integer. */
+  decimal_places?: number | null;
+  /** Resolved leading-zero width: null/undefined/0 = off, 2 = "03". */
+  min_integer_digits?: number | null;
   analyte_id?: string | null;
   analyteId?: string | null;
   id?: string | null;
@@ -49,6 +57,12 @@ export interface BuildBasicPreviewParams {
   reportDate?: string;
   referredBy?: string;
   sampleId?: string;
+  /** Per-lab configurable patient-field list (mirrors report_patient_info_config used by the PDF). */
+  patientInfoConfig?: { layout?: string; fields: string[] } | null;
+  /** Custom patient field labels (mirrors lab_patient_field_configs used by the PDF). */
+  extraFieldConfigs?: Array<{ field_key: string; label: string }>;
+  /** Resolved values for configurable patient fields, keyed by field key. */
+  patientFieldValues?: Record<string, string>;
   testGroups: PreviewTestGroup[];
   sections?: PreviewSection[];
   signatoryName?: string;
@@ -111,6 +125,11 @@ function escapeHtml(value: string): string {
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
 }
+
+// Keep in sync with DEFAULT_BASIC_REPORT_DISCLAIMER in
+// supabase/functions/generate-pdf-letterhead/index.ts
+export const DEFAULT_BASIC_REPORT_DISCLAIMER =
+  "This report is electronically generated and authenticated. Results relate only to the specimen received and should be correlated clinically. This report is not valid for medico-legal purposes.";
 
 function toPx(value: unknown, fallback: number): number {
   if (typeof value === "number" && Number.isFinite(value)) return value;
@@ -302,6 +321,9 @@ export function buildBasicPreviewHtml(params: BuildBasicPreviewParams): string {
     reportDate = new Date().toLocaleString("en-IN", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" }),
     referredBy = "",
     sampleId = "",
+    patientInfoConfig = null,
+    extraFieldConfigs = [],
+    patientFieldValues = {},
     testGroups,
     sections = [],
     signatoryName = "",
@@ -344,6 +366,10 @@ export function buildBasicPreviewHtml(params: BuildBasicPreviewParams): string {
   const basicColumnWidths = (printOptions.basicColumnWidths || {}) as Record<string, unknown>;
   const standardColumnWidths = normalizeBasicColumnWidths(basicColumnWidths.standard, [36, 24, 12, 28], 4);
   const siblingColumnWidths = normalizeBasicColumnWidths(basicColumnWidths.sibling, [30, 14, 8, 16, 16, 16], 6);
+  const showReportDisclaimer = printOptions.showReportDisclaimer !== false;
+  const reportDisclaimerText = (typeof printOptions.reportDisclaimer === "string"
+    ? printOptions.reportDisclaimer as string
+    : DEFAULT_BASIC_REPORT_DISCLAIMER).trim();
   const resultColors = printOptions.resultColors as Record<string, unknown> | undefined;
   const colorsEnabled = resultColors?.enabled !== false;
   const highColor = colorsEnabled ? (String(resultColors?.high || "") || "#dc2626") : "#000000";
@@ -472,10 +498,10 @@ th { padding: 3px 4px !important; }
 .val.high, .val.critical_high { color: ${highColor} !important; ${boldAbnormal ? "font-weight: 700 !important;" : ""} }
 .val.low, .val.critical_low   { color: ${lowColor} !important;  ${boldAbnormal ? "font-weight: 700 !important;" : ""} }
 .val.abnormal { color: ${highColor} !important; ${boldAbnormal ? "font-weight: 700 !important;" : ""} }
-.main-group-row td { padding: 0 !important; border: none !important; }
+.main-group-row td { padding: 8px 0 5px 0 !important; border: none !important; }
 .center-title {
   text-align: center; font-weight: 700; text-decoration: underline;
-  font-size: ${basePx + 2}px; margin: 8px 0 0;
+  font-size: ${basePx + 1}px; margin: 8px 0 0;
   text-transform: uppercase; line-height: 1.2; color: #000;
 }
 .center-title.left {
@@ -499,7 +525,7 @@ th { padding: 3px 4px !important; }
   text-align: left !important;
 }
 .tbl-results.has-sibling .sub-section-header .sibling-section-label {
-  text-align: left !important;
+  text-align: center !important;
   text-decoration: underline !important;
 }
 .descriptive-row td { border-bottom: 0.5px dotted #e5e5e5 !important; color: #111 !important; }
@@ -512,80 +538,45 @@ th { padding: 3px 4px !important; }
   word-break: break-word !important;
 }
 .calculated-note { font-size: ${smallPx}px; color: #444; margin: 3px 0 6px; font-style: italic; }
-.group-interpretation-block {
-  margin-top: 10px;
-  font-size: ${basePx}px;
+/* Group interpretation — kept in sync with generateBasicDefaultTemplateHtml's
+   plain .group-interpretation styling so the preview matches the delivered PDF. */
+.group-interpretation { margin-top: 8px; padding: 6px 0; border-top: 1px solid #ddd; font-size: ${basePx}px; }
+.group-interpretation figure.table { margin: 8px 0 0 0; width: 100%; }
+.group-interpretation figure.table table,
+.group-interpretation .tbl-interpretation {
+  border-collapse: collapse !important;
+  width: 100% !important;
 }
-.group-interpretation-block .section-header {
-  font-size: ${basePx + 2}px;
-  font-weight: 700;
-  color: #0b4aa2;
-  padding: 10px 0 6px 0;
-  margin: 16px 0 8px 0;
-  border-bottom: 2px solid #0b4aa2;
-  letter-spacing: 0.02em;
-  background: transparent;
+.group-interpretation figure.table table td,
+.group-interpretation figure.table table th,
+.group-interpretation .tbl-interpretation td,
+.group-interpretation .tbl-interpretation th {
+  border: 1px solid #ccc !important;
+  padding: 5px 8px !important;
+  vertical-align: top !important;
 }
-.group-interpretation-block figure.table {
-  margin: 8px 0 0 0;
-  width: 100%;
+.group-interpretation figure.table table thead th,
+.group-interpretation .tbl-interpretation thead th {
+  background-color: #f0f0f0 !important;
+  font-weight: 700 !important;
 }
-.group-interpretation-block .tbl-interpretation {
-  width: 100%;
-  border-collapse: collapse;
-  table-layout: fixed;
-  font-size: ${basePx}px;
-  border: 1px solid #d1daf0;
-  background: #fff;
-  margin-top: 8px;
+.group-interpretation .flag-high, .group-interpretation .value-high { color: #dc2626 !important; font-weight: 700 !important; }
+.group-interpretation .flag-low, .group-interpretation .value-low { color: #ea580c !important; font-weight: 700 !important; }
+.group-interpretation .flag-critical, .group-interpretation .flag-critical_h, .group-interpretation .value-critical { color: #dc2626 !important; font-weight: 900 !important; }
+.group-interpretation .flag-abnormal, .group-interpretation .value-abnormal { color: #dc2626 !important; font-weight: 700 !important; }
+.group-interpretation .flag-trace, .group-interpretation .value-trace { color: #ea580c !important; font-weight: 700 !important; }
+.group-interpretation .flag-normal, .group-interpretation .value-normal { color: #1f2937 !important; font-weight: 700 !important; }
+/* Report-section rich HTML (tables inside section content) — border protection,
+   mirrors .section-rich-content in the PDF template. */
+.section-rich-content table { border-collapse: collapse !important; }
+.section-rich-content table td,
+.section-rich-content table th {
+  border: 1px solid #9ca3af !important;
+  padding: 8px !important;
+  font-weight: inherit !important;
+  background-color: inherit !important;
+  vertical-align: middle !important;
 }
-.group-interpretation-block .tbl-interpretation thead th {
-  background: #0b4aa2;
-  color: #fff;
-  font-weight: 700;
-  padding: 9px 12px;
-  text-align: left;
-  font-size: ${basePx}px;
-  border: 1px solid #0b4aa2;
-  vertical-align: top;
-}
-.group-interpretation-block .tbl-interpretation tbody td {
-  padding: 9px 12px;
-  border: 1px solid #e2eaf8;
-  vertical-align: top;
-  line-height: 1.5;
-  font-size: ${basePx}px;
-  color: #1f2937;
-  word-break: break-word;
-}
-.group-interpretation-block .tbl-interpretation tbody tr:nth-child(even) td {
-  background: #f5f8ff;
-}
-.group-interpretation-block .tbl-interpretation th:first-child,
-.group-interpretation-block .tbl-interpretation td:first-child {
-  width: 100px;
-  font-weight: 600;
-  white-space: nowrap;
-  color: #1e3a6e;
-}
-.group-interpretation-block .tbl-interpretation tbody td:first-child {
-  border-left: 3px solid #cbd5e1;
-}
-.group-interpretation-block .note {
-  margin-top: 10px;
-  padding: 10px 14px;
-  border-left: 4px solid #0b4aa2;
-  background: #f0f5ff;
-  font-size: ${smallPx + 0.5}px;
-  color: #334155;
-  line-height: 1.55;
-}
-.group-interpretation-block .note strong {
-  color: #0b4aa2;
-}
-.report-sections { margin-top: 14px; border-top: 1px solid #000; padding-top: 6px; }
-.report-sections .section-block { margin-top: 8px; font-size: ${basePx}px; }
-.report-sections .section-label { font-weight: 700; margin-bottom: 2px; }
 .narrative-panel {
   margin: 0 0 14px;
   border-top: 1.5px solid #000;
@@ -619,6 +610,7 @@ th { padding: 3px 4px !important; }
 }
 .narrative-para { margin: 3px 0 6px; line-height: 1.55; }
 		.test-results { display: flex; flex-direction: column; flex: 1 1 auto; }
+		.report-disclaimer { margin-top: 10px; padding-top: 6px; border-top: 0.5px solid #bbb; font-size: ${smallPx}px; color: #444; font-style: italic; line-height: 1.4; page-break-inside: avoid; break-inside: avoid; }
 		.report-footer { margin-top: auto; padding-top: 30px; display: flex; justify-content: space-between; align-items: flex-end; page-break-inside: avoid; break-inside: avoid; }
 	.report-footer .qr-verify { margin-left: ${qrHorizontalOffset}px; }
 	.qr-top-left-slot .qr-verify { margin-left: ${qrHorizontalOffset}px; }
@@ -647,7 +639,94 @@ th { padding: 3px 4px !important; }
 		}
 	</style>`;
 
-  // Patient header
+  // Patient header — mirror the configurable field list the PDF uses
+  // (generateBasicDefaultTemplateHtml → patientInfoHtml). When the lab has no
+  // report_patient_info_config, fall back to the same default 6 fields the PDF uses.
+  const PREVIEW_PATIENT_FIELD_LABELS: Record<string, string> = {
+    patientName: "Patient Name",
+    patientId: "Patient ID",
+    registrationDate: "Reg. Date",
+    age: "Age",
+    gender: "Gender",
+    collectionDate: "Collected On",
+    sampleId: "Sample ID",
+    referringDoctorName: "Ref. Doctor",
+    approvedAt: "Approved On",
+    phone: "Phone",
+    sampleCollectedBy: "Collected By",
+    receivedAt: "Received Date/Time",
+    collectionCenter: "Collection Center",
+    b2bAccountName: "B2B / Account Name",
+  };
+  const patientValueFor = (key: string): string => {
+    if (patientFieldValues && Object.prototype.hasOwnProperty.call(patientFieldValues, key)) {
+      return String(patientFieldValues[key] ?? "");
+    }
+    switch (key) {
+      case "patientName": return patientName || "";
+      case "patientId": return patientCode || "";
+      case "sampleId": return sampleId || "";
+      case "referringDoctorName": return referredBy || "";
+      default: return "";
+    }
+  };
+  const buildPatientHeaderRows = (): string => {
+    const configFields = (patientInfoConfig && Array.isArray(patientInfoConfig.fields) && patientInfoConfig.fields.length > 0)
+      ? patientInfoConfig.fields
+          .map((key) => {
+            if (PREVIEW_PATIENT_FIELD_LABELS[key]) return { label: PREVIEW_PATIENT_FIELD_LABELS[key], key };
+            if (key.startsWith("custom_")) {
+              const found = extraFieldConfigs?.find((f) => `custom_${f.field_key}` === key);
+              const label = found
+                ? found.label
+                : key.replace(/^custom_/, "").replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+              return { label, key };
+            }
+            return undefined;
+          })
+          .filter(Boolean) as Array<{ label: string; key: string }>
+      : null;
+
+    if (configFields && configFields.length > 0) {
+      // Combine age + gender into a single "Age / Sex" field when both are present.
+      const ageIdx = configFields.findIndex((f) => f.key === "age");
+      const genderIdx = configFields.findIndex((f) => f.key === "gender");
+      if (ageIdx >= 0 && genderIdx >= 0) {
+        configFields[ageIdx] = { label: "Age / Sex", key: "ageGender" };
+        configFields.splice(genderIdx > ageIdx ? genderIdx : ageIdx + 1, 1);
+      }
+      const valueFor = (key: string): string =>
+        key === "ageGender"
+          ? ([patientValueFor("age"), patientValueFor("gender")].filter(Boolean).join(" / ") || ageGender || "")
+          : patientValueFor(key);
+
+      const rows: string[] = [];
+      for (let i = 0; i < configFields.length; i += 2) {
+        const f1 = configFields[i];
+        const f2 = configFields[i + 1];
+        rows.push(`<tr>
+          <th>${escapeHtml(f1.label)}</th><td>: ${escapeHtml(valueFor(f1.key))}</td>
+          ${f2 ? `<th>${escapeHtml(f2.label)}</th><td>: ${escapeHtml(valueFor(f2.key))}</td>` : `<th></th><td></td>`}
+        </tr>`);
+      }
+      return rows.join("");
+    }
+
+    // Default fallback — identical field set to the PDF's default (no Sample ID row).
+    return `<tr>
+          <th>Name</th><td>: ${escapeHtml(patientName || "")}</td>
+          <th>Reg. No</th><td>: ${escapeHtml(patientCode || "")}</td>
+        </tr>
+        <tr>
+          <th>Age / Sex</th><td>: ${escapeHtml(ageGender || "")}</td>
+          <th>Reg. Date</th><td>: ${escapeHtml(orderDate || "")}</td>
+        </tr>
+        <tr>
+          <th>Ref. By</th><td>: ${escapeHtml(referredBy || "")}</td>
+          <th>Report Date</th><td>: ${escapeHtml(reportDate || "")}</td>
+        </tr>`;
+  };
+
   const patientHtml = `
 	  <div>
 	    <div class="report-id-line">
@@ -662,38 +741,34 @@ th { padding: 3px 4px !important; }
 	  </div>
   <figure style="margin:0;">
     <table class="patient-header-table">
-      <tbody>
-        <tr>
-	          <th>Name</th><td>: ${escapeHtml(patientName || "")}</td>
-	          <th>Reg. No</th><td>: ${escapeHtml(patientCode || "")}</td>
-	        </tr>
-	        <tr>
-	          <th>Age / Sex</th><td>: ${escapeHtml(ageGender || "")}</td>
-	          <th>Reg. Date</th><td>: ${escapeHtml(orderDate || "")}</td>
-	        </tr>
-	        <tr>
-	          <th>Ref. By</th><td>: ${escapeHtml(referredBy || "")}</td>
-	          <th>Report Date</th><td>: ${escapeHtml(reportDate || "")}</td>
-	        </tr>
-	        ${sampleId ? `<tr><th>Sample ID</th><td>: ${escapeHtml(sampleId)}</td><td colspan="2"></td></tr>` : ""}
-	      </tbody>
+      <tbody>${buildPatientHeaderRows()}</tbody>
 	    </table>
 	  </figure>
     <div class="patient-test-separator"></div>`;
 
   // Test results (all groups)
+    // Report sections — mirror the PDF's reportSectionsHtml: rich HTML (content with a
+    // real <table>) renders as a border-protected block; plain text renders as a
+    // narrative-panel with a centered underlined title.
     let sectionsHtml = "";
     const validSections = sections.filter(s => s.content && s.content.trim());
     if (validSections.length > 0) {
-      sectionsHtml = `<div class="report-sections">`;
-      for (const sec of validSections) {
-        sectionsHtml += `
-        <div class="section-block">
-          <div class="section-label">${escapeHtml(sec.sectionName)}</div>
-          <div>${formatNarrativeHtml(sec.content)}</div>
+      sectionsHtml = validSections.map((sec) => {
+        const rawContent = sec.content.trim();
+        const isRichHtml = /<table\b/i.test(rawContent);
+        if (isRichHtml) {
+          return `
+        <div class="section-rich-content" style="margin: 8px 0 14px; page-break-inside: avoid; break-inside: avoid;">
+          <div class="center-title">${escapeHtml(sec.sectionName)}</div>
+          <div style="font-size:${basePx}px;">${rawContent}</div>
         </div>`;
-      }
-      sectionsHtml += `</div>`;
+        }
+        return `
+        <section class="narrative-panel">
+          <div class="center-title">${escapeHtml(sec.sectionName)}</div>
+          <div class="narrative-body">${formatNarrativeHtml(rawContent)}</div>
+        </section>`;
+      }).join("");
     }
 
     const qrBlock = verificationUrl
@@ -728,7 +803,12 @@ th { padding: 3px 4px !important; }
         </div>`
       : "";
 
+    const disclaimerHtml = (showReportDisclaimer && reportDisclaimerText)
+      ? `<div class="report-disclaimer">${escapeHtml(reportDisclaimerText).replace(/\n/g, "<br />")}</div>`
+      : "";
+
     const footerHtml = `
+    ${disclaimerHtml}
     <div class="report-footer">
       ${authBlock}
       ${signatoryBlock}
@@ -799,7 +879,7 @@ th { padding: 3px 4px !important; }
 	      <section class="narrative-panel">
 	        <div class="${titleClass}">${group.testGroupName}</div>
 	        <div class="narrative-body">${rowsHtml}</div>
-	        ${group.groupInterpretation ? `<div class="group-interpretation-block">${group.groupInterpretation}</div>` : ""}
+	        ${group.groupInterpretation ? `<div class="limsv2-report group-interpretation">${group.groupInterpretation}</div>` : ""}
 	      </section>`;
 	      if (!isCompact) testResultsHtml += `</div>${standardPageFooterHtml}</div>`;
 	      continue;
@@ -961,7 +1041,12 @@ th { padding: 3px 4px !important; }
         }
 
         const sym = flagSymbol !== "none" ? getFlagSymbolText(canonical) : "";
-        const formattedValue = formatIndianNumber(rawValue);
+        const formattedValue = formatAnalyteDisplayValue(
+          analyte,
+          printOptions,
+          rawValue,
+          formatIndianNumber,
+        );
 	        const displayValue =
 	          flagSymbol === "before" && sym
 	            ? `<span style="display:inline-block;min-width:${basePx * 1.15}px;text-align:center;font-weight:700;margin-right:4px;">${sym}</span>${formattedValue + asteriskSuffix}`
@@ -974,7 +1059,12 @@ th { padding: 3px 4px !important; }
 	        const siblingAnalyte = siblingId ? analyteById.get(siblingId) : null;
 	        const siblingValueHtml = siblingAnalyte
 	          ? (() => {
-		              const siblingValue = formatIndianNumber(siblingAnalyte.value ?? "");
+		              const siblingValue = formatAnalyteDisplayValue(
+		                siblingAnalyte,
+		                printOptions,
+		                undefined,
+		                formatIndianNumber,
+		              );
 		              const siblingUnit = siblingAnalyte.unit || "";
 		              if (!siblingValue && !siblingUnit) return "";
 		              const siblingCanonical = normalizeFlag(siblingAnalyte.flag);
@@ -1050,7 +1140,7 @@ th { padding: 3px 4px !important; }
       </tbody>
     </table>
     ${groupLegendParts.length ? `<p class="calculated-note">${groupLegendParts.join(" &nbsp;|&nbsp; ")}</p>` : ""}
-	    ${group.groupInterpretation ? `<div class="group-interpretation-block">${group.groupInterpretation}</div>` : ""}
+	    ${group.groupInterpretation ? `<div class="limsv2-report group-interpretation">${group.groupInterpretation}</div>` : ""}
 	  </figure>`;
 	    if (!isCompact) testResultsHtml += `</div>${standardPageFooterHtml}</div>`;
 	  }

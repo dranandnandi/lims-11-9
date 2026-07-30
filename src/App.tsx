@@ -93,12 +93,21 @@ import DoctorCommissionReport from './pages/DoctorCommissionReport';
 // WhatsApp Hybrid System Components
 import { FailedNotificationToast } from './components/WhatsApp/FailedNotificationToast';
 
+// Build target: 'lims' (default, full app) | 'patient' (patient portal only) | 'phlebo' (phlebo collections only).
+// Set via VITE_APP_TARGET at build time; unset = full LIMS, so web builds are unaffected.
+const APP_TARGET = (import.meta.env.VITE_APP_TARGET as string | undefined) || 'lims';
 
 const AppRoutes: React.FC = () => {
   const { user, loading } = useAuth();
 
   // Initialize WhatsApp auto-sync when user is authenticated
   useWhatsAppAutoSync();
+
+  // Per-app browser/tab title (index.html is shared by all three builds)
+  useEffect(() => {
+    if (APP_TARGET === 'patient') document.title = 'AnPro Patient';
+    else if (APP_TARGET === 'phlebo') document.title = 'AnPro Phlebo';
+  }, []);
 
   // Initialize native platform features
   useEffect(() => {
@@ -129,6 +138,50 @@ const AppRoutes: React.FC = () => {
       <div className="min-h-screen flex items-center justify-center">
         <div className="text-lg">Loading...</div>
       </div>
+    );
+  }
+
+  // Patient app: only the patient portal is reachable
+  if (APP_TARGET === 'patient') {
+    return (
+      <Routes>
+        <Route path="/patient/login" element={<PatientLogin />} />
+        <Route
+          path="/patient/portal"
+          element={
+            <ProtectedPatientRoute>
+              <PatientPortal />
+            </ProtectedPatientRoute>
+          }
+        />
+        <Route path="/verify" element={<VerificationPage />} />
+        <Route path="*" element={<Navigate to="/patient/login" replace />} />
+      </Routes>
+    );
+  }
+
+  // Phlebo app: staff login, then straight to collections (no staff layout/sidebar)
+  if (APP_TARGET === 'phlebo') {
+    return (
+      <Routes>
+        <Route
+          path="/login"
+          element={user ? <Navigate to="/phlebo" replace /> : <Login />}
+        />
+        <Route
+          path="/forgot-password"
+          element={user ? <Navigate to="/phlebo" replace /> : <ForgotPassword />}
+        />
+        <Route path="/reset-password" element={<ResetPassword />} />
+        <Route
+          path="*"
+          element={
+            <ProtectedRoute>
+              <PhleboCollections />
+            </ProtectedRoute>
+          }
+        />
+      </Routes>
     );
   }
 

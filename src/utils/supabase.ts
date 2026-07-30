@@ -6902,6 +6902,10 @@ export const database = {
         | "qualitative"
         | "semi_quantitative"
         | "descriptive";
+      // Report display precision: null = inherit, 0 = round to integer
+      decimal_places?: number | null;
+      // Leading-zero width for fixed-width printouts: null = inherit, 0 = off
+      min_integer_digits?: number | null;
       expected_normal_values?: string[];
       expected_value_flag_map?: Record<string, string>;
       flag_rules?: any;

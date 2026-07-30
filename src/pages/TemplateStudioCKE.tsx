@@ -215,6 +215,63 @@ const ensureStylesheet = (href: string) => {
   return resourcePromises[href];
 };
 
+// The CDN bundles are UMD. If anything on the page has defined an AMD loader or
+// CommonJS-style globals, the UMD wrapper takes that branch and never assigns
+// window.CKEDITOR — the script still fires `load`, so the failure is silent.
+// Hide those globals for the duration of the script execution.
+const withBrowserGlobalBranch = <T,>(run: () => T): T => {
+  const w = window as any;
+  const stashed: Array<[string, boolean, any]> = ['define', 'module', 'exports'].map((key) => [
+    key,
+    key in w,
+    w[key],
+  ]);
+  const needsGuard = stashed.some(([, present]) => present);
+
+  if (!needsGuard) {
+    return run();
+  }
+
+  stashed.forEach(([key]) => {
+    delete w[key];
+  });
+
+  const restore = () => {
+    stashed.forEach(([key, present, value]) => {
+      if (present) {
+        w[key] = value;
+      } else {
+        delete w[key];
+      }
+    });
+  };
+
+  try {
+    return run();
+  } finally {
+    // Scripts are loaded async, but the wrapper reads these synchronously while
+    // executing, so restoring on the next macrotask is late enough.
+    window.setTimeout(restore, 0);
+  }
+};
+
+// `@ckeditor/ckeditor5-build-classic` (used by SectionEditor, statically imported
+// by several routes) runs at app boot and claims globalThis.CKEDITOR_VERSION.
+// The CDN bundle then hits its `ckeditor-duplicated-modules` guard and throws
+// before it exports anything, leaving a half-built window.CKEDITOR. The two
+// bundles are self-contained and drive separate editors on separate screens, so
+// releasing the marker before injecting the CDN script is safe here — the CDN
+// bundle sets it to its own version as it initialises.
+const releaseDuplicateModuleGuard = () => {
+  const w = globalThis as any;
+  if (w.CKEDITOR_VERSION && w.CKEDITOR_VERSION !== CKEDITOR_VERSION) {
+    console.debug(
+      `Releasing CKEDITOR_VERSION marker (${w.CKEDITOR_VERSION}) so the CDN bundle ${CKEDITOR_VERSION} can initialise.`
+    );
+    delete w.CKEDITOR_VERSION;
+  }
+};
+
 const ensureScript = (src: string) => {
   if (typeof window === 'undefined') {
     return Promise.resolve();
@@ -224,9 +281,19 @@ const ensureScript = (src: string) => {
     return resourcePromises[src]!;
   }
 
-  resourcePromises[src] = new Promise<void>((resolve, reject) => {
-    if (document.querySelector(`script[src="${src}"]`)) {
-      resolve();
+  const promise = new Promise<void>((resolve, reject) => {
+    const existing = document.querySelector<HTMLScriptElement>(`script[src="${src}"]`);
+    if (existing) {
+      // A tag may exist but still be in flight — never assume it has executed.
+      if (existing.dataset.limsLoaded === 'true') {
+        resolve();
+      } else {
+        existing.addEventListener('load', () => resolve());
+        existing.addEventListener('error', () => reject(new Error(`Failed to load script: ${src}`)));
+        // The tag may have finished before we attached listeners (e.g. after an
+        // HMR reload reset the promise cache), so do not wait on it forever.
+        window.setTimeout(() => resolve(), 15000);
+      }
       return;
     }
 
@@ -234,12 +301,35 @@ const ensureScript = (src: string) => {
     script.src = src;
     script.async = true;
     script.crossOrigin = 'anonymous';
-    script.onload = () => resolve();
+    script.onload = () => {
+      script.dataset.limsLoaded = 'true';
+      resolve();
+    };
     script.onerror = () => reject(new Error(`Failed to load script: ${src}`));
-    document.head.appendChild(script);
+    releaseDuplicateModuleGuard();
+    withBrowserGlobalBranch(() => document.head.appendChild(script));
   });
 
-  return resourcePromises[src];
+  // Do not cache a rejection forever — a transient network failure should not
+  // permanently poison the editor for the rest of the session.
+  resourcePromises[src] = promise.catch((err) => {
+    resourcePromises[src] = undefined;
+    throw err;
+  });
+
+  return resourcePromises[src]!;
+};
+
+const waitForGlobal = async (name: 'CKEDITOR' | 'CKEDITOR_PREMIUM_FEATURES', timeoutMs = 15000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = (window as any)[name];
+    if (value) {
+      return value;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return undefined;
 };
 
 const loadCkeditorResources = async () => {
@@ -248,10 +338,21 @@ const loadCkeditorResources = async () => {
     ensureStylesheet(CKEDITOR_PREMIUM_CSS_URL),
     ensureScript(CKEDITOR_SCRIPT_URL),
   ]);
+
+  const ckeditor = await waitForGlobal('CKEDITOR');
+  if (!ckeditor?.ClassicEditor) {
+    throw new Error(
+      `CKEditor ${CKEDITOR_VERSION} loaded from ${CKEDITOR_SCRIPT_URL} but did not expose window.CKEDITOR.ClassicEditor. ` +
+        `Globals present: CKEDITOR=${typeof (window as any).CKEDITOR}, define=${typeof (window as any).define}, ` +
+        `module=${typeof (window as any).module}, exports=${typeof (window as any).exports}.`
+    );
+  }
+
   // Load premium features after base script is ready (they depend on CKEDITOR being defined)
   await ensureScript(CKEDITOR_PREMIUM_SCRIPT_URL).catch(() => {
     console.warn('CKEditor premium features failed to load — premium plugins (FormatPainter, etc.) will be unavailable.');
   });
+  await waitForGlobal('CKEDITOR_PREMIUM_FEATURES', 5000);
 };
 
 interface PremiumEditorConfigOptions {
@@ -1056,7 +1157,11 @@ const TemplateStudioCKE: React.FC = () => {
         console.error('Failed to initialise CKEditor premium editor:', err);
         if (isMounted) {
           setEditorBooting(false);
-          setError('Unable to load the premium editor. Please refresh and try again or contact support.');
+          setError(
+            `Unable to load the premium editor. Please refresh and try again or contact support. (${
+              err instanceof Error ? err.message : String(err)
+            })`
+          );
         }
       }
     };

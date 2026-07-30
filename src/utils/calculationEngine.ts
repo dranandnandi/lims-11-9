@@ -12,6 +12,7 @@
  */
 
 import { evaluate, round } from 'mathjs';
+import { FALLBACK_DECIMAL_PLACES, normalizeDecimalPlaces } from './resultValueFormat';
 import { supabase } from './supabase';
 import { selectPreferredCalculatedDependencies } from './calculatedDependencies';
 import { evaluateTextCalculation, normalizeCalculationResultType } from './calculationRules';
@@ -28,6 +29,8 @@ export interface CalculatedAnalyte {
   formula_description?: string;
   calculation_result_type?: 'numeric' | 'text';
   value_type?: string;
+  /** Report precision for this analyte: null = inherit (2 dp), 0 = round to integer. */
+  decimal_places?: number | null;
   unit?: string;
   reference_range?: string;
   category?: string;
@@ -98,6 +101,7 @@ export const calculationEngine = {
           formula_description,
           calculation_result_type,
           value_type,
+          decimal_places,
           unit,
           reference_range,
           category,
@@ -109,6 +113,7 @@ export const calculationEngine = {
           formula_variables,
           calculation_result_type,
           value_type,
+          decimal_places,
           unit,
           reference_range,
           lab_specific_reference_range,
@@ -131,6 +136,7 @@ export const calculationEngine = {
         formula_description: a.formula_description,
         calculation_result_type: normalizeCalculationResultType(la?.calculation_result_type ?? a.calculation_result_type),
         value_type: la?.value_type ?? a.value_type,
+        decimal_places: la?.decimal_places ?? a.decimal_places ?? null,
         unit: la?.unit ?? a.unit,
         reference_range: la?.lab_specific_reference_range ?? la?.reference_range ?? a.reference_range,
         category: a.category
@@ -367,7 +373,12 @@ export const calculationEngine = {
           'pow($1, $2)'
         );
         const result = evaluate(normalizedFormula, scope);
-        const roundedResult = round(result, 2);
+        // Store at the analyte's configured precision so the entry console, the
+        // portal and the PDF all agree. Unconfigured stays at 2 dp as before.
+        const roundedResult = round(
+          result,
+          normalizeDecimalPlaces(analyte.decimal_places) ?? FALLBACK_DECIMAL_PLACES,
+        );
 
         results.push({
           analyte_id: analyte.id,

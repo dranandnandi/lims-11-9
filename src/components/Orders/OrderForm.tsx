@@ -71,7 +71,17 @@ interface Account {
   payment_terms?: number | null;
   is_active?: boolean | null;
   billing_mode?: 'standard' | 'monthly' | null;
+  is_locked?: boolean | null;
+  lock_override_until?: string | null;
 }
+
+// An account is "effectively locked" (order creation blocked) when it is locked
+// and any temporary open window has expired. Mirrors AccountMaster.
+const isAccountEffectivelyLocked = (account?: Pick<Account, 'is_locked' | 'lock_override_until'> | null): boolean => {
+  if (!account?.is_locked) return false;
+  if (account.lock_override_until && new Date(account.lock_override_until).getTime() > Date.now()) return false;
+  return true;
+};
 
 interface Patient {
   id: string;
@@ -1451,6 +1461,17 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
       errors.push(
         `❌ Credit Limit: ${creditInfo.kind === 'account' ? 'Account' : 'Location'} credit limit exceeded. Available: ₹${creditInfo.availableCredit}`
       );
+    }
+
+    // Block orders against a locked (on-hold) account. Only an admin can open it
+    // in Account Master; there is no override here.
+    if (selectedAccount) {
+      const lockedAccount = accounts.find(a => a.id === selectedAccount);
+      if (isAccountEffectivelyLocked(lockedAccount)) {
+        errors.push(
+          `❌ Account Locked: "${lockedAccount?.name || 'This account'}" is locked and cannot be used for new orders. An admin must open it in Account Master.`
+        );
+      }
     }
 
     if (!patientForOrder) {
@@ -3136,6 +3157,7 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
                         e.preventDefault();
                         const idx = highlightedAccountIndex >= 0 ? highlightedAccountIndex : 0;
                         const acc = filteredAccounts[idx];
+                        if (isAccountEffectivelyLocked(acc)) return; // locked accounts can't be selected
                         setSelectedAccount(acc.id); setAccountSearch(acc.name);
                         setShowAccountDropdown(false); setHighlightedAccountIndex(-1);
                         setTimeout(() => {
@@ -3154,30 +3176,39 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
                   />
                   {showAccountDropdown && filteredAccounts.length > 0 && (
                     <div className="absolute z-[100] w-full mt-1 bg-white border border-gray-300 rounded-lg shadow-2xl max-h-48 overflow-y-auto">
-                      {filteredAccounts.map((account, idx) => (
+                      {filteredAccounts.map((account, idx) => {
+                        const locked = isAccountEffectivelyLocked(account);
+                        return (
                         <button
                           key={account.id}
                           type="button"
+                          disabled={locked}
                           onClick={() => {
+                            if (locked) return;
                             setSelectedAccount(account.id);
                             setAccountSearch(account.name);
                             setShowAccountDropdown(false);
                             setHighlightedAccountIndex(-1);
                           }}
+                          title={locked ? 'This account is locked — an admin must open it in Account Master.' : undefined}
                           className={`w-full px-4 py-2 text-left flex items-center gap-2 transition-colors ${
-                            highlightedAccountIndex === idx ? 'bg-blue-100' : 'hover:bg-blue-50'
+                            locked ? 'opacity-60 cursor-not-allowed bg-red-50' : highlightedAccountIndex === idx ? 'bg-blue-100' : 'hover:bg-blue-50'
                           }`}
                         >
                           <Briefcase className="w-4 h-4 text-gray-400" />
                           <div>
-                            <div className="font-medium text-gray-900">{account.name}</div>
+                            <div className="font-medium text-gray-900 flex items-center gap-1.5">
+                              {account.name}
+                              {locked && <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-red-100 text-red-700">🔒 Locked</span>}
+                            </div>
                             <div className="text-xs text-gray-500">
                               {account.type}
                               {account.credit_limit ? ` • Credit: ₹${account.credit_limit}` : ''}
                             </div>
                           </div>
                         </button>
-                      ))}
+                        );
+                      })}
                     </div>
                   )}
                   <p className="text-xs text-gray-500 mt-1">

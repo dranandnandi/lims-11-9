@@ -1,5 +1,7 @@
 import { createClient } from 'jsr:@supabase/supabase-js@2'
 import Anthropic from 'npm:@anthropic-ai/sdk'
+import { computeCalculatedResults } from './calculatedAnalytes.ts'
+import { normalizeUnitForCompare, quantityKind, quantityKindsConflict } from './quantityKind.ts'
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -182,6 +184,14 @@ function formatCalculatedResult(value: number): string {
   return rounded === '-0' ? '0' : rounded
 }
 
+// Fixed-precision variant of formatCalculatedResult. Keeps trailing zeros —
+// a 2 dp analyte should read "5.00", not "5" — but never emits "-0".
+function formatFixedResult(value: number, decimals: number): string {
+  if (!Number.isFinite(value)) return String(value)
+  const fixed = value.toFixed(decimals)
+  return Number(fixed) === 0 ? (0).toFixed(decimals) : fixed
+}
+
 function parseHl7Components(value: string | undefined): string[] {
   return String(value ?? '').split('^')
 }
@@ -200,6 +210,114 @@ function normalizeHl7Flag(value: string | undefined): string {
     .filter(Boolean)
   return components.find((component) => ['LL', 'HH', 'L', 'H', 'A', 'N'].includes(component))
     || 'N'
+}
+
+// --- Flag computed from the lab's SAVED reference range (never the machine's) ---
+// Ported from src/utils/flagDetermination.ts. Output vocabulary matches the HL7
+// flags this path already stores: 'N','H','L','HH','LL','A'. `flag_source` is
+// constrained (see 20260610_allow_analyzer_flag_source.sql), so computed flags
+// are tagged 'auto_numeric' (numeric result) or 'auto_text' (qualitative result).
+
+const SAVED_NORMAL_TEXT = [
+  /^negative$/i, /^non[\s-]?reactive$/i, /^normal$/i, /^nil$/i, /^absent$/i,
+  /^not[\s-]?detected$/i, /^nd$/i, /^none[\s-]?seen$/i, /^within[\s-]?normal[\s-]?limits$/i,
+  /^wnl$/i, /^clear$/i, /^no[\s-]?growth$/i, /^sterile$/i, /^unremarkable$/i,
+]
+const SAVED_ABNORMAL_TEXT = [
+  /^positive$/i, /^reactive$/i, /^detected$/i, /^present$/i, /^abnormal$/i, /^growth$/i,
+]
+
+function extractNumericValue(value: unknown): number | null {
+  if (value === null || value === undefined || value === '') return null
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null
+  const cleaned = String(value).replace(/,/g, '').replace(/[<>≤≥]/g, '').trim()
+  const match = cleaned.match(/^-?\d*\.?\d+/)
+  if (!match) return null
+  const num = parseFloat(match[0])
+  return Number.isNaN(num) ? null : num
+}
+
+function parseSavedReferenceRange(refRange: string | null | undefined): {
+  low: number | null; high: number | null; type: 'range' | 'less_than' | 'greater_than' | 'single' | 'none'
+} {
+  if (!refRange || typeof refRange !== 'string') return { low: null, high: null, type: 'none' }
+  const cleaned = refRange
+    .replace(/\([^)]*\)/g, '')       // drop parenthetical notes e.g. "(Optimal)"
+    .replace(/[a-zA-Z%\/]+/g, ' ')   // drop units e.g. mg/dL, U/L
+    .replace(/,/g, '')
+    .trim()
+  const lt = cleaned.match(/[<≤]\s*([\d.]+)/)
+  if (lt) return { low: null, high: parseFloat(lt[1]), type: 'less_than' }
+  const gt = cleaned.match(/[>≥]\s*([\d.]+)/)
+  if (gt) return { low: parseFloat(gt[1]), high: null, type: 'greater_than' }
+  const rng = cleaned.match(/([\d.]+)\s*[-–—~]+\s*([\d.]+)/)
+  if (rng) {
+    const a = parseFloat(rng[1]), b = parseFloat(rng[2])
+    return { low: Math.min(a, b), high: Math.max(a, b), type: 'range' }
+  }
+  const single = cleaned.match(/^([\d.]+)$/)
+  if (single) return { low: null, high: parseFloat(single[1]), type: 'single' }
+  return { low: null, high: null, type: 'none' }
+}
+
+// Determine the abnormal flag for a result value by comparing it against the
+// lab-saved reference range (and optional critical thresholds). Returns the flag
+// plus a constraint-valid flag_source. Falls back to 'N' when nothing is
+// parseable so a result is never dropped.
+function computeSavedFlag(
+  value: unknown,
+  refRange: string | null | undefined,
+  opts: {
+    lowCritical?: string | number | null
+    highCritical?: string | number | null
+    expectedNormalValues?: unknown
+    valueType?: string | null
+  } = {},
+): { flag: string; source: 'auto_numeric' | 'auto_text' } {
+  const raw = String(value ?? '').trim()
+  if (!raw) return { flag: 'N', source: 'auto_numeric' }
+
+  const num = extractNumericValue(raw)
+  const isQualitativeType = opts.valueType === 'qualitative'
+
+  if (num !== null && !isQualitativeType) {
+    const highCrit = extractNumericValue(opts.highCritical ?? null)
+    const lowCrit = extractNumericValue(opts.lowCritical ?? null)
+    if (highCrit !== null && num >= highCrit) return { flag: 'HH', source: 'auto_numeric' }
+    if (lowCrit !== null && num < lowCrit) return { flag: 'LL', source: 'auto_numeric' }
+
+    const { low, high, type } = parseSavedReferenceRange(refRange)
+    if (type === 'range' && low !== null && high !== null) {
+      if (num < low) return { flag: 'L', source: 'auto_numeric' }
+      if (num > high) return { flag: 'H', source: 'auto_numeric' }
+      return { flag: 'N', source: 'auto_numeric' }
+    }
+    if ((type === 'less_than' || type === 'single') && high !== null) {
+      return { flag: num > high ? 'H' : 'N', source: 'auto_numeric' }
+    }
+    if (type === 'greater_than' && low !== null) {
+      return { flag: num < low ? 'L' : 'N', source: 'auto_numeric' }
+    }
+    return { flag: 'N', source: 'auto_numeric' } // numeric value, no parseable range
+  }
+
+  // Qualitative / text result — compare against expected normal values or the
+  // reference-range text.
+  const lower = raw.toLowerCase()
+  const expected = Array.isArray(opts.expectedNormalValues)
+    ? opts.expectedNormalValues.map((v) => String(v).toLowerCase().trim()).filter(Boolean)
+    : []
+  if (expected.length > 0) {
+    return { flag: expected.includes(lower) ? 'N' : 'A', source: 'auto_text' }
+  }
+  const refLower = String(refRange ?? '').toLowerCase().trim()
+  if (refLower) {
+    const refIsText = SAVED_NORMAL_TEXT.some((p) => p.test(refLower)) || SAVED_ABNORMAL_TEXT.some((p) => p.test(refLower))
+    if (refIsText) return { flag: lower === refLower ? 'N' : 'A', source: 'auto_text' }
+  }
+  if (SAVED_NORMAL_TEXT.some((p) => p.test(lower))) return { flag: 'N', source: 'auto_text' }
+  if (SAVED_ABNORMAL_TEXT.some((p) => p.test(lower))) return { flag: 'A', source: 'auto_text' }
+  return { flag: 'N', source: 'auto_text' }
 }
 
 function normalizeAnalyzerValue(value: unknown): string | null {
@@ -527,6 +645,79 @@ async function getOrCreateSectionResult(
   return created
 }
 
+// Get-or-create ONE results header per test_group, mirroring the manual entry
+// path (save_result_entry_bulk). The UI matches each panel to its header by
+// results.test_group_id, so a multi-panel order needs one header per panel.
+// Analyzer results were previously dumped into a single 'Analyzer Result' header
+// tagged with one (dominant) group, so only that one panel ever displayed them.
+async function getOrCreateGroupResult(
+  supabase: any,
+  params: {
+    orderId: string
+    patientId: string
+    patientName: string
+    labId: string
+    testGroupId: string
+    testGroupName: string
+    orderTestGroupId: string | null
+    orderTestId: string | null
+  },
+): Promise<{ id: string } | null> {
+  // 1. Reuse an existing per-panel header (manual entry, or a prior analyzer run).
+  //    Match only on UUID columns — test_name can contain commas/parentheses that
+  //    would break a PostgREST .or() filter.
+  const orFilters: string[] = []
+  if (params.orderTestGroupId) orFilters.push(`order_test_group_id.eq.${params.orderTestGroupId}`)
+  if (params.orderTestId) orFilters.push(`order_test_id.eq.${params.orderTestId}`)
+  if (params.testGroupId) orFilters.push(`test_group_id.eq.${params.testGroupId}`)
+
+  if (orFilters.length > 0) {
+    const { data: existing } = await supabase
+      .from('results')
+      .select('id')
+      .eq('order_id', params.orderId)
+      .or(orFilters.join(','))
+      .limit(1)
+      .maybeSingle()
+    if (existing?.id) return existing
+  }
+
+  // 2. Create the panel header. On a (order_id, test_name) collision reuse the
+  //    existing row rather than overwrite it — never clobber a manual header.
+  const { data: created, error } = await supabase
+    .from('results')
+    .insert({
+      order_id: params.orderId,
+      patient_id: params.patientId,
+      patient_name: params.patientName,
+      lab_id: params.labId,
+      test_name: params.testGroupName,
+      test_group_id: params.testGroupId,
+      order_test_group_id: params.orderTestGroupId,
+      order_test_id: params.orderTestId,
+      status: 'Entered',
+      verification_status: 'pending_verification',
+      entered_by: 'AI Interface',
+      entered_date: new Date().toISOString().split('T')[0],
+    })
+    .select('id')
+    .single()
+
+  if (!error) return created
+  if (error.code === '23505') {
+    const { data: dup } = await supabase
+      .from('results')
+      .select('id')
+      .eq('order_id', params.orderId)
+      .eq('test_name', params.testGroupName)
+      .limit(1)
+      .maybeSingle()
+    return dup ?? null
+  }
+  console.error('Failed to create group result header:', error)
+  return null
+}
+
 async function upsertAnalyzerSectionContent(
   supabase: any,
   params: {
@@ -852,6 +1043,26 @@ async function resolveAiReferenceRanges(
   return resolvedByKey
 }
 
+// Pick the most barcode-like token from a set of candidate HL7 fields.
+// The sample ID sits in different OBR fields per analyzer: OBR-2 on Tulip
+// (OBR-3 is a bare counter like "1"), OBR-3 on FineCare (OBR-2 is an internal
+// cartridge ID like "F25715503"), OBR-18 on Peerless HA560. Matching a wrong or
+// trivial token against the wildcard sample lookup would attach results to an
+// arbitrary sample, so prefer a real LIS-barcode-shaped token.
+function pickSampleId(candidates: Array<string | undefined>): string {
+  const cleaned = candidates
+    .map((c) => firstComponent(c))
+    .map((c) => c.replace(/^["']+|["']+$/g, '').trim())
+    .filter((c) => c && !/^0+$/.test(c))
+  // 1. Prefer a numeric sample-barcode-shaped token. LIS barcodes here are
+  //    date-prefixed all-digit strings (e.g. 2607220002); this rejects both bare
+  //    counters ("1") and alpha-prefixed analyzer internal IDs ("F25715503").
+  const numeric = cleaned.find((c) => /^\d{6,}$/.test(c))
+  if (numeric) return numeric
+  // 2. Otherwise the first reasonably-long token (avoids counters like "1").
+  return cleaned.find((c) => c.length >= 3) || cleaned[0] || ''
+}
+
 function parseHl7ResultsDeterministic(rawContent: string): {
   sample_barcode: string
   results: Array<{ test_code: string; name: string; value: string; unit: string; flag: string; reference_range: string; value_type?: string }>
@@ -868,8 +1079,10 @@ function parseHl7ResultsDeterministic(rawContent: string): {
   for (const segment of segments) {
     const fields = segment.split('|')
     if (fields[0] === 'OBR') {
-      // Some analyzers (e.g. Peerless HA560) carry the sample ID in OBR-18 (Placer Field 1)
-      sampleBarcode = firstComponent(fields[3]) || firstComponent(fields[2]) || firstComponent(fields[18]) || sampleBarcode
+      // Sample ID placement varies by analyzer: OBR-2 (Placer, e.g. Tulip),
+      // OBR-3 (Filler), or OBR-18 (Placer Field 1, e.g. Peerless HA560). Prefer a
+      // real barcode-shaped token over an analyzer-assigned counter like "1".
+      sampleBarcode = pickSampleId([fields[2], fields[18], fields[3]]) || sampleBarcode
     } else if (fields[0] === 'ORC') {
       sampleBarcode = firstComponent(fields[2]) || sampleBarcode
     } else if (fields[0] === 'PID') {
@@ -886,9 +1099,24 @@ function parseHl7ResultsDeterministic(rawContent: string): {
 
     const valueType = String(fields[2] ?? '').trim().toUpperCase()
     const idParts = parseHl7Components(fields[3])
-    const testCode = (idParts[0] || '').trim()
-    const name = (idParts[1] || testCode).trim()
-    const value = String(fields[5] ?? '').trim()
+    let testCode = (idParts[0] || '').trim()
+    let name = (idParts[1] || testCode).trim()
+    let value = String(fields[5] ?? '').trim()
+
+    // Some analyzers (e.g. Tulip) put a placeholder in OBX-3 and the real analyte
+    // mnemonic in OBX-4 (Observation Sub-ID), e.g. OBX-3="0", OBX-4="IRON".
+    const subId = firstComponent(fields[4])
+    if ((!testCode || /^0+$/.test(testCode)) && /[A-Za-z]/.test(subId)) {
+      testCode = subId
+      name = subId
+    }
+
+    // Some analyzers (e.g. FineCare) embed the unit in the value field
+    // (OBX-5 = "5.71 ng/mL") while also sending it in OBX-6. For numeric results,
+    // keep just the leading number so the stored value is clean.
+    if (valueType === 'NM') {
+      value = value.replace(/^([+-]?\d*\.?\d+)\s+\S.*$/, '$1')
+    }
 
     if (!testCode) continue
 
@@ -916,6 +1144,75 @@ function parseHl7ResultsDeterministic(rawContent: string): {
 
   if (!sampleBarcode && results.length === 0) return null
   return { sample_barcode: sampleBarcode, results, instrument, graphs }
+}
+
+// Extract the human-readable assay name from an ASTM Universal Test ID.
+// Format is `^^^TT4 II` (components separated by ^); the assay name is the last
+// non-empty component.
+function astmTestName(universalTestId: string | undefined): string {
+  const parts = parseHl7Components(universalTestId)
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const part = parts[i]?.trim()
+    if (part) return part
+  }
+  return ''
+}
+
+// Deterministic parser for ASTM E1394 messages (Snibe Maglumi and similar).
+// Records are \r-delimited and typed by their first field: H(eader), P(atient),
+// O(rder), R(esult), L(erminator). Tolerates a stripped leading `H` on the
+// header — detection keys off the `R` result records, not the header.
+function parseAstmResultsDeterministic(rawContent: string): {
+  sample_barcode: string
+  results: Array<{ test_code: string; name: string; value: string; unit: string; flag: string; reference_range: string; value_type?: string }>
+  instrument: string
+  graphs: Array<{ type: string; name: string; test_code: string; description: string; associated_test: string }>
+} | null {
+  const segments = rawContent.split(/\r|\n/).map((s) => s.trim()).filter(Boolean)
+  if (!segments.some((s) => /^R\|\d+\|/.test(s))) return null
+
+  let sampleBarcode = ''
+  let instrument = ''
+  const results: Array<{ test_code: string; name: string; value: string; unit: string; flag: string; reference_range: string; value_type?: string }> = []
+
+  for (const segment of segments) {
+    const fields = segment.split('|')
+    const recordType = (fields[0] ?? '').trim().toUpperCase()
+
+    // Header record: proper `H` first field, or a header whose leading `H` was
+    // stripped by framing (identified by the ASTM delimiter-definition token).
+    if (recordType === 'H' || segment.startsWith('\\^&') || segment.startsWith('|\\^&')) {
+      // Sender/instrument name sits in the early sender fields (e.g. "Maglumi User").
+      instrument = fields[4]?.trim() || fields[3]?.trim() || instrument
+      continue
+    }
+
+    if (recordType === 'O') {
+      // O-3 = specimen/sample ID (the LIMS sample barcode).
+      sampleBarcode = firstComponent(fields[2]) || firstComponent(fields[3]) || sampleBarcode
+      continue
+    }
+
+    if (recordType === 'R') {
+      // R-3 = Universal Test ID, R-4 = value, R-5 = unit, R-6 = reference range,
+      // R-7 = abnormal flag.
+      const testCode = astmTestName(fields[2])
+      const value = String(fields[3] ?? '').trim()
+      if (!testCode) continue
+      results.push({
+        test_code: testCode,
+        name: testCode,
+        value,
+        unit: firstComponent(fields[4]),
+        reference_range: String(fields[5] ?? '').trim(),
+        flag: normalizeHl7Flag(fields[6]),
+        value_type: 'NM',
+      })
+    }
+  }
+
+  if (!sampleBarcode && results.length === 0) return null
+  return { sample_barcode: sampleBarcode, results, instrument, graphs: [] }
 }
 
 async function saveAnalyzerLearning(
@@ -952,6 +1249,101 @@ async function saveAnalyzerLearning(
     },
     confidence_score: 0.8,
   })
+}
+
+// Extract the message/run date from an HL7 (MSH-7 / OBR-7) or ASTM message.
+// Sample barcodes are date-prefixed (YYMMDDSSSS), so the run date is what lets us
+// scope a bare analyzer sequence ("9") to the correct day instead of matching an
+// arbitrary previous-day sample. Returns the 6-digit YYMMDD prefix, or null.
+function extractMessageDatePrefix(rawContent: string): string | null {
+  const segments = rawContent.split(/\r|\n/).map((s) => s.trim()).filter(Boolean)
+
+  const timestampCandidates: Array<string | undefined> = []
+  const msh = segments.find((s) => s.startsWith('MSH|'))?.split('|')
+  if (msh) timestampCandidates.push(msh[6]) // MSH-7 Date/Time Of Message
+  const obr = segments.find((s) => s.startsWith('OBR|'))?.split('|')
+  if (obr) timestampCandidates.push(obr[7]) // OBR-7 Observation Date/Time
+
+  for (const raw of timestampCandidates) {
+    const match = String(raw ?? '').trim().match(/^(\d{2})(\d{2})(\d{2})(\d{2})/)
+    // Matches YYYYMMDD (captures YY MM DD from the first 8 digits).
+    if (match) {
+      const [, , yy, mm, dd] = match
+      return `${yy}${mm}${dd}`
+    }
+  }
+  return null
+}
+
+// Resolve the analyzer's parsed sample barcode to an actual sample row, in
+// priority order so a bare operator-typed sequence never latches onto a stale
+// previous-day sample:
+//   1. Exact barcode match (analyzer sent the full LIS barcode).
+//   2. Bare sequence ("9","10"): reconstruct the date-prefixed barcode
+//      (YYMMDD + sequence) for the message's own day and match within that day.
+//   3. Last-resort wildcard, but ordered most-recent-first so a current sample
+//      always outranks an old one.
+async function findSampleForBarcode(
+  supabase: any,
+  labId: string,
+  barcode: string,
+  datePrefix: string | null,
+): Promise<{ sample: any; matchType: string } | null> {
+  const selectCols = 'id, order_id, lab_id, barcode, created_at'
+
+  // 1. Exact match.
+  const { data: exact } = await supabase
+    .from('samples')
+    .select(selectCols)
+    .eq('lab_id', labId)
+    .eq('barcode', barcode)
+    .order('created_at', { ascending: false })
+    .limit(1)
+  if (exact && exact.length > 0) return { sample: exact[0], matchType: 'exact' }
+
+  // 2. Bare sequence scoped to the message's day.
+  if (/^\d{1,4}$/.test(barcode) && datePrefix) {
+    const seq = parseInt(barcode, 10)
+
+    // 2a. Standard YYMMDDSSSS barcode (4-digit zero-padded sequence).
+    const candidate = `${datePrefix}${String(seq).padStart(4, '0')}`
+    const { data: reconstructed } = await supabase
+      .from('samples')
+      .select(selectCols)
+      .eq('lab_id', labId)
+      .eq('barcode', candidate)
+      .order('created_at', { ascending: false })
+      .limit(1)
+    if (reconstructed && reconstructed.length > 0) {
+      return { sample: reconstructed[0], matchType: 'same_day_sequence' }
+    }
+
+    // 2b. Same day, tolerating non-standard sequence widths/padding.
+    const { data: sameDay } = await supabase
+      .from('samples')
+      .select(selectCols)
+      .eq('lab_id', labId)
+      .like('barcode', `${datePrefix}%`)
+      .order('created_at', { ascending: false })
+      .limit(500)
+    const match = (sameDay ?? []).find((row: any) => {
+      const suffix = String(row.barcode ?? '').slice(datePrefix.length)
+      return /^\d+$/.test(suffix) && parseInt(suffix, 10) === seq
+    })
+    if (match) return { sample: match, matchType: 'same_day_sequence' }
+  }
+
+  // 3. Wildcard fallback (most recent first).
+  const { data: wildcard } = await supabase
+    .from('samples')
+    .select(selectCols)
+    .eq('lab_id', labId)
+    .ilike('barcode', `%${barcode}%`)
+    .order('created_at', { ascending: false })
+    .limit(1)
+  if (wildcard && wildcard.length > 0) return { sample: wildcard[0], matchType: 'wildcard' }
+
+  return null
 }
 
 // Helper to extract histogram/waveform numeric data
@@ -1002,10 +1394,16 @@ Deno.serve(async (req) => {
     const mshFields = String(record.raw_content).split(/\r|\n/).find((s) => s.startsWith('MSH|'))?.split('|') ?? []
     const hl7MessageType = mshFields[8] || record.message_type || ''
     const hasResultObx = /\r?OBX\|/i.test(record.raw_content)
+    // ASTM E1394 analyzers (e.g. Snibe Maglumi) carry results in `R` records, not
+    // HL7 OBX segments, and often have no MSH. Some framing strips the leading `H`
+    // of the header, so key off the result record itself: `R|<seq>|` at a line
+    // boundary. HL7 has no single-letter `R` segment, so this is unambiguous.
+    const hasAstmResult = /(^|[\r\n])R\|\d+\|/.test(record.raw_content)
     const isResultMessage =
       hl7MessageType.includes('ORU') ||
       hl7MessageType.includes('ASTM_RESULT') ||
-      hasResultObx
+      hasResultObx ||
+      hasAstmResult
 
     if (!isResultMessage) {
       await supabase
@@ -1035,6 +1433,21 @@ Deno.serve(async (req) => {
     const anthropic = new Anthropic({ apiKey: Deno.env.get('ANTHROPIC_API_KEY') || '' })
     const MODEL = 'claude-haiku-4-5-20251001'
 
+    // Per-connection toggle: derive reference range + flag from the lab's SAVED
+    // reference ranges instead of trusting the analyzer's OBX-7/OBX-8. Defaults ON;
+    // only an explicit `use_saved_reference_ranges: false` in the connection config
+    // reverts to storing the machine-provided range and flag.
+    let useSavedReferenceRanges = true
+    if (record.analyzer_connection_id) {
+      const { data: connRow } = await supabase
+        .from('analyzer_connections')
+        .select('config')
+        .eq('id', record.analyzer_connection_id)
+        .maybeSingle()
+      if (connRow?.config?.use_saved_reference_ranges === false) useSavedReferenceRanges = false
+    }
+    console.log(`DEBUG: use_saved_reference_ranges=${useSavedReferenceRanges} for connection ${record.analyzer_connection_id || 'none'}`)
+
     // 3a. Extract embedded images, waveform data, and Octer-stream histograms
     const embeddedImages = extractEmbeddedImages(record.raw_content);
     const waveformData = extractWaveformData(record.raw_content);
@@ -1060,9 +1473,18 @@ Deno.serve(async (req) => {
 
     console.log(`📊 Found ${embeddedImages.length} images, ${waveformData.length} waveforms, ${octerHistograms.length} Octer-stream histograms in analyzer data`);
 
-	    // 4. Parse results. Standard HL7 OBX messages are deterministic; AI is fallback.
+	    // 4. Parse results. Standard HL7 OBX and ASTM E1394 messages are deterministic;
+	    // AI is the fallback for formats neither handles.
 	    let parsedData = parseHl7ResultsDeterministic(record.raw_content)
 	    let parserUsed = parsedData ? 'deterministic_hl7_obx' : 'ai'
+
+	    if (!parsedData || !Array.isArray(parsedData.results) || parsedData.results.length === 0) {
+	      const astmParsed = parseAstmResultsDeterministic(record.raw_content)
+	      if (astmParsed && astmParsed.results.length > 0) {
+	        parsedData = astmParsed
+	        parserUsed = 'deterministic_astm'
+	      }
+	    }
 
 	    if (!parsedData || !Array.isArray(parsedData.results) || parsedData.results.length === 0) {
 	      parserUsed = 'ai'
@@ -1132,9 +1554,9 @@ Do NOT include or describe binary histogram data — it is already extracted sep
 	    }
 	    }
 
-	    if (parsedData && parserUsed === 'deterministic_hl7_obx') {
+	    if (parsedData && parserUsed.startsWith('deterministic')) {
 	      try {
-	        await saveAnalyzerLearning(supabase, record, parsedData, hl7MessageType || record.message_type || 'HL7')
+	        await saveAnalyzerLearning(supabase, record, parsedData, hl7MessageType || record.message_type || (parserUsed === 'deterministic_astm' ? 'ASTM' : 'HL7'))
 	      } catch (learningError) {
 	        console.warn('Analyzer knowledge save skipped:', learningError)
 	      }
@@ -1147,21 +1569,33 @@ Do NOT include or describe binary histogram data — it is already extracted sep
 	    // 5. Order Lookup & Insertion Logic
     let statusLog = "Parsed successfully. "
     let foundOrderId: string | null = null
+    // Surfaced on the raw message so a rejected row is visible in the UI instead
+    // of being buried in the free-text processing log.
+    const insertErrors: Array<{ analyzer_code: string | null; analyte_name: string | null; message: string }> = []
+    let calculatedSummary: {
+      inserted: number
+      skipped: Array<{ parameter: string; reason: string }>
+    } | null = null
     const barcode = String(parsedData.sample_barcode).trim()
 
-    // A. Find Sample (using robust WILDCARD search). An empty barcode must never
-    // reach the wildcard query — '%%' matches an arbitrary sample in the lab.
+    // A. Find Sample. Barcodes are date-prefixed (YYMMDDSSSS); the analyzer often
+    // sends only the bare operator-typed sequence ("9","10"), so match that day's
+    // sample first and only fall back to a recency-ordered wildcard. An empty
+    // barcode must never reach the wildcard query — '%%' matches any sample.
     let sample: any = null
     let sampleError: any = null
     if (barcode) {
-        const { data: sampleList, error: sampleLookupError } = await supabase
-            .from('samples')
-            .select('id, order_id, lab_id, barcode')
-            .eq('lab_id', record.lab_id)
-            .ilike('barcode', `%${barcode}%`)
-            .limit(1)
-        sample = sampleList && sampleList.length > 0 ? sampleList[0] : null
-        sampleError = sampleLookupError
+        const datePrefix = extractMessageDatePrefix(record.raw_content)
+        try {
+            const found = await findSampleForBarcode(supabase, record.lab_id, barcode, datePrefix)
+            sample = found?.sample ?? null
+            if (found) {
+                console.log(`🔎 Sample matched for barcode '${barcode}' via ${found.matchType} (barcode=${found.sample.barcode}, day=${datePrefix ?? 'unknown'})`)
+            }
+        } catch (lookupError) {
+            sampleError = lookupError
+            console.error('Sample lookup failed', lookupError)
+        }
     }
 
     if (sampleError || !sample) {
@@ -1176,7 +1610,7 @@ Do NOT include or describe binary histogram data — it is already extracted sep
         // Fetch Patient Details from Order (patient_name from orders, gender from patients join)
         const { data: orderData, error: orderError } = await supabase
             .from('orders')
-            .select('patient_id, patient_name, patients (gender)')
+            .select('patient_id, patient_name, patients (gender, age)')
             .eq('id', sample.order_id)
             .single()
 
@@ -1187,6 +1621,10 @@ Do NOT include or describe binary histogram data — it is already extracted sep
         const patientId = orderData?.patient_id
         // @ts-ignore
         const patientGender: string = (orderData as any)?.patients?.gender || ''
+        // Age feeds AGE-dependent formulas (eGFR and friends) when calculated
+        // analytes are evaluated below.
+        // @ts-ignore
+        const patientAge: number | null = (orderData as any)?.patients?.age ?? null
         const patientName = orderData?.patient_name || "Unknown Patient"
 
         if (patientId) {
@@ -1203,12 +1641,26 @@ Do NOT include or describe binary histogram data — it is already extracted sep
             }
         }
 
-        // Ensure master Result record exists
+        // Ensure master Result record exists. The results table has a UNIQUE
+        // (order_id, test_name) constraint, so a header may already exist for this
+        // order with a null/other sample_id (e.g. from an earlier run). Look it up
+        // by sample_id first, then fall back to the constraint key, and create via
+        // upsert so a concurrent/existing header is reused instead of colliding.
         let { data: resultHeader } = await supabase
             .from('results')
             .select('id, test_group_id')
             .eq('sample_id', sample.id)
             .maybeSingle()
+
+        if (!resultHeader) {
+            const { data: existingByOrder } = await supabase
+                .from('results')
+                .select('id, test_group_id')
+                .eq('order_id', sample.order_id)
+                .eq('test_name', 'Analyzer Result')
+                .maybeSingle()
+            resultHeader = existingByOrder ?? null
+        }
 
         if (!resultHeader) {
             if (!patientId) {
@@ -1217,7 +1669,7 @@ Do NOT include or describe binary histogram data — it is already extracted sep
             } else {
                 const { data: newResult, error: createError } = await supabase
                     .from('results')
-                    .insert({
+                    .upsert({
                         order_id: sample.order_id,
                         patient_id: patientId,
                         patient_name: patientName,
@@ -1226,8 +1678,8 @@ Do NOT include or describe binary histogram data — it is already extracted sep
                         test_name: 'Analyzer Result',
                         entered_by: 'AI Interface',
                         status: 'Entered',
-                    })
-                    .select()
+                    }, { onConflict: 'order_id,test_name' })
+                    .select('id, test_group_id')
                     .single()
 
                 if (createError) {
@@ -1246,6 +1698,73 @@ Do NOT include or describe binary histogram data — it is already extracted sep
                 .select('*')
                 .eq('order_id', sample.order_id)
 
+            // The view carries no unit / code / is_calculated, so every mapping
+            // path below was matching on names alone. Enrich the expected list
+            // once here: the unit tells a percentage analyte from a count
+            // analyte, and is_calculated marks analytes that must NEVER receive
+            // a machine value (they are derived from other analytes instead).
+            const expectedKey = (a: any) => String(a?.lab_analyte_id || a?.analyte_id || '')
+            const expectedMeta = new Map<string, { unit: string; code: string; is_calculated: boolean }>()
+            if (missingAnalytes && missingAnalytes.length > 0) {
+                const allExpectedAnalyteIds = [
+                    ...new Set(missingAnalytes.map((a: any) => a.analyte_id).filter(Boolean)),
+                ] as string[]
+
+                const [{ data: globalMetaRows }, { data: labMetaRows }] = await Promise.all([
+                    allExpectedAnalyteIds.length > 0
+                        ? supabase.from('analytes').select('id, code, unit, is_calculated').in('id', allExpectedAnalyteIds)
+                        : Promise.resolve({ data: [] }),
+                    allExpectedAnalyteIds.length > 0
+                        ? supabase
+                              .from('lab_analytes')
+                              .select('id, analyte_id, code, unit, lab_specific_unit, is_calculated')
+                              .eq('lab_id', sample.lab_id)
+                              .in('analyte_id', allExpectedAnalyteIds)
+                        : Promise.resolve({ data: [] }),
+                ])
+
+                const globalMetaById = new Map<string, any>()
+                for (const row of globalMetaRows ?? []) globalMetaById.set(row.id, row)
+                const labMetaById = new Map<string, any>()
+                const labMetaByAnalyteId = new Map<string, any>()
+                for (const row of labMetaRows ?? []) {
+                    labMetaById.set(row.id, row)
+                    if (!labMetaByAnalyteId.has(row.analyte_id)) labMetaByAnalyteId.set(row.analyte_id, row)
+                }
+
+                for (const a of missingAnalytes) {
+                    const lab = (a.lab_analyte_id ? labMetaById.get(a.lab_analyte_id) : null)
+                        ?? labMetaByAnalyteId.get(a.analyte_id)
+                        ?? null
+                    const global = globalMetaById.get(a.analyte_id) ?? null
+                    const meta = {
+                        unit: String(lab?.lab_specific_unit || lab?.unit || global?.unit || ''),
+                        code: String(lab?.code || global?.code || ''),
+                        is_calculated: (lab?.is_calculated ?? global?.is_calculated ?? false) === true,
+                    }
+                    expectedMeta.set(expectedKey(a), meta)
+                    // Secondary key: a mapping row may carry a lab_analyte_id the view
+                    // row did not, so keep an analyte_id entry to fall back on.
+                    if (a.analyte_id && !expectedMeta.has(String(a.analyte_id))) {
+                        expectedMeta.set(String(a.analyte_id), meta)
+                    }
+                }
+            }
+
+            // Machine values may only target non-calculated analytes.
+            const mappableAnalytes = (missingAnalytes ?? []).filter(
+                (a: any) => !expectedMeta.get(expectedKey(a))?.is_calculated,
+            )
+            const calculatedExpectedCount = (missingAnalytes?.length ?? 0) - mappableAnalytes.length
+            if (calculatedExpectedCount > 0) {
+                console.log(`DEBUG: Excluded ${calculatedExpectedCount} calculated analyte(s) from analyzer mapping targets`)
+            }
+
+            const expectedMetaFor = (mapping: any) =>
+                (mapping?.lab_analyte_id ? expectedMeta.get(String(mapping.lab_analyte_id)) : null)
+                ?? (mapping?.analyte_id ? expectedMeta.get(String(mapping.analyte_id)) : null)
+                ?? null
+
             if (!missingAnalytes || missingAnalytes.length === 0) {
                 statusLog += "No expected analytes found for this order. "
             } else {
@@ -1263,13 +1782,13 @@ Do NOT include or describe binary histogram data — it is already extracted sep
                 const machineCodes = clinicalResults
                     .map((r: any) => String(r.test_code ?? '').toUpperCase())
                     .filter(Boolean)
-                const expectedAnalyteIds = missingAnalytes
+                const expectedAnalyteIds = mappableAnalytes
                     .map((a: any) => a.analyte_id)
                     .filter(Boolean)
                 let deterministicMappingRows: any[] = []
 
                 // Collect lab_analyte_ids from missingAnalytes view
-                const expectedLabAnalyteIds = missingAnalytes
+                const expectedLabAnalyteIds = mappableAnalytes
                     .map((a: any) => a.lab_analyte_id)
                     .filter(Boolean)
 
@@ -1334,10 +1853,10 @@ Do NOT include or describe binary histogram data — it is already extracted sep
 
                     // Match by lab_analyte_id first, then analyte_id
                     let expected = row.lab_analyte_id
-                        ? missingAnalytes.find((a: any) => a.lab_analyte_id === row.lab_analyte_id)
+                        ? mappableAnalytes.find((a: any) => a.lab_analyte_id === row.lab_analyte_id)
                         : null
                     if (!expected && row.analyte_id) {
-                        expected = missingAnalytes.find((a: any) => a.analyte_id === row.analyte_id)
+                        expected = mappableAnalytes.find((a: any) => a.analyte_id === row.analyte_id)
                     }
                     if (!expected) continue
 
@@ -1353,6 +1872,76 @@ Do NOT include or describe binary histogram data — it is already extracted sep
                     })
                 }
 
+	                // Deterministic name/code fallback (runs before the AI mapper).
+	                // Analyzers routinely send a standard mnemonic in the OBX name
+	                // (e.g. "HGB", "RBC") even when OBX-3 carries a LOINC code
+	                // ("718-7"). Match that mnemonic — and the raw code — against each
+	                // expected analyte's name and code (global + lab-specific) so
+	                // obvious mappings never depend on the AI. Exact-token only, and
+	                // only when a single analyte matches, to avoid false positives.
+	                const preAiUnresolved = clinicalResults.filter((r: any) => {
+	                    const code = String(r.test_code ?? '').toUpperCase()
+	                    return code && !analyteMap.has(code)
+	                })
+	                if (preAiUnresolved.length > 0 && mappableAnalytes.length > 0) {
+	                    const expAnalyteIds = [...new Set(mappableAnalytes.map((a: any) => a.analyte_id).filter(Boolean))] as string[]
+	                    const expLabAnalyteIds = [...new Set(mappableAnalytes.map((a: any) => a.lab_analyte_id).filter(Boolean))] as string[]
+	                    const codesByAnalyteId = new Map<string, Set<string>>()
+	                    const addCode = (analyteId: string, code: unknown) => {
+	                        const key = normalizeAnalyteName(code)
+	                        if (!analyteId || !key) return
+	                        const set = codesByAnalyteId.get(analyteId) ?? new Set<string>()
+	                        set.add(key)
+	                        codesByAnalyteId.set(analyteId, set)
+	                    }
+	                    if (expAnalyteIds.length > 0) {
+	                        const { data: aRows } = await supabase.from('analytes').select('id, code').in('id', expAnalyteIds)
+	                        for (const a of aRows ?? []) addCode(a.id, a.code)
+	                    }
+	                    if (expLabAnalyteIds.length > 0) {
+	                        const { data: laRows } = await supabase.from('lab_analytes').select('id, analyte_id, code').in('id', expLabAnalyteIds)
+	                        for (const la of laRows ?? []) addCode(la.analyte_id, la.code)
+	                    }
+
+	                    const analyteCandidates = mappableAnalytes.map((a: any) => {
+	                        const tokens = new Set<string>()
+	                        const nameKey = normalizeAnalyteName(a.analyte_name)
+	                        if (nameKey) tokens.add(nameKey)
+	                        for (const code of codesByAnalyteId.get(a.analyte_id) ?? []) tokens.add(code)
+	                        const meta = expectedMeta.get(expectedKey(a))
+	                        return { expected: a, tokens, kind: quantityKind(a.analyte_name, meta?.unit) }
+	                    })
+
+	                    let deterministicNameMatches = 0
+	                    for (const r of preAiUnresolved) {
+	                        const realCode = String(r.test_code ?? '').toUpperCase()
+	                        if (!realCode || analyteMap.has(realCode)) continue
+	                        const machineTokens = [normalizeAnalyteName(r.name), normalizeAnalyteName(r.test_code)].filter(Boolean)
+	                        if (machineTokens.length === 0) continue
+	                        // normalizeAnalyteName() drops '%' and '#', so GRAN% and GRAN#
+	                        // produce the same token. Compare the quantity kind before
+	                        // accepting the match, or the count silently wins the race.
+	                        const machineKind = quantityKind(r.name || r.test_code, r.unit)
+	                        const matches = analyteCandidates
+	                            .filter((c) => machineTokens.some((t) => c.tokens.has(t)))
+	                            .filter((c) => !quantityKindsConflict(machineKind, c.kind))
+	                        if (matches.length !== 1) continue // skip ambiguous / no match → let AI decide
+	                        const hit = matches[0].expected
+	                        analyteMap.set(realCode, {
+	                            analyte_id: hit.analyte_id,
+	                            lab_analyte_id: hit.lab_analyte_id || null,
+	                            analyte_name: hit.analyte_name,
+	                            test_group_id: hit.test_group_id,
+	                            order_test_group_id: null,
+	                            order_test_id: hit.order_test_id,
+	                            confidence: 1.0,
+	                            mapping_source: 'deterministic_name_code',
+	                        })
+	                        deterministicNameMatches++
+	                    }
+	                    console.log(`DEBUG: Deterministic name/code fallback mapped ${deterministicNameMatches} analyte(s)`)
+	                }
+
 	                const unresolvedClinicalResults = clinicalResults.filter((r: any) => {
 	                    const code = String(r.test_code ?? '').toUpperCase()
 	                    return code && !analyteMap.has(code)
@@ -1367,15 +1956,33 @@ Output ONLY valid JSON. No markdown fences, no explanation.
 MACHINE RESULTS:
 ${JSON.stringify(unresolvedClinicalResults.map((r: any) => ({ test_code: r.test_code, name: r.name, value: r.value, unit: r.unit })), null, 2)}
 
-EXPECTED ANALYTES FOR THIS ORDER:
-${JSON.stringify(missingAnalytes.map(a => ({
-    analyte_id: a.analyte_id,
-    analyte_name: a.analyte_name,
-    test_group_id: a.test_group_id,
-    order_test_id: a.order_test_id
-})), null, 2)}
+EXPECTED ANALYTES FOR THIS ORDER (these are the ONLY valid targets):
+${JSON.stringify(mappableAnalytes.map(a => {
+    const meta = expectedMeta.get(expectedKey(a))
+    return {
+        analyte_id: a.analyte_id,
+        analyte_name: a.analyte_name,
+        analyte_code: meta?.code || null,
+        expected_unit: meta?.unit || null,
+        test_group_id: a.test_group_id,
+        order_test_id: a.order_test_id
+    }
+}), null, 2)}
 
 TASK: Map each machine result to the correct analyte_id from the expected list.
+"machine_code" MUST be copied VERBATIM from the machine result's "test_code"
+field (e.g. "6690-2"), NOT the name/mnemonic. The name is only a hint for matching.
+
+HARD RULES:
+1. A percentage and an absolute count are DIFFERENT parameters. "GRAN%" (unit %)
+   and "GRAN#" (unit 10*9/L) must never map to the same analyte. Match the
+   machine unit against expected_unit: a "%" result belongs only to a percentage
+   analyte, a count/concentration result only to a count analyte.
+2. Each expected analyte may be used AT MOST ONCE. If two machine results seem to
+   fit the same analyte, map only the one whose unit matches expected_unit.
+3. If a machine result has no correct target in the expected list, OMIT it. Do not
+   force it onto the nearest name — an unmapped result is fine, a wrong one is not.
+
 Consider common abbreviations:
 - WBC = White Blood Cell / Total White Blood Cell Count
 - RBC = Red Blood Cell Count
@@ -1385,12 +1992,14 @@ Consider common abbreviations:
 - MCV = Mean Corpuscular Volume
 - MCH = Mean Corpuscular Hemoglobin
 - MCHC = Mean Corpuscular Hemoglobin Concentration
+- GRAN/NEUT, LYM, MID/MONO carry a "%" or "#" suffix that decides rule 1
 
-OUTPUT ONLY valid JSON in this exact format (no markdown, no explanation):
+OUTPUT ONLY valid JSON in this exact format (no markdown, no explanation).
+Note machine_code is the exact test_code (here "6690-2"), even though the name is "WBC":
 {
   "mappings": [
     {
-      "machine_code": "WBC",
+      "machine_code": "6690-2",
       "analyte_id": "uuid-here",
       "analyte_name": "matched name",
       "test_group_id": "uuid-here",
@@ -1407,6 +2016,12 @@ OUTPUT ONLY valid JSON in this exact format (no markdown, no explanation):
                   messages: [{ role: 'user', content: mappingPrompt }]
                 })
                 const aiMappingText = (aiMappingResult.content[0] as { type: string; text: string }).text
+                console.log(`[analyzer-ai-mapping] raw_response ${JSON.stringify({
+                  raw_message_id: record.id,
+                  order_id: sample.order_id,
+                  unresolved_codes: unresolvedClinicalResults.map((r: any) => r.test_code),
+                  response: aiMappingText.slice(0, 2000),
+                })}`)
 
                 // Robust JSON extraction
                 const mappingJsonMatch = aiMappingText.match(/\{[\s\S]*\}/)
@@ -1421,25 +2036,54 @@ OUTPUT ONLY valid JSON in this exact format (no markdown, no explanation):
 	                }
 	                }
 
-                // Build lookup map from AI mappings
+                // Build lookup map from AI mappings.
+                // The AI may echo either the machine test_code ("6690-2") or the
+                // mnemonic name ("WBC") in machine_code, but the downstream lookup
+                // keys strictly on the result's test_code. Reconcile the AI's answer
+                // back to the original result (by test_code OR name) and key
+                // analyteMap by the REAL test_code so the mapping is never lost.
                 if (aiMappings.mappings && Array.isArray(aiMappings.mappings)) {
-                    for (const mapping of aiMappings.mappings) {
-                        if (mapping.machine_code && mapping.analyte_id) {
-                            const machineCode = mapping.machine_code.toUpperCase()
-                            if (analyteMap.has(machineCode)) continue
-                            // Resolve lab_analyte_id from missingAnalytes
-                            const expectedForAi = missingAnalytes.find((a: any) => a.analyte_id === mapping.analyte_id)
-                            analyteMap.set(machineCode, {
-                                analyte_id: mapping.analyte_id,
-                                lab_analyte_id: expectedForAi?.lab_analyte_id || null,
-                                analyte_name: mapping.analyte_name,
-                                test_group_id: mapping.test_group_id,
-                                order_test_group_id: null,
-                                order_test_id: mapping.order_test_id,
-                                confidence: mapping.confidence || 0.8,
-                                mapping_source: 'ai'
-                            })
+                    const realCodeByToken = new Map<string, string>() // normalized token -> real test_code
+                    for (const r of unresolvedClinicalResults) {
+                        const realCode = String(r.test_code ?? '').toUpperCase()
+                        if (!realCode) continue
+                        for (const token of [r.test_code, r.name]) {
+                            const key = normalizeAnalyteName(token)
+                            if (key && !realCodeByToken.has(key)) realCodeByToken.set(key, realCode)
                         }
+                    }
+
+                    for (const mapping of aiMappings.mappings) {
+                        if (!mapping.machine_code || !mapping.analyte_id) continue
+                        const realCode =
+                            realCodeByToken.get(normalizeAnalyteName(mapping.machine_code)) ||
+                            String(mapping.machine_code).toUpperCase()
+                        if (analyteMap.has(realCode)) continue
+                        // Resolve lab_analyte_id from the mappable (non-calculated) list.
+                        // A machine value must never be written to a formula analyte,
+                        // even if the model suggests one.
+                        const expectedForAi = mappableAnalytes.find((a: any) => a.analyte_id === mapping.analyte_id)
+                        if (!expectedForAi) {
+                            console.log(`[analyzer-ai-mapping] rejected_target ${JSON.stringify({
+                              raw_message_id: record.id,
+                              order_id: sample.order_id,
+                              machine_code: realCode,
+                              analyte_id: mapping.analyte_id,
+                              reason: 'not a mappable expected analyte (calculated or not in order)',
+                            })}`)
+                            continue
+                        }
+                        analyteMap.set(realCode, {
+                            analyte_id: mapping.analyte_id,
+                            lab_analyte_id: expectedForAi.lab_analyte_id || null,
+                            // Trust the order for identity/routing; the model only picks the target.
+                            analyte_name: expectedForAi.analyte_name || mapping.analyte_name,
+                            test_group_id: expectedForAi.test_group_id || mapping.test_group_id,
+                            order_test_group_id: null,
+                            order_test_id: expectedForAi.order_test_id || mapping.order_test_id,
+                            confidence: mapping.confidence || 0.8,
+                            mapping_source: 'ai'
+                        })
                     }
                 }
 
@@ -1570,22 +2214,48 @@ OUTPUT ONLY valid JSON in this exact format (no markdown, no explanation):
                     console.log(`DEBUG: Enriched ${analyteToOTG.size} analytes with order_test_group_id/order_test_id`)
                 }
 
-                // Backfill test_group_id on the results row so v_result_panel_status can see it.
-                // Pick the most-common test_group_id among mapped analytes.
-                if (!resultHeader.test_group_id) {
-                    const tgIds = Array.from(analyteMap.values())
-                        .map((m: any) => m.test_group_id)
-                        .filter(Boolean) as string[]
-                    if (tgIds.length > 0) {
-                        const freq = new Map<string, number>()
-                        for (const id of tgIds) freq.set(id, (freq.get(id) ?? 0) + 1)
-                        const dominantTgId = [...freq.entries()].sort((a, b) => b[1] - a[1])[0][0]
-                        await supabase.from('results')
-                            .update({ test_group_id: dominantTgId })
-                            .eq('id', resultHeader.id)
-                        resultHeader.test_group_id = dominantTgId
-                        console.log(`DEBUG: Set results.test_group_id = ${dominantTgId}`)
+                // Route each value to a results header for ITS OWN test_group,
+                // exactly like manual entry (one header per panel). The single
+                // 'Analyzer Result' header (resultHeader) stays as a fallback only
+                // for values that carry no test_group_id; it is left untagged so it
+                // never competes with a real panel header in v_result_panel_status.
+                const testGroupNameById = new Map<string, string>()
+                {
+                    const allTgIds = [...new Set(
+                        (missingAnalytes ?? []).map((a: any) => a.test_group_id).filter(Boolean),
+                    )] as string[]
+                    if (allTgIds.length > 0) {
+                        const { data: tgRows } = await supabase
+                            .from('test_groups')
+                            .select('id, name')
+                            .in('id', allTgIds)
+                        for (const tg of tgRows ?? []) testGroupNameById.set(tg.id, tg.name)
                     }
+                }
+
+                const groupHeaderCache = new Map<string, string | null>()
+                const resolveGroupHeaderId = async (
+                    tgId: string | null | undefined,
+                    otgId: string | null | undefined,
+                    otId: string | null | undefined,
+                ): Promise<string> => {
+                    const key = String(tgId ?? '')
+                    if (!key) return resultHeader.id // no group → generic fallback header
+                    if (groupHeaderCache.has(key)) {
+                        return groupHeaderCache.get(key) ?? resultHeader.id
+                    }
+                    const header = await getOrCreateGroupResult(supabase, {
+                        orderId: sample.order_id,
+                        patientId,
+                        patientName,
+                        labId: sample.lab_id,
+                        testGroupId: key,
+                        testGroupName: testGroupNameById.get(key) || 'Analyzer Result',
+                        orderTestGroupId: otgId ?? null,
+                        orderTestId: otId ?? null,
+                    })
+                    groupHeaderCache.set(key, header?.id ?? null)
+                    return header?.id ?? resultHeader.id
                 }
 
             // D. Insert Result Values with Context
@@ -1619,6 +2289,7 @@ OUTPUT ONLY valid JSON in this exact format (no markdown, no explanation):
               multiply_by: number; add_offset: number;
               dilution_factor: number; dilution_mode: string;
               lims_unit: string | null; auto_verify: boolean;
+              decimal_places: number | null;
               analyzer_connection_id: string | null
             }>() // lab_analyte_id → config
             const allLabAnalyteIds = [
@@ -1627,7 +2298,7 @@ OUTPUT ONLY valid JSON in this exact format (no markdown, no explanation):
             if (allLabAnalyteIds.length > 0) {
               const { data: configRows } = await supabase
                 .from('lab_analyte_interface_config')
-                .select('lab_analyte_id, analyzer_connection_id, multiply_by, add_offset, dilution_factor, dilution_mode, lims_unit, auto_verify')
+                .select('lab_analyte_id, analyzer_connection_id, multiply_by, add_offset, dilution_factor, dilution_mode, lims_unit, auto_verify, decimal_places')
                 .eq('lab_id', sample.lab_id)
                 .in('lab_analyte_id', allLabAnalyteIds)
               if (configRows) {
@@ -1645,6 +2316,7 @@ OUTPUT ONLY valid JSON in this exact format (no markdown, no explanation):
                     dilution_mode: String(cfg.dilution_mode ?? 'auto'),
                     lims_unit:   cfg.lims_unit ?? null,
                     auto_verify: cfg.auto_verify ?? false,
+                    decimal_places: cfg.decimal_places == null ? null : Number(cfg.decimal_places),
                     analyzer_connection_id: cfg.analyzer_connection_id ?? null,
                   })
                 }
@@ -1655,12 +2327,14 @@ OUTPUT ONLY valid JSON in this exact format (no markdown, no explanation):
             // Batch-fetch reference ranges from lab_analytes
             const refRangeMap = new Map<string, {
               lab_specific: string | null; ref_generic: string | null;
-              ref_male: string | null; ref_female: string | null
+              ref_male: string | null; ref_female: string | null;
+              low_critical: string | null; high_critical: string | null;
+              value_type: string | null; expected_normal_values: unknown
             }>()
             if (allLabAnalyteIds.length > 0) {
               const { data: refRows } = await supabase
                 .from('lab_analytes')
-                .select('id, reference_range, reference_range_male, reference_range_female, lab_specific_reference_range')
+                .select('id, reference_range, reference_range_male, reference_range_female, lab_specific_reference_range, low_critical, high_critical, value_type, expected_normal_values')
                 .eq('lab_id', sample.lab_id)
                 .in('id', allLabAnalyteIds)
               if (refRows) {
@@ -1670,6 +2344,10 @@ OUTPUT ONLY valid JSON in this exact format (no markdown, no explanation):
                     ref_generic:  la.reference_range || null,
                     ref_male:     la.reference_range_male || null,
                     ref_female:   la.reference_range_female || null,
+                    low_critical: la.low_critical || null,
+                    high_critical: la.high_critical || null,
+                    value_type: la.value_type || null,
+                    expected_normal_values: la.expected_normal_values ?? null,
                   })
                 }
                 console.log(`DEBUG: Loaded reference ranges for ${refRangeMap.size} lab_analytes`)
@@ -1685,6 +2363,8 @@ OUTPUT ONLY valid JSON in this exact format (no markdown, no explanation):
               finalUnit: string
               verifyStatus: string
               fallbackReferenceRange: string
+              analyteKey: string
+              matchScore: number
             }> = []
 
             for (const item of parsedData.results) {
@@ -1712,6 +2392,30 @@ OUTPUT ONLY valid JSON in this exact format (no markdown, no explanation):
                     continue
                 }
 
+                // A count must never be stored in a percentage analyte (or the
+                // reverse). This is what let GRAN# (6.2, 10*9/L) land on
+                // "Granulocyte Percentage" and push out the real GRAN% (68.5 %).
+                const expectedForCode = expectedMetaFor(mapping)
+                const machineKind = quantityKind(item.name || item.test_code, item.unit)
+                const analyteKind = quantityKind(mapping.analyte_name, expectedForCode?.unit)
+                if (quantityKindsConflict(machineKind, analyteKind)) {
+                    console.log(`[analyzer-result] rejected_kind_mismatch ${JSON.stringify({
+                      raw_message_id: record.id,
+                      order_id: sample.order_id,
+                      analyzer_code: item.test_code || null,
+                      analyzer_name: item.name || null,
+                      analyzer_unit: item.unit || null,
+                      analyte_name: mapping.analyte_name,
+                      analyte_unit: expectedForCode?.unit || null,
+                      machine_kind: machineKind,
+                      analyte_kind: analyteKind,
+                      mapping_source: mapping.mapping_source || null,
+                    })}`)
+                    statusLog += `Rejected ${item.test_code} → ${mapping.analyte_name} (${machineKind} value into ${analyteKind} analyte). `
+                    unmappedCount++
+                    continue
+                }
+
                 // Use mapped name
                 const finalParamName = mapping.analyte_name
 
@@ -1732,23 +2436,74 @@ OUTPUT ONLY valid JSON in this exact format (no markdown, no explanation):
                       ? Math.max(1, ifCfg.dilution_factor || 1)
                       : 1
                     const converted = (raw * dilutionFactor * ifCfg.multiply_by) + ifCfg.add_offset
-                    finalValue = formatCalculatedResult(converted)
+                    // decimal_places pins the precision after conversion — counts
+                    // such as Platelets or TLC are reported as whole numbers even
+                    // though the analyzer sends a fractional part.
+                    finalValue = ifCfg.decimal_places == null
+                      ? formatCalculatedResult(converted)
+                      : formatFixedResult(converted, ifCfg.decimal_places)
                   }
                   if (ifCfg.lims_unit) finalUnit = ifCfg.lims_unit
                   if (ifCfg.auto_verify)  verifyStatus = 'approved'
                   console.log(`DEBUG: Conversion applied to ${item.test_code}: ${item.value}${item.unit} → ${finalValue}${finalUnit}`)
                 }
 
+                // The analyzer's unit is kept as-is: relabelling a number with the
+                // lab's configured unit without a conversion would mislabel it.
+                // Fill in only when the machine sent none, and report a genuine
+                // disagreement so the lab can add a lab_analyte_interface_config.
+                if (!finalUnit && expectedForCode?.unit) {
+                  finalUnit = expectedForCode.unit
+                } else if (
+                  !ifCfg?.lims_unit &&
+                  finalUnit &&
+                  expectedForCode?.unit &&
+                  normalizeUnitForCompare(finalUnit) !== normalizeUnitForCompare(expectedForCode.unit)
+                ) {
+                  console.log(`[analyzer-result] unit_mismatch ${JSON.stringify({
+                    raw_message_id: record.id,
+                    order_id: sample.order_id,
+                    analyzer_code: item.test_code || null,
+                    analyte_name: mapping.analyte_name,
+                    analyzer_unit: finalUnit,
+                    configured_unit: expectedForCode.unit,
+                    note: 'stored the analyzer unit; configure a unit conversion to normalise',
+                  })}`)
+                }
+
                 const rr = labAnalyteId ? refRangeMap.get(labAnalyteId) : null
                 const isMale = patientGender?.toLowerCase().startsWith('m')
                 const isFemale = patientGender?.toLowerCase().startsWith('f')
-                const fallbackReferenceRange =
+                const savedReferenceRange =
                   rr?.lab_specific ||
                   (isMale ? rr?.ref_male : null) ||
                   (isFemale ? rr?.ref_female : null) ||
-                  item.reference_range ||
                   rr?.ref_generic ||
-                  '-'
+                  null
+                // With the toggle on, the lab's saved range wins and the machine's
+                // range (item.reference_range) is only a last resort when the lab
+                // has none. With it off, preserve the prior machine-first behaviour.
+                const fallbackReferenceRange = useSavedReferenceRanges
+                  ? (savedReferenceRange || item.reference_range || '-')
+                  : (rr?.lab_specific ||
+                     (isMale ? rr?.ref_male : null) ||
+                     (isFemale ? rr?.ref_female : null) ||
+                     item.reference_range ||
+                     rr?.ref_generic ||
+                     '-')
+
+                // How well this machine result fits the analyte it claims — used
+                // only to settle collisions between two codes wanting one analyte.
+                const expectedUnit = normalizeUnitForCompare(expectedForCode?.unit)
+                const machineUnit = normalizeUnitForCompare(finalUnit)
+                const sourcePriority =
+                  mapping.mapping_source === 'test_mappings' ? 20 :
+                  mapping.mapping_source === 'deterministic_name_code' ? 10 : 0
+                const matchScore =
+                  (expectedUnit && machineUnit && expectedUnit === machineUnit ? 100 : 0) +
+                  (machineKind !== 'unknown' && machineKind === analyteKind ? 50 : 0) +
+                  sourcePriority +
+                  Number(mapping.confidence ?? 0) * 5
 
                 mappedCandidates.push({
                   item,
@@ -1759,11 +2514,46 @@ OUTPUT ONLY valid JSON in this exact format (no markdown, no explanation):
                   finalUnit,
                   verifyStatus,
                   fallbackReferenceRange,
+                  analyteKey: String(labAnalyteId || mapping.analyte_id),
+                  matchScore,
                 })
             }
 
+            // result_values holds one row per analyte (uq_rv_result_analyte). Two
+            // machine codes resolving to the same analyte used to be decided by
+            // message order: the first insert won, the second failed with a
+            // duplicate-key error that was only appended to the log. Settle it
+            // here on match quality instead, and report what was dropped.
+            const bestCandidateByAnalyte = new Map<string, typeof mappedCandidates[number]>()
+            for (const candidate of mappedCandidates) {
+              const current = bestCandidateByAnalyte.get(candidate.analyteKey)
+              if (!current || candidate.matchScore > current.matchScore) {
+                bestCandidateByAnalyte.set(candidate.analyteKey, candidate)
+              }
+            }
+            const resolvedCandidates = mappedCandidates.filter(
+              (candidate) => bestCandidateByAnalyte.get(candidate.analyteKey) === candidate,
+            )
+            for (const candidate of mappedCandidates) {
+              const winner = bestCandidateByAnalyte.get(candidate.analyteKey)
+              if (winner === candidate) continue
+              console.log(`[analyzer-result] dropped_duplicate_target ${JSON.stringify({
+                raw_message_id: record.id,
+                order_id: sample.order_id,
+                analyte_name: candidate.finalParamName,
+                dropped_code: candidate.item.test_code || null,
+                dropped_unit: candidate.finalUnit || null,
+                dropped_score: candidate.matchScore,
+                kept_code: winner?.item.test_code || null,
+                kept_unit: winner?.finalUnit || null,
+                kept_score: winner?.matchScore ?? null,
+              })}`)
+              statusLog += `Dropped ${candidate.item.test_code} → ${candidate.finalParamName} (kept ${winner?.item.test_code}). `
+              unmappedCount++
+            }
+
             const candidateTestGroupIds = [
-              ...new Set(mappedCandidates.map((candidate) => candidate.mapping.test_group_id).filter(Boolean)),
+              ...new Set(resolvedCandidates.map((candidate) => candidate.mapping.test_group_id).filter(Boolean)),
             ] as string[]
             const aiEnabledTestGroupIds = new Set<string>()
             if (candidateTestGroupIds.length > 0) {
@@ -1784,14 +2574,14 @@ OUTPUT ONLY valid JSON in this exact format (no markdown, no explanation):
             logAiRefRange('configuration_evaluated', {
               order_id: sample.order_id,
               raw_message_id: record.id,
-              candidate_count: mappedCandidates.length,
+              candidate_count: resolvedCandidates.length,
               candidate_test_group_ids: candidateTestGroupIds,
               enabled_test_group_ids: [...aiEnabledTestGroupIds],
             })
 
             const aiResolvedRanges = await resolveAiReferenceRanges(
               sample.order_id,
-              mappedCandidates
+              resolvedCandidates
                 .filter((candidate) => aiEnabledTestGroupIds.has(candidate.mapping.test_group_id))
                 .map((candidate) => ({
                   analyte_id: candidate.mapping.analyte_id,
@@ -1803,7 +2593,7 @@ OUTPUT ONLY valid JSON in this exact format (no markdown, no explanation):
                 })),
             )
 
-            for (const candidate of mappedCandidates) {
+            for (const candidate of resolvedCandidates) {
                 const {
                   item,
                   mapping,
@@ -1817,8 +2607,27 @@ OUTPUT ONLY valid JSON in this exact format (no markdown, no explanation):
                 const aiResolution = mapping.test_group_id
                   ? aiResolvedRanges.get(`${mapping.test_group_id}:${labAnalyteId || mapping.analyte_id}`)
                   : null
-                const finalFlag = aiResolution?.flag || normalizeHl7Flag(item.flag)
                 const finalReferenceRange = aiResolution?.used_reference_range || fallbackReferenceRange
+
+                // Flag: with the toggle on, compute it from the value vs. the
+                // resolved (saved/AI) reference range — never from the analyzer's
+                // OBX-8. With it off, keep the machine (or AI) flag as before.
+                const rrMeta = labAnalyteId ? refRangeMap.get(labAnalyteId) : null
+                let finalFlag: string
+                let finalFlagSource: string
+                if (useSavedReferenceRanges) {
+                  const computed = computeSavedFlag(finalValue, finalReferenceRange, {
+                    lowCritical: rrMeta?.low_critical,
+                    highCritical: rrMeta?.high_critical,
+                    expectedNormalValues: rrMeta?.expected_normal_values,
+                    valueType: rrMeta?.value_type,
+                  })
+                  finalFlag = computed.flag
+                  finalFlagSource = computed.source
+                } else {
+                  finalFlag = aiResolution?.flag || normalizeHl7Flag(item.flag)
+                  finalFlagSource = aiResolution ? 'ai' : 'analyzer'
+                }
                 const fallbackReason = aiResolution
                   ? null
                   : !mapping.test_group_id
@@ -1833,14 +2642,18 @@ OUTPUT ONLY valid JSON in this exact format (no markdown, no explanation):
                   test_group_id: mapping.test_group_id || null,
                   analyte_id: mapping.analyte_id,
                   analyzer_code: item.test_code || null,
-                  range_source: aiResolution ? 'ai' : 'analyzer_or_lab',
+                  range_source: aiResolution ? 'ai' : (useSavedReferenceRanges ? 'lab_saved' : 'analyzer_or_lab'),
+                  flag_source: finalFlagSource,
                   fallback_reason: fallbackReason,
                   reference_range: finalReferenceRange,
                   flag: finalFlag,
                 })
 
+                const valueResultId = await resolveGroupHeaderId(
+                    mapping.test_group_id, mapping.order_test_group_id, mapping.order_test_id,
+                )
                 const { error: valError } = await supabase.from('result_values').insert({
-                    result_id: resultHeader.id,
+                    result_id: valueResultId,
                     analyte_id: mapping.analyte_id,
                     lab_analyte_id: labAnalyteId,
                     parameter: finalParamName,
@@ -1852,7 +2665,7 @@ OUTPUT ONLY valid JSON in this exact format (no markdown, no explanation):
                     reference_range_male: labAnalyteId ? (refRangeMap.get(labAnalyteId)?.ref_male ?? null) : null,
                     reference_range_female: labAnalyteId ? (refRangeMap.get(labAnalyteId)?.ref_female ?? null) : null,
                     extracted_by_ai: true,
-                    flag_source: aiResolution ? 'ai' : 'analyzer',
+                    flag_source: finalFlagSource,
                     verify_status: verifyStatus,
                     order_id: sample.order_id,
                     test_group_id: mapping.test_group_id,
@@ -1864,11 +2677,147 @@ OUTPUT ONLY valid JSON in this exact format (no markdown, no explanation):
                 if (valError) {
                     console.error(`Failed to insert result value for ${item.test_code}`, valError)
                     statusLog += `Error inserting ${item.test_code}: ${valError.message}. `
+                    insertErrors.push({
+                      analyzer_code: item.test_code ?? null,
+                      analyte_name: finalParamName ?? null,
+                      message: valError.message,
+                    })
                 } else {
                     mappedCount++
                 }
             }
             statusLog += `Mapped ${mappedCount} analytes. `
+
+            // E. Materialise calculated (formula) analytes.
+            // Formulas used to run only in the browser (src/utils/calculationEngine.ts
+            // on the entry screen, recalculatePanel on rows that already exist), so an
+            // order filled entirely by the analyzer produced no result_values row for
+            // its calculated parameters at all — nothing for the verification console
+            // to show, and the order never read as complete. Evaluate them here from
+            // the values just stored.
+            if (mappedCount > 0) {
+                try {
+                    const { data: savedValues } = await supabase
+                        .from('result_values')
+                        .select('analyte_id, lab_analyte_id, parameter, value, test_group_id')
+                        .eq('order_id', sample.order_id)
+
+                    // uq_rv_result_analyte is keyed on the analyte, so that is the
+                    // guard against recomputing something already stored.
+                    const alreadyStored = new Set(
+                        (savedValues ?? []).map((rv: any) => String(rv.analyte_id)).filter(Boolean),
+                    )
+                    const sourceValues = (savedValues ?? [])
+                        .filter((rv: any) => rv.value !== null && String(rv.value).trim() !== '')
+                        .map((rv: any) => ({
+                            analyte_id: rv.analyte_id,
+                            lab_analyte_id: rv.lab_analyte_id,
+                            parameter: rv.parameter,
+                            value: String(rv.value),
+                        }))
+
+                    const calcTestGroupIds = [...new Set([
+                        ...(missingAnalytes ?? []).map((a: any) => a.test_group_id),
+                        ...(savedValues ?? []).map((rv: any) => rv.test_group_id),
+                    ].filter(Boolean))] as string[]
+
+                    const { results: calcResults, skipped: calcSkipped } = await computeCalculatedResults(supabase, {
+                        labId: sample.lab_id,
+                        testGroupIds: calcTestGroupIds,
+                        sourceValues,
+                        patient: { age: patientAge, gender: patientGender },
+                    })
+
+                    // Routing (order_test_group_id / order_test_id) for the calculated
+                    // analytes comes from the order's own expected-analyte rows.
+                    const routingByAnalyte = new Map<string, any>()
+                    for (const a of missingAnalytes ?? []) {
+                        if (a.lab_analyte_id && !routingByAnalyte.has(String(a.lab_analyte_id))) {
+                            routingByAnalyte.set(String(a.lab_analyte_id), a)
+                        }
+                        if (a.analyte_id && !routingByAnalyte.has(String(a.analyte_id))) {
+                            routingByAnalyte.set(String(a.analyte_id), a)
+                        }
+                    }
+
+                    let calcInserted = 0
+                    for (const calc of calcResults) {
+                        if (alreadyStored.has(String(calc.analyte_id))) continue
+
+                        const routing =
+                            (calc.lab_analyte_id ? routingByAnalyte.get(String(calc.lab_analyte_id)) : null)
+                            ?? routingByAnalyte.get(String(calc.analyte_id))
+                            ?? null
+                        const computedFlag = computeSavedFlag(calc.value, calc.reference_range, {
+                            lowCritical: calc.low_critical,
+                            highCritical: calc.high_critical,
+                            expectedNormalValues: calc.expected_normal_values,
+                            valueType: calc.value_type,
+                        })
+
+                        const calcResultId = await resolveGroupHeaderId(
+                            routing?.test_group_id || calc.test_group_id,
+                            routing?.order_test_group_id,
+                            routing?.order_test_id,
+                        )
+                        const { error: calcError } = await supabase.from('result_values').insert({
+                            result_id: calcResultId,
+                            analyte_id: calc.analyte_id,
+                            lab_analyte_id: calc.lab_analyte_id,
+                            parameter: calc.parameter,
+                            analyte_name: calc.parameter,
+                            value: calc.value,
+                            unit: calc.unit || '',
+                            flag: computedFlag.flag,
+                            flag_source: computedFlag.source,
+                            reference_range: calc.reference_range || '-',
+                            is_auto_calculated: true,
+                            calculation_inputs: calc.calculation_inputs,
+                            calculated_at: new Date().toISOString(),
+                            verify_status: 'pending',
+                            order_id: sample.order_id,
+                            test_group_id: routing?.test_group_id || calc.test_group_id,
+                            order_test_group_id: routing?.order_test_group_id ?? null,
+                            order_test_id: routing?.order_test_id ?? null,
+                            lab_id: sample.lab_id,
+                        })
+
+                        if (calcError) {
+                            console.error(`Failed to insert calculated value for ${calc.parameter}`, calcError)
+                            statusLog += `Error inserting calculated ${calc.parameter}: ${calcError.message}. `
+                            insertErrors.push({
+                                analyzer_code: null,
+                                analyte_name: calc.parameter,
+                                message: calcError.message,
+                            })
+                        } else {
+                            calcInserted++
+                        }
+                    }
+
+                    calculatedSummary = {
+                        inserted: calcInserted,
+                        skipped: calcSkipped.map((s) => ({ parameter: s.parameter, reason: s.reason })),
+                    }
+                    if (calcInserted > 0 || calcSkipped.length > 0) {
+                        statusLog += `Calculated ${calcInserted} analyte(s)`
+                        if (calcSkipped.length > 0) {
+                            statusLog += `, skipped ${calcSkipped.length} (${calcSkipped.map((s) => `${s.parameter}: ${s.reason}`).join('; ')})`
+                        }
+                        statusLog += '. '
+                    }
+                    console.log(`[analyzer-result] calculated_analytes ${JSON.stringify({
+                        raw_message_id: record.id,
+                        order_id: sample.order_id,
+                        inserted: calcInserted,
+                        skipped: calcSkipped,
+                    })}`)
+                } catch (calcErr: any) {
+                    // A formula problem must never fail the machine results already stored.
+                    console.error('Calculated analyte evaluation failed', calcErr)
+                    statusLog += `Calculated analyte evaluation failed: ${calcErr?.message ?? calcErr}. `
+                }
+            }
 
             // Mark order queue entry as completed now that results are stored
             if (mappedCount > 0) {
@@ -1879,7 +2828,7 @@ OUTPUT ONLY valid JSON in this exact format (no markdown, no explanation):
                     .in('status', ['acknowledged', 'sent'])
             }
 
-            // E. Save decoded histograms to analyzer_graphs table
+            // F. Save decoded histograms to analyzer_graphs table
             if (octerHistograms.length > 0) {
                 statusLog += `Saving ${octerHistograms.length} histograms. `
 
@@ -1928,7 +2877,11 @@ OUTPUT ONLY valid JSON in this exact format (no markdown, no explanation):
       extracted_images: embeddedImages.length,
       extracted_waveforms: waveformData.length,
       extracted_histograms: octerHistograms.length,
-      graphs_analyzed: parsedData.graphs?.length || 0
+      graphs_analyzed: parsedData.graphs?.length || 0,
+      // Rejected rows used to exist only inside processing_log's free text.
+      insert_errors: insertErrors,
+      has_errors: insertErrors.length > 0,
+      calculated: calculatedSummary,
     };
 
     await supabase

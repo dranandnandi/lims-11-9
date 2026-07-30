@@ -1,4 +1,5 @@
 import React, { useMemo } from 'react';
+import { formatAnalyteDisplayValue } from '../../utils/resultValueFormat';
 
 export interface BasicPrintOptions {
   baseFontSize?: number;
@@ -9,6 +10,9 @@ export interface BasicPrintOptions {
   boldAllValues?: boolean;         // default true — all values font-weight 600; false = normal weight
   boldAbnormalValues?: boolean;    // default true — extra bold (700) for high/low; false = no extra bold
   calcMarker?: 'asterisk' | 'cal' | 'none'; // default 'cal'
+  defaultDecimalPlaces?: number | null; // lab-wide result precision (0-4); undefined = as entered, per-analyte setting overrides
+  padDecimals?: boolean;           // default false — true keeps trailing zeros (12.3 prints as 12.30)
+  minIntegerDigits?: number | null; // leading-zero width for fixed-width formats (2 prints 3 as "03"); undefined/0 = off
   sectionHeaderInline?: boolean;   // default true = inline shaded row; false = small-caps label
   flagSymbol?: 'none' | 'before' | 'after'; // default 'none'; 'before' = flag prefix inside result; 'after' = inline flag suffix
   showFlagLegend?: boolean;        // show H=High, L=Low legend below each group table
@@ -25,6 +29,8 @@ export interface BasicPrintOptions {
     maxCount?: number;
   };
   sectionFieldNamePct?: number;    // Section field name width % for narrative/section-only reports (20-70, default 40)
+  reportDisclaimer?: string;       // Disclaimer text printed above the QR/signature footer (default text used when undefined)
+  showReportDisclaimer?: boolean;  // default true — print the disclaimer line at end of report
   resultTableBackground?: 'white' | 'transparent';
   basicColumnWidths?: {
     standard?: number[];
@@ -66,6 +72,10 @@ const SAMPLE_ANALYTES_BY_GROUP = new Map([
   ]],
 ]);
 const SAMPLE_GROUP_NAMES = new Map([['grp-cbc', 'Complete Blood Count (CBC)']]);
+// Keep in sync with DEFAULT_BASIC_REPORT_DISCLAIMER in
+// supabase/functions/generate-pdf-letterhead/index.ts
+const DEFAULT_BASIC_REPORT_DISCLAIMER =
+  'This report is electronically generated and authenticated. Results relate only to the specimen received and should be correlated clinically. This report is not valid for medico-legal purposes.';
 const DEFAULT_BASIC_STANDARD_WIDTHS = [36, 24, 12, 28];
 const DEFAULT_BASIC_SIBLING_WIDTHS = [30, 14, 8, 16, 16, 16];
 
@@ -168,6 +178,10 @@ function buildBasicHtml(
   const siblingColumnWidths = normalizeBasicColumnWidths(printOptions.basicColumnWidths?.sibling, DEFAULT_BASIC_SIBLING_WIDTHS, 6);
   const highColor = printOptions.resultColors?.enabled ? (printOptions.resultColors?.high ?? '#dc2626') : '#dc2626';
   const lowColor  = printOptions.resultColors?.enabled ? (printOptions.resultColors?.low  ?? '#000')    : '#000';
+  const showReportDisclaimer = printOptions.showReportDisclaimer !== false;
+  const reportDisclaimerText = (typeof printOptions.reportDisclaimer === 'string'
+    ? printOptions.reportDisclaimer
+    : DEFAULT_BASIC_REPORT_DISCLAIMER).trim();
 
   const noColorCss = `
 <style>
@@ -532,6 +546,16 @@ function buildBasicHtml(
   padding-top: 6px !important;
 }
 
+.basic-report-template .report-disclaimer {
+  margin-top: 10px !important;
+  padding-top: 6px !important;
+  border-top: 0.5px solid #bbb !important;
+  font-size: ${smallPx}px !important;
+  color: #444 !important;
+  font-style: italic !important;
+  line-height: 1.4 !important;
+}
+
 .basic-report-template .report-footer {
   margin-top: 20px !important;
   padding-top: 8px !important;
@@ -717,9 +741,7 @@ function buildBasicHtml(
         const parameterName = analyte.parameter || analyte.name || analyte.test_name || '';
         const isCalculated    = analyte.is_auto_calculated || analyte.is_calculated;
         const rawValue        = analyte.value ?? '';
-        const value           = isCalculated && rawValue !== '' && !isNaN(Number(rawValue))
-          ? String(parseFloat(Number(rawValue).toFixed(2)))
-          : rawValue;
+        const value           = formatAnalyteDisplayValue(analyte, printOptions, rawValue);
         const unit          = analyte.unit || '';
         const refRange      = analyte.reference_range || '';
         const flag          = analyte.flag || '';
@@ -878,12 +900,18 @@ function buildBasicHtml(
       <p style="margin:2px 0 0 0;font-size:8px;color:#555;">Scan to verify</p>
     </div>` : '';
 
+  const disclaimerHtml = (showReportDisclaimer && reportDisclaimerText)
+    ? `<div class="report-disclaimer">${reportDisclaimerText
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br />')}</div>`
+    : '';
+
   return `
     ${noColorCss}
     <div class="basic-report-template" style="position:relative;font-family: Arial, Helvetica, sans-serif; font-size: ${basePx}px; color: #000;">
       ${headerQrHtml}
       ${patientInfoHtml}
       ${testResultsHtml}
+      ${disclaimerHtml}
       ${signatoryHtml}
     </div>
   `;
@@ -1037,6 +1065,35 @@ export default function BasicTemplateFormatBuilder({ printOptions, showMethodolo
               <option value="none">None</option>
             </select>
           </Row>
+          <Row label="Decimal Places" hint="Lab-wide result precision. Individual analytes can override this in the analyte editor">
+            <select
+              value={printOptions.defaultDecimalPlaces ?? ''}
+              onChange={(e) => setPO({ defaultDecimalPlaces: e.target.value === '' ? null : Number(e.target.value) })}
+              className="text-sm border border-gray-300 rounded px-2 py-1 bg-white"
+            >
+              <option value="">As entered</option>
+              <option value="0">0 — Integer (150)</option>
+              <option value="1">1 — 0.0</option>
+              <option value="2">2 — 0.00</option>
+              <option value="3">3 — 0.000</option>
+              <option value="4">4 — 0.0000</option>
+            </select>
+          </Row>
+          <Row label="Pad Decimals" hint="Keep trailing zeros so the value column lines up (12.3 prints as 12.30)">
+            <Toggle checked={printOptions.padDecimals ?? false} onChange={(v) => setPO({ padDecimals: v })} />
+          </Row>
+          <Row label="Leading Zeros" hint="Fixed-width legacy formats only — pads the whole-number part (3 prints as 03)">
+            <select
+              value={printOptions.minIntegerDigits ?? ''}
+              onChange={(e) => setPO({ minIntegerDigits: e.target.value === '' ? null : Number(e.target.value) })}
+              className="text-sm border border-gray-300 rounded px-2 py-1 bg-white"
+            >
+              <option value="">Off</option>
+              <option value="2">2 digits (03)</option>
+              <option value="3">3 digits (003)</option>
+              <option value="4">4 digits (0003)</option>
+            </select>
+          </Row>
           <Row label="Section Header Style" hint="Small caps label vs inline shaded row">
             <select
               value={(printOptions.sectionHeaderInline ?? true) ? 'inline' : 'label'}
@@ -1145,6 +1202,30 @@ export default function BasicTemplateFormatBuilder({ printOptions, showMethodolo
               </span>
             </div>
           </Row>
+          <Row label="Disclaimer" hint="Printed above the QR & signature at the end of the report">
+            <Toggle
+              checked={printOptions.showReportDisclaimer !== false}
+              onChange={(v) => setPO({ showReportDisclaimer: v })}
+            />
+          </Row>
+          {printOptions.showReportDisclaimer !== false && (
+            <div className="py-2.5 border-b border-gray-100">
+              <textarea
+                rows={4}
+                value={printOptions.reportDisclaimer ?? DEFAULT_BASIC_REPORT_DISCLAIMER}
+                onChange={(e) => setPO({ reportDisclaimer: e.target.value })}
+                placeholder="Disclaimer text printed at the end of every report"
+                className="w-full text-xs border border-gray-300 rounded px-2 py-1.5 resize-y focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              />
+              <button
+                type="button"
+                onClick={() => setPO({ reportDisclaimer: DEFAULT_BASIC_REPORT_DISCLAIMER })}
+                className="mt-1 text-xs text-indigo-600 hover:underline"
+              >
+                Reset to default
+              </button>
+            </div>
+          )}
           <Row label="Section Field %" hint="Field name width for section-only reports (20-70%)">
             <div className="flex items-center gap-2">
               <input

@@ -16,8 +16,21 @@
     "android:sync": "npm run build && npx cap sync android",
     "android:open": "npx cap open android",
     "android:run": "npm run android:sync && npx cap run android",
-    "android:build": "npm run build && npx cap sync android && cd android && ./gradlew assembleRelease",
-    "android:build:debug": "npm run build && npx cap sync android && cd android && ./gradlew assembleDebug"
+    "android:build": "npm run build && npx cap sync android && cd android && ./gradlew assembleLimsRelease",
+    "android:build:debug": "npm run build && npx cap sync android && cd android && ./gradlew assembleLimsDebug",
+    "build:patient": "cross-env NODE_OPTIONS=--max-old-space-size=4096 VITE_APP_TARGET=patient vite build --outDir dist-patient",
+    "build:phlebo": "cross-env NODE_OPTIONS=--max-old-space-size=4096 VITE_APP_TARGET=phlebo vite build --outDir dist-phlebo",
+    "deploy:patient": "npm run build:patient && netlify deploy --prod --no-build --dir dist-patient --site anpro-patient",
+    "deploy:phlebo": "npm run build:phlebo && netlify deploy --prod --no-build --dir dist-phlebo --site anpro-phlebo",
+    "android:sync:patient": "npm run build:patient && cross-env APP_TARGET=patient npx cap sync android",
+    "android:sync:phlebo": "npm run build:phlebo && cross-env APP_TARGET=phlebo npx cap sync android",
+    "android:build:patient": "npm run android:sync:patient && cd android && ./gradlew assemblePatientRelease",
+    "android:build:patient:debug": "npm run android:sync:patient && cd android && ./gradlew assemblePatientDebug",
+    "android:build:phlebo": "npm run android:sync:phlebo && cd android && ./gradlew assemblePhleboRelease",
+    "android:build:phlebo:debug": "npm run android:sync:phlebo && cd android && ./gradlew assemblePhleboDebug",
+    "android:bundle:lims": "npm run android:sync && cd android && ./gradlew bundleLimsRelease",
+    "android:bundle:patient": "npm run android:sync:patient && cd android && ./gradlew bundlePatientRelease",
+    "android:bundle:phlebo": "npm run android:sync:phlebo && cd android && ./gradlew bundlePhleboRelease"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.71.2",

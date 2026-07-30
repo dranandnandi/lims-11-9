@@ -187,6 +187,7 @@ interface LabSettings {
   auto_open_collection_modal?: boolean;
   auto_print_barcode_on_order?: boolean;
   auto_print_report_on_approval?: boolean;
+  show_approve_all_in_result_entry?: boolean;
   sample_type_colors?: Record<string, string>;
   accession_collection_config?: AccessionCollectionConfig | null;
   portal_settings?: PortalSettings | null;
@@ -781,6 +782,7 @@ const Settings: React.FC = () => {
             auto_open_collection_modal: (labData as any).auto_open_collection_modal ?? false,
             auto_print_barcode_on_order: (labData as any).auto_print_barcode_on_order ?? false,
             auto_print_report_on_approval: (labData as any).auto_print_report_on_approval ?? false,
+            show_approve_all_in_result_entry: (labData as any).show_approve_all_in_result_entry ?? false,
             sample_type_colors: (labData as any).sample_type_colors ?? {},
             accession_collection_config: (labData as any).accession_collection_config ?? { sample_type_flows: {} },
             portal_settings: normalizePortalSettings((labData as any).portal_settings, true),
@@ -1193,6 +1195,7 @@ const Settings: React.FC = () => {
         auto_open_collection_modal: labSettings.auto_open_collection_modal ?? false,
         auto_print_barcode_on_order: labSettings.auto_print_barcode_on_order ?? false,
         auto_print_report_on_approval: labSettings.auto_print_report_on_approval ?? false,
+        show_approve_all_in_result_entry: labSettings.show_approve_all_in_result_entry ?? false,
         sample_type_colors: labSettings.sample_type_colors || {},
         accession_collection_config: labSettings.accession_collection_config || { sample_type_flows: {} },
         portal_settings: normalizePortalSettings(labSettings.portal_settings),
@@ -2439,6 +2442,7 @@ const Settings: React.FC = () => {
                         {[
                           { key: 'patientName', label: 'Patient Name' },
                           { key: 'patientId', label: 'Patient ID' },
+                          { key: 'registrationDate', label: 'Registration Date' },
                           { key: 'age', label: 'Age' },
                           { key: 'gender', label: 'Gender' },
                           { key: 'collectionDate', label: 'Collection Date/Time' },
@@ -3455,6 +3459,26 @@ const Settings: React.FC = () => {
                           </div>
                         </label>
                       </div>
+                    </div>
+
+                    {/* Result Entry */}
+                    <div className="border-t border-gray-100 pt-5">
+                      <h4 className="text-sm font-semibold text-gray-700 mb-1">Result Entry</h4>
+                      <p className="text-xs text-gray-500 mb-3">
+                        Controls what the technician sees inside the result entry modal. Saved results are always listed there in a collapsed panel that can be opened, edited and approved analyte by analyte.
+                      </p>
+                      <label className="flex items-start cursor-pointer gap-3">
+                        <input
+                          type="checkbox"
+                          checked={labSettings.show_approve_all_in_result_entry ?? false}
+                          onChange={(e) => setLabSettings(prev => prev ? { ...prev, show_approve_all_in_result_entry: e.target.checked } : prev)}
+                          className="mt-0.5 h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded"
+                        />
+                        <div>
+                          <span className="text-sm font-medium text-gray-800">Show "Approve Whole Order" button in result entry</span>
+                          <p className="text-xs text-gray-400 mt-0.5">Lets whoever enters results verify every analyte on the order in one click. Leave off when a separate verification desk must sign off.</p>
+                        </div>
+                      </label>
                     </div>
 
                     {/* Sample Type Colors */}

@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as XLSX from 'xlsx';
-import { AlertCircle, CheckCircle, Download, FileSpreadsheet, Loader2, Save, Sparkles, Upload, X } from 'lucide-react';
+import { AlertCircle, CheckCircle, Download, FileSpreadsheet, Loader2, Save, Sparkles, Upload, Wand2, X } from 'lucide-react';
 import { database, supabase } from '../../utils/supabase';
 
 const IMPORT_FUNCTION_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/ai-analyzer-mapping-import`;
@@ -33,6 +33,7 @@ interface MappingRow {
   mapping_type: string;
   verified: boolean;
   ai_confidence?: number | null;
+  ai_source?: string | null;
   test_name: string;
   dirty: boolean;
   saving: boolean;
@@ -147,6 +148,8 @@ const AnalyzerMappingPanel: React.FC<Props> = ({
   const [excelMessage, setExcelMessage] = useState<string | null>(null);
   const [showAiImport, setShowAiImport] = useState(false);
   const [aiStage, setAiStage] = useState<'upload' | 'loading' | 'review' | 'applying'>('upload');
+  const [aiMode, setAiMode] = useState<'image' | 'text'>('image');
+  const [aiText, setAiText] = useState('');
   const [aiError, setAiError] = useState<string | null>(null);
   const [aiSuggestions, setAiSuggestions] = useState<AiSuggestion[]>([]);
   const [selectedSuggestions, setSelectedSuggestions] = useState<Set<string>>(new Set());
@@ -284,7 +287,7 @@ const AnalyzerMappingPanel: React.FC<Props> = ({
       supports_result_receive: true,
       verified: mapping.verified,
       ai_confidence: mapping.ai_confidence ?? null,
-      ai_source: mapping.ai_confidence ? 'analyzer_mapping_image' : null,
+      ai_source: mapping.ai_confidence ? (mapping.ai_source || 'analyzer_mapping_image') : null,
       metadata: {
         source,
         test_group_name: testGroupName,
@@ -452,34 +455,21 @@ const AnalyzerMappingPanel: React.FC<Props> = ({
     }
   };
 
-  const processAiFile = async (file: File) => {
-    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
-    if (!allowedTypes.includes(file.type)) {
-      setAiError('Unsupported file type. Upload JPEG, PNG, WebP, or GIF.');
-      return;
-    }
-    if (file.size > 20 * 1024 * 1024) {
-      setAiError('File size must be under 20 MB.');
-      return;
-    }
+  const canRunAiImport = (): boolean => {
     if (!analyzerConnection?.id) {
       setAiError('Select a connected analyzer first.');
-      return;
+      return false;
     }
     if (mappableAnalytes.length === 0) {
       setAiError('Save analytes to this test group before importing analyzer codes.');
-      return;
+      return false;
     }
+    return true;
+  };
 
+  const requestAiSuggestions = async (source: Record<string, unknown>) => {
     setAiError(null);
     setAiStage('loading');
-
-    const base64 = await new Promise<string>((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(String(reader.result).split(',')[1] || '');
-      reader.onerror = reject;
-      reader.readAsDataURL(file);
-    });
 
     try {
       const response = await fetch(IMPORT_FUNCTION_URL, {
@@ -489,8 +479,7 @@ const AnalyzerMappingPanel: React.FC<Props> = ({
           'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
         },
         body: JSON.stringify({
-          file_base64: base64,
-          file_mime_type: file.type,
+          ...source,
           test_group: { id: testGroupId, name: testGroupName },
           analyzer_connection: analyzerConnection,
           analytes: mappableAnalytes.map((analyte) => ({
@@ -516,6 +505,53 @@ const AnalyzerMappingPanel: React.FC<Props> = ({
     }
   };
 
+  const processAiFile = async (file: File) => {
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+    if (!allowedTypes.includes(file.type)) {
+      setAiError('Unsupported file type. Upload JPEG, PNG, WebP, or GIF.');
+      return;
+    }
+    if (file.size > 20 * 1024 * 1024) {
+      setAiError('File size must be under 20 MB.');
+      return;
+    }
+    if (!canRunAiImport()) return;
+
+    setAiError(null);
+    setAiStage('loading');
+
+    let base64: string;
+    try {
+      base64 = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result).split(',')[1] || '');
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+    } catch {
+      setAiError('Could not read the selected image.');
+      setAiStage('upload');
+      return;
+    }
+
+    await requestAiSuggestions({ file_base64: base64, file_mime_type: file.type });
+  };
+
+  const processAiText = async () => {
+    const trimmed = aiText.trim();
+    if (!trimmed) {
+      setAiError('Paste the analyzer message or code list first.');
+      return;
+    }
+    if (trimmed.length > 200000) {
+      setAiError('Analyzer text must be under 200,000 characters.');
+      return;
+    }
+    if (!canRunAiImport()) return;
+
+    await requestAiSuggestions({ text_content: trimmed });
+  };
+
   const applyAiSuggestions = () => {
     setAiStage('applying');
     const byLabAnalyte = new Map(mappableAnalytes.map((analyte) => [analyte.lab_analyte_id, analyte]));
@@ -527,6 +563,7 @@ const AnalyzerMappingPanel: React.FC<Props> = ({
         analyzer_code: suggestion.analyzer_code || '',
         analyzer_display: suggestion.analyzer_display || displayAnalyteName(analyte),
         ai_confidence: suggestion.confidence,
+        ai_source: aiMode === 'text' ? 'analyzer_mapping_text' : 'analyzer_mapping_image',
         verified: suggestion.confidence >= 0.9,
       });
     }
@@ -698,7 +735,9 @@ const AnalyzerMappingPanel: React.FC<Props> = ({
               <div className="flex items-center gap-2">
                 <Sparkles className="h-5 w-5 text-purple-600" />
                 <h3 className="text-lg font-semibold text-gray-900">AI Analyzer Mapping Helper</h3>
-                <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs text-gray-500">Claude Haiku vision</span>
+                <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs text-gray-500">
+                  {aiMode === 'text' ? 'Claude Haiku' : 'Claude Haiku vision'}
+                </span>
               </div>
               <button type="button" onClick={() => setShowAiImport(false)} className="text-gray-400 hover:text-gray-600">
                 <X className="h-5 w-5" />
@@ -715,9 +754,61 @@ const AnalyzerMappingPanel: React.FC<Props> = ({
 
               {aiStage === 'upload' && (
                 <>
+                  <div className="flex gap-2 rounded-lg bg-gray-100 p-1">
+                    <button
+                      type="button"
+                      onClick={() => { setAiMode('image'); setAiError(null); }}
+                      className={`flex-1 rounded-md px-3 py-1.5 text-sm font-medium ${
+                        aiMode === 'image' ? 'bg-white text-purple-700 shadow-sm' : 'text-gray-500 hover:text-gray-700'
+                      }`}
+                    >
+                      Upload image
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => { setAiMode('text'); setAiError(null); }}
+                      className={`flex-1 rounded-md px-3 py-1.5 text-sm font-medium ${
+                        aiMode === 'text' ? 'bg-white text-purple-700 shadow-sm' : 'text-gray-500 hover:text-gray-700'
+                      }`}
+                    >
+                      Paste analyzer text
+                    </button>
+                  </div>
                   <p className="text-sm text-gray-600">
-                    Upload an analyzer code list, printout, software screen, or mapping sheet. AI will extract analyzer codes only and propose matches against this test group's attached analytes.
+                    {aiMode === 'text'
+                      ? "Paste a raw analyzer message (ASTM/HL7 frames), a code list, or anything copied from the analyzer software. AI will extract analyzer codes only and propose matches against this test group's attached analytes."
+                      : "Upload an analyzer code list, printout, software screen, or mapping sheet. AI will extract analyzer codes only and propose matches against this test group's attached analytes."}
                   </p>
+                </>
+              )}
+
+              {aiStage === 'upload' && aiMode === 'text' && (
+                <>
+                  <textarea
+                    value={aiText}
+                    onChange={(event) => setAiText(event.target.value)}
+                    rows={12}
+                    spellCheck={false}
+                    placeholder={'Paste anything the analyzer sends or shows, for example:\n\nHGB  Hemoglobin  g/dL\nRBC  Red Blood Cell Count  10^6/uL\nWBC  Total WBC Count  10^3/uL\n\nor a raw frame:\nR|1|^^^HGB^1|13.2|g/dL||N||F||||20260725103000'}
+                    className="w-full rounded-lg border border-gray-300 p-3 font-mono text-xs leading-relaxed focus:outline-none focus:ring-2 focus:ring-purple-500"
+                  />
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-gray-500">{aiText.trim().length.toLocaleString()} characters</span>
+                    <button
+                      type="button"
+                      onClick={processAiText}
+                      disabled={!aiText.trim()}
+                      className="inline-flex items-center gap-1.5 rounded-md bg-purple-600 px-4 py-2 text-sm font-medium text-white hover:bg-purple-700 disabled:opacity-50"
+                    >
+                      <Wand2 className="h-4 w-4" />
+                      Map with AI
+                    </button>
+                  </div>
+                </>
+              )}
+
+              {aiStage === 'upload' && aiMode === 'image' && (
+                <>
                   <div
                     onDragOver={(event) => { event.preventDefault(); setDragOver(true); }}
                     onDragLeave={() => setDragOver(false)}
@@ -761,7 +852,7 @@ const AnalyzerMappingPanel: React.FC<Props> = ({
                 <>
                   {aiSuggestions.length === 0 ? (
                     <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-                      No confident analyzer code matches were found. Try a clearer image or enter codes manually.
+                      No confident analyzer code matches were found. {aiMode === 'text' ? 'Paste more of the analyzer message' : 'Try a clearer image'} or enter codes manually.
                     </div>
                   ) : (
                     <div className="overflow-hidden rounded-lg border border-gray-200">

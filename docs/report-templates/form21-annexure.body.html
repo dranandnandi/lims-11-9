@@ -1,0 +1,224 @@
+<!-- ══════════ FORM 21 HEADING ══════════ -->
+<div class="form-title">
+  <h1>FORM 21</h1>
+  <p class="rule">[Prescribed under Rule (19)]</p>
+  <h2>Health Register</h2>
+  <p class="scope">(In respect of persons employed in occupations declared to be dangerous
+     operations under Section 87)</p>
+</div>
+<hr class="sep">
+
+<!-- ══════════ WORKER IDENTIFICATION ══════════ -->
+<table class="worker">
+  <tr>
+    <td class="lbl">Name of Worker</td><td>{{patientName}}</td>
+    <td class="lbl">Serial No.</td><td>{{patientDisplayId}}</td>
+  </tr>
+  <tr>
+    <td class="lbl">Sex</td><td>{{patientGender}}</td>
+    <td class="lbl">Age (last birthday)</td><td>{{patientAge}}</td>
+  </tr>
+  <tr>
+    <td class="lbl">Works No.</td><td>{{patientNumber}}</td>
+    <td class="lbl">Sample / Ref. ID</td><td>{{sampleId}}</td>
+  </tr>
+  <tr>
+    <td class="lbl">Date of Examination</td><td>{{orderDate}}</td>
+    <td class="lbl">Order No.</td><td>{{orderNumber}}</td>
+  </tr>
+  <tr>
+    <td class="lbl">Referred By</td><td>{{referringDoctorName}}</td>
+    <td class="lbl">Establishment</td><td>{{locationName}}</td>
+  </tr>
+  <!-- TODO: Nature of job, Raw material/by-product handled, and Date of employment
+       on present work are NOT in the patient model. Add them as patient custom
+       fields and confirm the flat placeholder name before using them here. -->
+</table>
+
+<!-- ══════════ ANNEXURE ══════════ -->
+<div class="annexure-head">
+  <h2>Annexure</h2>
+  <h3>PRE-EMPLOYMENT &amp; PERIODIC MEDICAL EXAMINATION</h3>
+</div>
+
+<div class="item">
+  <h4>(1) GENERAL EXAMINATION</h4>
+  <div class="body">
+    {{section:form21_general}}
+    {{section:form21_built}}
+  </div>
+</div>
+
+<div class="item">
+  <h4>(2) CARDIO-VASCULAR SYSTEM</h4>
+  <div class="body">{{section:form21_cvs}}</div>
+</div>
+
+<div class="item">
+  <h4>(3) RESPIRATORY SYSTEM</h4>
+  <div class="body">{{section:form21_respiratory}}</div>
+</div>
+
+<div class="item">
+  <h4>(4) GASTRO-INTESTINAL SYSTEM</h4>
+  <div class="body">{{section:form21_git}}</div>
+</div>
+
+<div class="item">
+  <h4>(5) EXAMINATION OF EYES</h4>
+  <div class="body">
+    <div class="subhead">Vision</div>
+    {{section:form21_vision}}
+    <div class="subhead">Other Ocular Findings</div>
+    {{section:form21_eyes_other}}
+  </div>
+</div>
+
+<div class="item">
+  <h4>(6) EXAMINATION OF EAR, NOSE &amp; THROAT</h4>
+  <div class="body">{{section:form21_ent}}</div>
+</div>
+
+<div class="item">
+  <h4>(7) GENITO-URINARY SYSTEM</h4>
+  <div class="body">
+    {{section:form21_gus}}
+    <div class="subhead">Other Examination for Females — Menstrual &amp; Obstetric History</div>
+    {{section:form21_female_history}}
+  </div>
+</div>
+
+<div class="annexure-head"><h2>INVESTIGATIONS</h2></div>
+
+<!-- ══════════ (8) LAB INVESTIGATIONS ══════════
+     These are REAL ANALYTES, not report sections.
+     Placeholder keys are: ANALYTE_<CODE>_VALUE / _UNIT / _REFERENCE / _FLAG
+     where <CODE> = UPPER(analytes.code) with ALL non-alphanumerics REMOVED.
+     e.g. code "SERUM_UREA" -> {{ANALYTE_SERUMUREA_VALUE}}  (no underscore!)
+
+     Generate the exact rows for whatever you attach with the companion query in
+     docs/report-templates/form21-analyte-rows.sql, then paste them in below.
+     The rows here are a SKELETON — the codes are guesses and must be replaced. -->
+<div class="item">
+  <h4>(8) LAB INVESTIGATIONS</h4>
+  <div class="body">
+    <table class="lab-table">
+      <thead>
+        <tr><th style="width:38%">Investigation</th><th style="width:18%">Result</th>
+            <th style="width:14%">Unit</th><th style="width:22%">Reference Range</th>
+            <th style="width:8%">Flag</th></tr>
+      </thead>
+      <tbody>
+        <tr class="grp"><td colspan="5">URINE / STOOL</td></tr>
+        <tr><td>Urine — Albumin</td><td class="val">{{ANALYTE_URINEALBUMIN_VALUE}}</td><td>{{ANALYTE_URINEALBUMIN_UNIT}}</td><td>{{ANALYTE_URINEALBUMIN_REFERENCE}}</td><td>{{ANALYTE_URINEALBUMIN_FLAG}}</td></tr>
+        <tr><td>Urine — Sugar</td><td class="val">{{ANALYTE_URINESUGAR_VALUE}}</td><td>{{ANALYTE_URINESUGAR_UNIT}}</td><td>{{ANALYTE_URINESUGAR_REFERENCE}}</td><td>{{ANALYTE_URINESUGAR_FLAG}}</td></tr>
+        <tr><td>Urine — Microscopy</td><td class="val">{{ANALYTE_URINEMICROSCOPY_VALUE}}</td><td>{{ANALYTE_URINEMICROSCOPY_UNIT}}</td><td>{{ANALYTE_URINEMICROSCOPY_REFERENCE}}</td><td>{{ANALYTE_URINEMICROSCOPY_FLAG}}</td></tr>
+        <tr><td>Stool</td><td class="val">{{ANALYTE_STOOL_VALUE}}</td><td>{{ANALYTE_STOOL_UNIT}}</td><td>{{ANALYTE_STOOL_REFERENCE}}</td><td>{{ANALYTE_STOOL_FLAG}}</td></tr>
+
+        <tr class="grp"><td colspan="5">HAEMOGRAM</td></tr>
+        <tr><td>Blood Group</td><td class="val">{{ANALYTE_BLOODGROUP_VALUE}}</td><td>{{ANALYTE_BLOODGROUP_UNIT}}</td><td>{{ANALYTE_BLOODGROUP_REFERENCE}}</td><td>{{ANALYTE_BLOODGROUP_FLAG}}</td></tr>
+        <tr><td>Rh Factor</td><td class="val">{{ANALYTE_RHFACTOR_VALUE}}</td><td>{{ANALYTE_RHFACTOR_UNIT}}</td><td>{{ANALYTE_RHFACTOR_REFERENCE}}</td><td>{{ANALYTE_RHFACTOR_FLAG}}</td></tr>
+        <tr><td>Haemoglobin</td><td class="val">{{ANALYTE_HB_VALUE}}</td><td>{{ANALYTE_HB_UNIT}}</td><td>{{ANALYTE_HB_REFERENCE}}</td><td>{{ANALYTE_HB_FLAG}}</td></tr>
+        <tr><td>TLC</td><td class="val">{{ANALYTE_TLC_VALUE}}</td><td>{{ANALYTE_TLC_UNIT}}</td><td>{{ANALYTE_TLC_REFERENCE}}</td><td>{{ANALYTE_TLC_FLAG}}</td></tr>
+        <tr><td>RBC Count</td><td class="val">{{ANALYTE_RBC_VALUE}}</td><td>{{ANALYTE_RBC_UNIT}}</td><td>{{ANALYTE_RBC_REFERENCE}}</td><td>{{ANALYTE_RBC_FLAG}}</td></tr>
+        <tr><td>Platelet Count</td><td class="val">{{ANALYTE_PLATELETCOUNT_VALUE}}</td><td>{{ANALYTE_PLATELETCOUNT_UNIT}}</td><td>{{ANALYTE_PLATELETCOUNT_REFERENCE}}</td><td>{{ANALYTE_PLATELETCOUNT_FLAG}}</td></tr>
+        <tr><td>DLC — Neutrophils (P)</td><td class="val">{{ANALYTE_NEUTROPHILS_VALUE}}</td><td>{{ANALYTE_NEUTROPHILS_UNIT}}</td><td>{{ANALYTE_NEUTROPHILS_REFERENCE}}</td><td>{{ANALYTE_NEUTROPHILS_FLAG}}</td></tr>
+        <tr><td>DLC — Lymphocytes (L)</td><td class="val">{{ANALYTE_LYMPHOCYTES_VALUE}}</td><td>{{ANALYTE_LYMPHOCYTES_UNIT}}</td><td>{{ANALYTE_LYMPHOCYTES_REFERENCE}}</td><td>{{ANALYTE_LYMPHOCYTES_FLAG}}</td></tr>
+        <tr><td>DLC — Eosinophils (E)</td><td class="val">{{ANALYTE_EOSINOPHILS_VALUE}}</td><td>{{ANALYTE_EOSINOPHILS_UNIT}}</td><td>{{ANALYTE_EOSINOPHILS_REFERENCE}}</td><td>{{ANALYTE_EOSINOPHILS_FLAG}}</td></tr>
+        <tr><td>DLC — Monocytes (M)</td><td class="val">{{ANALYTE_MONOCYTES_VALUE}}</td><td>{{ANALYTE_MONOCYTES_UNIT}}</td><td>{{ANALYTE_MONOCYTES_REFERENCE}}</td><td>{{ANALYTE_MONOCYTES_FLAG}}</td></tr>
+        <tr><td>DLC — Basophils (B)</td><td class="val">{{ANALYTE_BASOPHILS_VALUE}}</td><td>{{ANALYTE_BASOPHILS_UNIT}}</td><td>{{ANALYTE_BASOPHILS_REFERENCE}}</td><td>{{ANALYTE_BASOPHILS_FLAG}}</td></tr>
+
+        <tr class="grp"><td colspan="5">LIPID PROFILE</td></tr>
+        <tr><td>Serum Cholesterol</td><td class="val">{{ANALYTE_CHOLESTEROL_VALUE}}</td><td>{{ANALYTE_CHOLESTEROL_UNIT}}</td><td>{{ANALYTE_CHOLESTEROL_REFERENCE}}</td><td>{{ANALYTE_CHOLESTEROL_FLAG}}</td></tr>
+        <tr><td>Serum Triglycerides</td><td class="val">{{ANALYTE_TRIGLYCERIDES_VALUE}}</td><td>{{ANALYTE_TRIGLYCERIDES_UNIT}}</td><td>{{ANALYTE_TRIGLYCERIDES_REFERENCE}}</td><td>{{ANALYTE_TRIGLYCERIDES_FLAG}}</td></tr>
+        <tr><td>HDL</td><td class="val">{{ANALYTE_HDL_VALUE}}</td><td>{{ANALYTE_HDL_UNIT}}</td><td>{{ANALYTE_HDL_REFERENCE}}</td><td>{{ANALYTE_HDL_FLAG}}</td></tr>
+        <tr><td>LDL</td><td class="val">{{ANALYTE_LDL_VALUE}}</td><td>{{ANALYTE_LDL_UNIT}}</td><td>{{ANALYTE_LDL_REFERENCE}}</td><td>{{ANALYTE_LDL_FLAG}}</td></tr>
+
+        <tr class="grp"><td colspan="5">HEPATIC PROFILE</td></tr>
+        <tr><td>SGPT</td><td class="val">{{ANALYTE_SGPT_VALUE}}</td><td>{{ANALYTE_SGPT_UNIT}}</td><td>{{ANALYTE_SGPT_REFERENCE}}</td><td>{{ANALYTE_SGPT_FLAG}}</td></tr>
+        <tr><td>SGOT</td><td class="val">{{ANALYTE_SGOT_VALUE}}</td><td>{{ANALYTE_SGOT_UNIT}}</td><td>{{ANALYTE_SGOT_REFERENCE}}</td><td>{{ANALYTE_SGOT_FLAG}}</td></tr>
+        <tr><td>Alkaline Phosphatase</td><td class="val">{{ANALYTE_ALKALINEPHOSPHATASE_VALUE}}</td><td>{{ANALYTE_ALKALINEPHOSPHATASE_UNIT}}</td><td>{{ANALYTE_ALKALINEPHOSPHATASE_REFERENCE}}</td><td>{{ANALYTE_ALKALINEPHOSPHATASE_FLAG}}</td></tr>
+
+        <tr class="grp"><td colspan="5">RENAL PROFILE</td></tr>
+        <tr><td>Blood Urea</td><td class="val">{{ANALYTE_BLOODUREA_VALUE}}</td><td>{{ANALYTE_BLOODUREA_UNIT}}</td><td>{{ANALYTE_BLOODUREA_REFERENCE}}</td><td>{{ANALYTE_BLOODUREA_FLAG}}</td></tr>
+        <tr><td>Serum Creatinine</td><td class="val">{{ANALYTE_SERUMCREATININE_VALUE}}</td><td>{{ANALYTE_SERUMCREATININE_UNIT}}</td><td>{{ANALYTE_SERUMCREATININE_REFERENCE}}</td><td>{{ANALYTE_SERUMCREATININE_FLAG}}</td></tr>
+
+        <tr class="grp"><td colspan="5">METABOLIC</td></tr>
+        <tr><td>Blood Sugar — Fasting</td><td class="val">{{ANALYTE_BLOODSUGARF_VALUE}}</td><td>{{ANALYTE_BLOODSUGARF_UNIT}}</td><td>{{ANALYTE_BLOODSUGARF_REFERENCE}}</td><td>{{ANALYTE_BLOODSUGARF_FLAG}}</td></tr>
+        <tr><td>Blood Sugar — PP</td><td class="val">{{ANALYTE_BLOODSUGARPP_VALUE}}</td><td>{{ANALYTE_BLOODSUGARPP_UNIT}}</td><td>{{ANALYTE_BLOODSUGARPP_REFERENCE}}</td><td>{{ANALYTE_BLOODSUGARPP_FLAG}}</td></tr>
+        <tr><td>Serum Uric Acid</td><td class="val">{{ANALYTE_URICACID_VALUE}}</td><td>{{ANALYTE_URICACID_UNIT}}</td><td>{{ANALYTE_URICACID_REFERENCE}}</td><td>{{ANALYTE_URICACID_FLAG}}</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="item">
+  <h4>(9) OTHER INVESTIGATIONS</h4>
+  <div class="body">{{section:form21_other_investigations}}</div>
+</div>
+
+<div class="item">
+  <h4>(10) PULMONARY FUNCTION TEST</h4>
+  <div class="body">
+    {{section:form21_pft}}
+    <div class="subhead">Remarks</div>
+    {{section:form21_pft_remarks}}
+  </div>
+</div>
+
+<div class="item">
+  <h4>(11) AUDIOMETRY EXAMINATION</h4>
+  <div class="body">
+    <p style="font-size:10px;font-style:italic;margin:0 0 4px;">
+      PTA of both ears at 125, 250, 500, 1000, 2000, 4000 and 8000 cycles per second.</p>
+    {{section:form21_audiometry}}
+  </div>
+</div>
+
+<div class="item">
+  <h4>(12) MEDICAL EXAMINATION OF CANTEEN STAFF</h4>
+  <div class="body">{{section:form21_canteen}}</div>
+</div>
+
+<div class="item">
+  <h4>(13) OTHER SPECIFIC MEDICAL EXAMINATIONS</h4>
+  <div class="body">
+    <p style="font-size:10px;font-style:italic;margin:0 0 4px;">
+      As mentioned in the respective schedules of Rule 107 of the C.G. Factories Rules, 1962.</p>
+    {{section:form21_rule107}}
+  </div>
+</div>
+
+<div class="item">
+  <h4>FITNESS OPINION</h4>
+  <div class="body">{{section:form21_fitness}}</div>
+</div>
+
+<div class="notes">
+  <strong>Note.—</strong><br>
+  (i)&nbsp;&nbsp;Column (8) — Detailed summary of reasons for transfer or discharge should be stated.<br>
+  (ii)&nbsp;Column (11) — Should be expressed as fit / unfit / suspended.
+</div>
+
+<!-- ══════════ SIGNATURES ══════════ -->
+<div class="sign-block">
+  <table class="sign-row">
+    <tr>
+      <td>
+        <span class="sign-line">Signature (with date) of Factory Medical Officer</span>
+      </td>
+      <td class="right">
+        <img src="{{approverSignature}}" class="sign-img" style="margin-left:auto;" alt="">
+        <span class="sign-line">
+          {{approvedByName}}<br>
+          <span style="font-size:10px;">Signature (with date) of Certifying Surgeon</span>
+        </span>
+      </td>
+    </tr>
+  </table>
+</div>
+
+<div class="footer">
+  <strong>{{labName}}</strong> &nbsp;|&nbsp; {{labAddress}}<br>
+  Reg. No. {{labRegistrationNumber}}
+</div>

@@ -7,7 +7,7 @@ import {
   Home, MapPin, Truck, Navigation
 } from 'lucide-react';
 import { supabase } from '../supabase';
-import { getCurrentPatientMeta, patientSignOut } from '../patientAuth';
+import { getCurrentPatientMeta, patientSignOut, forgetLabRecordedPin } from '../patientAuth';
 
 interface PatientInfo {
   id: string;
@@ -307,6 +307,8 @@ const PatientPortal: React.FC = () => {
     try {
       const { error } = await supabase.auth.updateUser({ password: newPin });
       if (error) throw error;
+      // Drop the PIN the lab recorded — it is no longer the working one
+      await forgetLabRecordedPin();
       setPinMessage({ type: 'success', text: 'PIN changed successfully.' });
       setNewPin('');
       setConfirmPin('');

@@ -49,6 +49,107 @@ function normalizeAnalyzerFlag(value: unknown): string {
     || 'N'
 }
 
+// --- Flag computed from the lab's SAVED reference range (never the machine's) ---
+// Mirrors process-analyzer-result's computeSavedFlag. Output vocabulary matches
+// the HL7 flags this path already stores: 'N','H','L','HH','LL','A'. flag_source
+// is constrained, so computed flags are 'auto_numeric' / 'auto_text'.
+
+const SAVED_NORMAL_TEXT = [
+  /^negative$/i, /^non[\s-]?reactive$/i, /^normal$/i, /^nil$/i, /^absent$/i,
+  /^not[\s-]?detected$/i, /^nd$/i, /^none[\s-]?seen$/i, /^within[\s-]?normal[\s-]?limits$/i,
+  /^wnl$/i, /^clear$/i, /^no[\s-]?growth$/i, /^sterile$/i, /^unremarkable$/i,
+]
+const SAVED_ABNORMAL_TEXT = [
+  /^positive$/i, /^reactive$/i, /^detected$/i, /^present$/i, /^abnormal$/i, /^growth$/i,
+]
+
+function extractNumericValue(value: unknown): number | null {
+  if (value === null || value === undefined || value === '') return null
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null
+  const cleaned = String(value).replace(/,/g, '').replace(/[<>≤≥]/g, '').trim()
+  const match = cleaned.match(/^-?\d*\.?\d+/)
+  if (!match) return null
+  const num = parseFloat(match[0])
+  return Number.isNaN(num) ? null : num
+}
+
+function parseSavedReferenceRange(refRange: string | null | undefined): {
+  low: number | null; high: number | null; type: 'range' | 'less_than' | 'greater_than' | 'single' | 'none'
+} {
+  if (!refRange || typeof refRange !== 'string') return { low: null, high: null, type: 'none' }
+  const cleaned = refRange
+    .replace(/\([^)]*\)/g, '')
+    .replace(/[a-zA-Z%\/]+/g, ' ')
+    .replace(/,/g, '')
+    .trim()
+  const lt = cleaned.match(/[<≤]\s*([\d.]+)/)
+  if (lt) return { low: null, high: parseFloat(lt[1]), type: 'less_than' }
+  const gt = cleaned.match(/[>≥]\s*([\d.]+)/)
+  if (gt) return { low: parseFloat(gt[1]), high: null, type: 'greater_than' }
+  const rng = cleaned.match(/([\d.]+)\s*[-–—~]+\s*([\d.]+)/)
+  if (rng) {
+    const a = parseFloat(rng[1]), b = parseFloat(rng[2])
+    return { low: Math.min(a, b), high: Math.max(a, b), type: 'range' }
+  }
+  const single = cleaned.match(/^([\d.]+)$/)
+  if (single) return { low: null, high: parseFloat(single[1]), type: 'single' }
+  return { low: null, high: null, type: 'none' }
+}
+
+function computeSavedFlag(
+  value: unknown,
+  refRange: string | null | undefined,
+  opts: {
+    lowCritical?: string | number | null
+    highCritical?: string | number | null
+    expectedNormalValues?: unknown
+    valueType?: string | null
+  } = {},
+): { flag: string; source: 'auto_numeric' | 'auto_text' } {
+  const raw = String(value ?? '').trim()
+  if (!raw) return { flag: 'N', source: 'auto_numeric' }
+
+  const num = extractNumericValue(raw)
+  const isQualitativeType = opts.valueType === 'qualitative'
+
+  if (num !== null && !isQualitativeType) {
+    const highCrit = extractNumericValue(opts.highCritical ?? null)
+    const lowCrit = extractNumericValue(opts.lowCritical ?? null)
+    if (highCrit !== null && num >= highCrit) return { flag: 'HH', source: 'auto_numeric' }
+    if (lowCrit !== null && num < lowCrit) return { flag: 'LL', source: 'auto_numeric' }
+
+    const { low, high, type } = parseSavedReferenceRange(refRange)
+    if (type === 'range' && low !== null && high !== null) {
+      if (num < low) return { flag: 'L', source: 'auto_numeric' }
+      if (num > high) return { flag: 'H', source: 'auto_numeric' }
+      return { flag: 'N', source: 'auto_numeric' }
+    }
+    if ((type === 'less_than' || type === 'single') && high !== null) {
+      return { flag: num > high ? 'H' : 'N', source: 'auto_numeric' }
+    }
+    if (type === 'greater_than' && low !== null) {
+      return { flag: num < low ? 'L' : 'N', source: 'auto_numeric' }
+    }
+    return { flag: 'N', source: 'auto_numeric' }
+  }
+
+  const lower = raw.toLowerCase()
+  const expected = Array.isArray(opts.expectedNormalValues)
+    ? opts.expectedNormalValues.map((v) => String(v).toLowerCase().trim()).filter(Boolean)
+    : []
+  if (expected.length > 0) {
+    return { flag: expected.includes(lower) ? 'N' : 'A', source: 'auto_text' }
+  }
+  const refLower = String(refRange ?? '').toLowerCase().trim()
+  if (refLower) {
+    const refIsText = SAVED_NORMAL_TEXT.some((p) => p.test(refLower)) || SAVED_ABNORMAL_TEXT.some((p) => p.test(refLower))
+    if (refIsText) return { flag: lower === refLower ? 'N' : 'A', source: 'auto_text' }
+  }
+  if (SAVED_NORMAL_TEXT.some((p) => p.test(lower))) return { flag: 'N', source: 'auto_text' }
+  if (SAVED_ABNORMAL_TEXT.some((p) => p.test(lower))) return { flag: 'A', source: 'auto_text' }
+  return { flag: 'N', source: 'auto_text' }
+}
+
 function normalizeAnalyzerValue(value: unknown): string | null {
   const normalized = String(value ?? '').trim()
   if (!normalized) return null
@@ -440,7 +541,8 @@ async function storeResults(
   genAI: GoogleGenerativeAI,
   parsedData: any,
   labId: string,
-  rawMessageId: string
+  rawMessageId: string,
+  opts: { useSavedReferenceRanges: boolean } = { useSavedReferenceRanges: true }
 ): Promise<{ success: boolean; mapped: number; unmapped: number; log: string }> {
   
   let log = ''
@@ -480,10 +582,10 @@ async function storeResults(
     
     // Use order directly
     const order = orders[0]
-    return await storeResultsForOrder(supabase, genAI, parsedData, order, labId, log)
+    return await storeResultsForOrder(supabase, genAI, parsedData, order, labId, log, opts)
   }
-  
-  return await storeResultsForSample(supabase, genAI, parsedData, sample, labId, log)
+
+  return await storeResultsForSample(supabase, genAI, parsedData, sample, labId, log, opts)
 }
 
 async function storeResultsForOrder(
@@ -492,8 +594,10 @@ async function storeResultsForOrder(
   parsedData: any,
   order: any,
   labId: string,
-  log: string
+  log: string,
+  opts: { useSavedReferenceRanges: boolean } = { useSavedReferenceRanges: true }
 ) {
+  const useSavedReferenceRanges = opts.useSavedReferenceRanges !== false
   let mappedCount = 0
   let unmappedCount = 0
   
@@ -542,10 +646,24 @@ OUTPUT JSON:
     
     if (jsonMatch) {
       const mappings = JSON.parse(jsonMatch[0])
-      for (const m of mappings.mappings || []) {
-        if (m.analyzer_code && m.analyte_id) {
-          analyteMap.set(m.analyzer_code.toUpperCase(), m)
+      // The AI may echo either the machine code or the mnemonic name in
+      // analyzer_code, but the downstream lookup keys on (analyzer_code ||
+      // test_code). Reconcile the AI's answer back to the real result code (by
+      // code OR name) so a correct mapping is never filed under the wrong key.
+      const realCodeByToken = new Map<string, string>()
+      for (const r of parsedData.results || []) {
+        const realCode = String(r.analyzer_code || r.test_code || '').toUpperCase()
+        if (!realCode) continue
+        for (const token of [r.analyzer_code, r.test_code, r.name]) {
+          const key = normalizeAnalyteName(token)
+          if (key && !realCodeByToken.has(key)) realCodeByToken.set(key, realCode)
         }
+      }
+      for (const m of mappings.mappings || []) {
+        if (!m.analyzer_code || !m.analyte_id) continue
+        const realCode = realCodeByToken.get(normalizeAnalyteName(m.analyzer_code))
+          || String(m.analyzer_code).toUpperCase()
+        if (!analyteMap.has(realCode)) analyteMap.set(realCode, m)
       }
     }
   } catch (e: any) {
@@ -581,22 +699,52 @@ OUTPUT JSON:
   }
   
   // Insert result values
-  // Batch-resolve lab_analyte_id for all mapped analytes
+  // Batch-resolve lab_analyte_id for all mapped analytes, plus the lab's saved
+  // reference ranges / critical thresholds used to derive the range and flag.
   const allMappedAnalyteIds = Array.from(analyteMap.values()).map((m: any) => m.analyte_id).filter(Boolean) as string[]
   const labAnalyteIdMap = new Map<string, string>()
+  const refRangeMap = new Map<string, {
+    lab_specific: string | null; ref_generic: string | null;
+    ref_male: string | null; ref_female: string | null;
+    low_critical: string | null; high_critical: string | null;
+    value_type: string | null; expected_normal_values: unknown
+  }>()
   if (allMappedAnalyteIds.length > 0) {
     const { data: laRows } = await supabase
       .from('lab_analytes')
-      .select('id, analyte_id')
+      .select('id, analyte_id, reference_range, reference_range_male, reference_range_female, lab_specific_reference_range, low_critical, high_critical, value_type, expected_normal_values')
       .eq('lab_id', labId)
       .in('analyte_id', allMappedAnalyteIds)
       .order('created_at', { ascending: true })
     if (laRows) {
       for (const la of laRows) {
         if (!labAnalyteIdMap.has(la.analyte_id)) labAnalyteIdMap.set(la.analyte_id, la.id)
+        refRangeMap.set(la.id, {
+          lab_specific: la.lab_specific_reference_range || null,
+          ref_generic:  la.reference_range || null,
+          ref_male:     la.reference_range_male || null,
+          ref_female:   la.reference_range_female || null,
+          low_critical: la.low_critical || null,
+          high_critical: la.high_critical || null,
+          value_type: la.value_type || null,
+          expected_normal_values: la.expected_normal_values ?? null,
+        })
       }
     }
   }
+
+  // Patient gender drives gender-specific saved ranges.
+  let patientGender: string | null = null
+  if (useSavedReferenceRanges && order.patient_id) {
+    const { data: patientRow } = await supabase
+      .from('patients')
+      .select('gender')
+      .eq('id', order.patient_id)
+      .maybeSingle()
+    patientGender = patientRow?.gender ?? null
+  }
+  const isMale = patientGender?.toLowerCase().startsWith('m')
+  const isFemale = patientGender?.toLowerCase().startsWith('f')
 
   const mappedCandidates: Array<{ item: any; mapping: any }> = []
   for (const item of parsedData.results) {
@@ -664,11 +812,43 @@ OUTPUT JSON:
   )
 
   for (const { item, mapping } of mappedCandidates) {
+    const labAnalyteId = labAnalyteIdMap.get(mapping.analyte_id) || null
     const aiResolution = mapping.test_group_id
-      ? aiResolvedRanges.get(`${mapping.test_group_id}:${labAnalyteIdMap.get(mapping.analyte_id) || mapping.analyte_id}`)
+      ? aiResolvedRanges.get(`${mapping.test_group_id}:${labAnalyteId || mapping.analyte_id}`)
       : null
-    const finalFlag = aiResolution?.flag || normalizeAnalyzerFlag(item.flag)
-    const finalReferenceRange = aiResolution?.used_reference_range || item.reference_range || '-'
+
+    const rr = labAnalyteId ? refRangeMap.get(labAnalyteId) : null
+    const savedReferenceRange =
+      rr?.lab_specific ||
+      (isMale ? rr?.ref_male : null) ||
+      (isFemale ? rr?.ref_female : null) ||
+      rr?.ref_generic ||
+      null
+    // With the toggle on, the lab's saved range wins and the machine's range is
+    // only a last resort. With it off, keep the prior machine-first behaviour.
+    const fallbackReferenceRange = useSavedReferenceRanges
+      ? (savedReferenceRange || item.reference_range || '-')
+      : (item.reference_range || savedReferenceRange || '-')
+    const finalReferenceRange = aiResolution?.used_reference_range || fallbackReferenceRange
+
+    // Flag: compute from the saved/AI range when the toggle is on; never trust
+    // the analyzer's OBX-8. Keep the machine (or AI) flag when the toggle is off.
+    let finalFlag: string
+    let finalFlagSource: string
+    if (useSavedReferenceRanges) {
+      const computed = computeSavedFlag(item.value, finalReferenceRange, {
+        lowCritical: rr?.low_critical,
+        highCritical: rr?.high_critical,
+        expectedNormalValues: rr?.expected_normal_values,
+        valueType: rr?.value_type,
+      })
+      finalFlag = computed.flag
+      finalFlagSource = computed.source
+    } else {
+      finalFlag = aiResolution?.flag || normalizeAnalyzerFlag(item.flag)
+      finalFlagSource = aiResolution ? 'ai' : 'analyzer'
+    }
+
     const fallbackReason = aiResolution
       ? null
       : !mapping.test_group_id
@@ -683,7 +863,8 @@ OUTPUT JSON:
       test_group_id: mapping.test_group_id || null,
       analyte_id: mapping.analyte_id,
       analyzer_code: item.analyzer_code || item.test_code || null,
-      range_source: aiResolution ? 'ai' : 'analyzer',
+      range_source: aiResolution ? 'ai' : (useSavedReferenceRanges ? 'lab_saved' : 'analyzer'),
+      flag_source: finalFlagSource,
       fallback_reason: fallbackReason,
       reference_range: finalReferenceRange,
       flag: finalFlag,
@@ -694,7 +875,7 @@ OUTPUT JSON:
       order_id: order.id,
       lab_id: labId,
       analyte_id: mapping.analyte_id,
-      lab_analyte_id: labAnalyteIdMap.get(mapping.analyte_id) || null,
+      lab_analyte_id: labAnalyteId,
       parameter: mapping.analyte_name,
       analyte_name: mapping.analyte_name,
       value: item.value,
@@ -702,7 +883,7 @@ OUTPUT JSON:
       flag: finalFlag,
       reference_range: finalReferenceRange,
       extracted_by_ai: true,
-      flag_source: aiResolution ? 'ai' : 'analyzer',
+      flag_source: finalFlagSource,
       test_group_id: mapping.test_group_id,
       order_test_id: mapping.order_test_id
     })
@@ -733,7 +914,8 @@ async function storeResultsForSample(
   parsedData: any,
   sample: any,
   labId: string,
-  log: string
+  log: string,
+  opts: { useSavedReferenceRanges: boolean } = { useSavedReferenceRanges: true }
 ) {
   // Get order from sample
   const { data: order } = await supabase
@@ -741,12 +923,12 @@ async function storeResultsForSample(
     .select('id, patient_id')
     .eq('id', sample.order_id)
     .single()
-  
+
   if (!order) {
     return { success: false, mapped: 0, unmapped: parsedData.results.length, log: 'Order not found for sample' }
   }
-  
-  return await storeResultsForOrder(supabase, genAI, parsedData, order, labId, log)
+
+  return await storeResultsForOrder(supabase, genAI, parsedData, order, labId, log, opts)
 }
 
 Deno.serve(async (req) => {
@@ -825,8 +1007,21 @@ Deno.serve(async (req) => {
       .update({ sample_barcode: parsedData.barcode })
       .eq('id', record.id)
 
+    // Per-connection toggle: derive the reference range + flag from the lab's
+    // SAVED analyte settings instead of trusting the analyzer's OBX-7/OBX-8.
+    // Defaults ON; an explicit `use_saved_reference_ranges: false` reverts.
+    let useSavedReferenceRanges = true
+    if (record.analyzer_connection_id) {
+      const { data: connRow } = await supabase
+        .from('analyzer_connections')
+        .select('config')
+        .eq('id', record.analyzer_connection_id)
+        .maybeSingle()
+      if (connRow?.config?.use_saved_reference_ranges === false) useSavedReferenceRanges = false
+    }
+
     // Store results
-    const storeResult = await storeResults(supabase, genAI, parsedData, record.lab_id, record.id)
+    const storeResult = await storeResults(supabase, genAI, parsedData, record.lab_id, record.id, { useSavedReferenceRanges })
 
     // Final update
     await supabase

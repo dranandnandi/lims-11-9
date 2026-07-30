@@ -5,7 +5,8 @@
 //   POST /analyzer-ingest
 //     Store raw analyzer message.
 //   GET /analyzer-ingest/pending
-//     Fetch due push-style mapped orders and reclaim stale send leases.
+//     Fetch due mapped orders (both lims_push and analyzer_initiated flows)
+//     and reclaim stale send leases.
 //   GET /analyzer-ingest/worklist?sample_barcode=...
 //     Fetch one ORR^O02 worklist response for analyzer-initiated flows.
 //   POST /analyzer-ingest/ack
@@ -201,7 +202,7 @@ Deno.serve(async (req) => {
         .select('id, last_error')
         .eq('lab_id', labId)
         .eq('status', 'rejected')
-        .eq('flow_type', 'lims_push')
+        .in('flow_type', ['lims_push', 'analyzer_initiated'])
         .is('sent_at', null)
         .limit(100)
 
@@ -241,7 +242,7 @@ Deno.serve(async (req) => {
         .select('id, retry_count')
         .eq('lab_id', labId)
         .eq('status', 'sending')
-        .eq('flow_type', 'lims_push')
+        .in('flow_type', ['lims_push', 'analyzer_initiated'])
         .or(`sending_started_at.is.null,sending_started_at.lt.${staleBeforeIso}`)
 
       if (staleError) {
@@ -299,7 +300,7 @@ Deno.serve(async (req) => {
         `)
         .eq('lab_id', labId)
         .eq('status', 'mapped')
-        .eq('flow_type', 'lims_push')
+        .in('flow_type', ['lims_push', 'analyzer_initiated'])
         .or(`next_retry_at.is.null,next_retry_at.lte.${nowIso}`)
         .order('priority', { ascending: true })
         .order('created_at', { ascending: true })

@@ -20,6 +20,8 @@ type AccessionSample = {
   rejection_reason?: string | null;
   pre_barcoded?: boolean | null;
   patient_name?: string | null;
+  patient_gender?: string | null;
+  patient_age?: string | number | null;
   order_display?: string | null;
   order_number?: number | null;
   doctor?: string | null;
@@ -114,7 +116,7 @@ const Accession: React.FC = () => {
         orderIds.length
           ? supabase
               .from('orders')
-              .select('id, patient_name, order_display, order_number, doctor')
+              .select('id, patient_name, order_display, order_number, doctor, patients(age, gender)')
               .in('id', orderIds)
           : Promise.resolve({ data: [], error: null } as any),
         orderIds.length
@@ -203,6 +205,8 @@ const Accession: React.FC = () => {
         return {
           ...sample,
           patient_name: order?.patient_name || null,
+          patient_gender: order?.patients?.gender || null,
+          patient_age: order?.patients?.age ?? null,
           order_display: order?.order_display || null,
           order_number: order?.order_number || null,
           doctor: order?.doctor || null,
@@ -360,6 +364,8 @@ const Accession: React.FC = () => {
       patientName: sample.patient_name || 'Sample',
       sampleType: sample.sample_type || 'Sample',
       date: new Date(sample.created_at).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: '2-digit' }).replace(/ /g, '-'),
+      gender: sample.patient_gender || undefined,
+      age: sample.patient_age != null && String(sample.patient_age).trim() !== '' ? String(sample.patient_age) : undefined,
       referredBy: sample.doctor && sample.doctor !== 'Self' ? sample.doctor : undefined,
     };
 

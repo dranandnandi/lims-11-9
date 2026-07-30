@@ -21,6 +21,7 @@ import {
   X,
 } from 'lucide-react';
 import { database, supabase } from '../../utils/supabase';
+import { SAMPLE_TYPES } from '../../utils/sampleTypes';
 
 const IMPORT_FUNCTION_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/ai-report-import`;
 
@@ -226,6 +227,8 @@ const ReportImportWizard: React.FC<Props> = ({
       },
       existing_analytes: existingAnalytes,
       existing_tga: existingTga,
+      // sample_type is an enum column — tell the AI what it may return
+      allowed_sample_types: SAMPLE_TYPES,
     };
 
     let response: Response;
@@ -333,14 +336,17 @@ const ReportImportWizard: React.FC<Props> = ({
           section_heading: change.tga_updates.section_heading ?? change.current_values.section_heading ?? null,
           is_visible: true,
         };
-        const existingTgaRow = existingTga.find((row) =>
-          row.lab_analyte_id
-            ? row.lab_analyte_id === change.lab_analyte_id
-            : row.analyte_id === change.analyte_id
+        // The table is UNIQUE (test_group_id, analyte_id) — match the existing row
+        // on analyte_id, not just lab_analyte_id, or we insert a duplicate.
+        const existingTgaRow = existingTga.find(
+          (row) => row.analyte_id === change.analyte_id ||
+            (!!row.lab_analyte_id && row.lab_analyte_id === change.lab_analyte_id)
         );
         const tgaQuery = existingTgaRow?.id
           ? supabase.from('test_group_analytes').update(tgaPayload).eq('id', existingTgaRow.id)
-          : supabase.from('test_group_analytes').insert(tgaPayload);
+          : supabase
+              .from('test_group_analytes')
+              .upsert(tgaPayload, { onConflict: 'test_group_id,analyte_id' });
         const { error: tgaErr } = await tgaQuery;
         if (tgaErr) {
           log.push(`✗ ${change.matched_name} — test group attach/update failed: ${tgaErr.message}`);
@@ -387,14 +393,17 @@ const ReportImportWizard: React.FC<Props> = ({
 
       const { error: attachErr } = await supabase
         .from('test_group_analytes')
-        .insert({
-          test_group_id: testGroupId,
-          analyte_id: createdAnalyte.id,
-          lab_analyte_id: createdAnalyte.lab_analyte_id,
-          sort_order: unmatched.position || 0,
-          section_heading: unmatched.section_header || null,
-          is_visible: true,
-        });
+        .upsert(
+          {
+            test_group_id: testGroupId,
+            analyte_id: createdAnalyte.id,
+            lab_analyte_id: createdAnalyte.lab_analyte_id,
+            sort_order: unmatched.position || 0,
+            section_heading: unmatched.section_header || null,
+            is_visible: true,
+          },
+          { onConflict: 'test_group_id,analyte_id' }
+        );
 
       if (attachErr) {
         log.push(`✗ ${unmatched.extracted_name} — created but failed to attach: ${attachErr.message}`);

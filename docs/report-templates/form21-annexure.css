@@ -1,0 +1,51 @@
+body { font-family: "Times New Roman", Georgia, serif; font-size: 12px; color: #000; margin: 18px; }
+
+.form-title { text-align: center; margin-bottom: 4px; }
+.form-title h1 { font-size: 18px; margin: 0; letter-spacing: 1px; }
+.form-title .rule { font-size: 11px; font-style: italic; margin: 2px 0; }
+.form-title h2 { font-size: 14px; margin: 4px 0 0; text-decoration: underline; }
+.form-title .scope { font-size: 10px; margin: 3px 0 0; }
+
+hr.sep { border: none; border-top: 1.5px solid #000; margin: 8px 0 10px; }
+
+.worker { width: 100%; border-collapse: collapse; margin-bottom: 12px; }
+.worker td { border: 1px solid #000; padding: 4px 6px; font-size: 11px; }
+.worker td.lbl { font-weight: bold; width: 18%; background: #f2f2f2; }
+
+.annexure-head { text-align: center; margin: 14px 0 10px; }
+.annexure-head h2 { font-size: 14px; margin: 0; text-decoration: underline; }
+.annexure-head h3 { font-size: 12px; margin: 3px 0 0; }
+
+.item { margin: 0 0 10px; page-break-inside: avoid; }
+.item > h4 {
+  font-size: 12px; margin: 0 0 4px; padding: 3px 6px;
+  background: #e8e8e8; border-left: 3px solid #000; font-weight: bold;
+}
+.item .body { padding-left: 6px; }
+
+.subhead { font-size: 11px; font-weight: bold; margin: 6px 0 3px; text-decoration: underline; }
+
+/* Report sections inject here — matches .section-content CSS in the PDF shell */
+.section-content table { width: 100%; border-collapse: collapse; margin: 4px 0; font-size: 11px; }
+.section-content th, .section-content td { border: 1px solid #666; padding: 3px 5px; }
+.section-content th { background: #f2f2f2; font-weight: bold; }
+.section-content p { margin: 3px 0; }
+.section-images img { max-width: 45%; margin: 6px 6px 0 0; border: 1px solid #999; }
+
+.lab-table { width: 100%; border-collapse: collapse; font-size: 11px; margin: 4px 0 10px; }
+.lab-table th { background: #e8e8e8; border: 1px solid #000; padding: 4px 6px; text-align: left; }
+.lab-table td { border: 1px solid #666; padding: 3px 6px; }
+.lab-table td.val { font-weight: bold; }
+.lab-table tr.grp td { background: #f7f7f7; font-weight: bold; font-style: italic; }
+
+.notes { font-size: 10px; margin: 10px 0; padding: 6px; border: 1px solid #999; background: #fafafa; }
+
+.sign-block { margin-top: 40px; page-break-inside: avoid; }
+.sign-row { width: 100%; border-collapse: collapse; margin-top: 34px; }
+.sign-row td { width: 50%; vertical-align: bottom; font-size: 11px; }
+.sign-row td.right { text-align: right; }
+.sign-line { border-top: 1px solid #000; padding-top: 3px; display: inline-block; min-width: 210px; }
+.sign-img { max-height: 46px; display: block; margin-bottom: 2px; }
+
+.footer { margin-top: 22px; text-align: center; font-size: 10px; color: #444;
+          border-top: 1px solid #999; padding-top: 5px; }

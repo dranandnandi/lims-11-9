@@ -1108,6 +1108,10 @@ const Tests: React.FC = () => {
             calculationResultType: labAnalyte.calculation_result_type ?? analyteSource?.calculation_result_type ?? analyte.calculationResultType ?? 'numeric',
             // Lab-level display name override
             display_name: labAnalyte.display_name || null,
+            // Report precision: lab-level only, null = inherit (never fall back to global here)
+            decimal_places: labAnalyte.decimal_places ?? null,
+            min_integer_digits: labAnalyte.min_integer_digits ?? null,
+            value_type: labAnalyte.value_type ?? null,
             lab_analyte_id: labAnalyte.id || analyte.lab_analyte_id,
           });
           setShowEditAnalyteModal(true);
@@ -2834,6 +2838,9 @@ const Tests: React.FC = () => {
                 formula_variables: editingAnalyte.formulaVariables,
                 formula_description: editingAnalyte.formulaDescription,
                 display_name: (editingAnalyte as any).display_name || null,
+                value_type: (editingAnalyte as any).value_type ?? undefined,
+                decimal_places: (editingAnalyte as any).decimal_places ?? null,
+                min_integer_digits: (editingAnalyte as any).min_integer_digits ?? null,
               }}
               availableAnalytes={analytes
                 .filter(a => a.id !== editingAnalyte.id)

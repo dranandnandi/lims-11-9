@@ -1,6 +1,6 @@
 import React from 'react';
 import { useState, useEffect } from 'react';
-import { X, User, Phone, Mail, MapPin, Droplet, FileText, QrCode, Palette, Printer, Edit, Plus, Upload, ExternalLink, Calendar, Gift, Smartphone, KeyRound, Copy, Check } from 'lucide-react';
+import { X, User, Phone, Mail, MapPin, Droplet, FileText, QrCode, Palette, Printer, Edit, Plus, Upload, ExternalLink, Calendar, Gift, Smartphone, KeyRound, Copy, Check, Eye, EyeOff } from 'lucide-react';
 import { QRCodeCanvas } from 'qrcode.react';
 import { database, supabase, formatAge, LabPatientFieldConfig } from '../../utils/supabase';
 import { WhatsAppAPI } from '../../utils/whatsappAPI';
@@ -34,6 +34,19 @@ interface Patient {
   updated_at: string;
 }
 
+// One row of the lab-scoped patient_portal_credentials view: the patient's virtual
+// login plus the last PIN this lab issued. Supabase Auth only stores the hash, so this
+// is the only way the PIN survives past the moment it was generated.
+interface PortalCredential {
+  portal_email: string | null;
+  portal_pin: string | null;
+  pin_status: 'available' | 'patient_changed' | 'not_recorded' | 'no_access';
+  pin_recorded_at: string | null;
+  portal_access_enabled: boolean | null;
+  // False for roles below admin/owner/lab_manager, whose RLS hides the PIN column
+  can_view_pin: boolean | null;
+}
+
 interface PatientDetailsProps {
   patient: Patient;
   onClose: () => void;
@@ -59,6 +72,8 @@ const PatientDetails: React.FC<PatientDetailsProps> = ({
   const [portalLoading, setPortalLoading] = useState(false);
   const [portalPin, setPortalPin] = useState<string | null>(null);
   const [portalAction, setPortalAction] = useState<'created' | 'pin_reset' | null>(null);
+  const [portalCred, setPortalCred] = useState<PortalCredential | null>(null);
+  const [revealPin, setRevealPin] = useState(false);
   const [pinCopied, setPinCopied] = useState(false);
   const [pinWAStatus, setPinWAStatus] = useState<'sending' | 'sent' | 'failed' | null>(null);
   const [externalReports, setExternalReports] = useState<any[]>([]);
@@ -220,6 +235,27 @@ const PatientDetails: React.FC<PatientDetailsProps> = ({
     }
   };
 
+  // Reads the lab-scoped view, so this only ever returns the caller's own lab row
+  // even when the same mobile number is registered at other labs.
+  const loadPortalCredential = async () => {
+    const { data, error } = await supabase
+      .from('patient_portal_credentials')
+      .select('portal_email, portal_pin, pin_status, pin_recorded_at, portal_access_enabled, can_view_pin')
+      .eq('patient_id', patient.id)
+      .maybeSingle();
+
+    if (error) {
+      console.error('Error loading portal credential:', error);
+      return;
+    }
+    setPortalCred((data as PortalCredential | null) ?? null);
+  };
+
+  useEffect(() => {
+    setRevealPin(false);
+    loadPortalCredential();
+  }, [patient.id]);
+
   const buildPortalCredentialsMessage = (pin: string) => {
     const portalUrl = `${window.location.origin}/patient/login`;
     return `Hello ${patient.name},\n\nYour patient portal access is ready!\n\n` +
@@ -265,6 +301,7 @@ const PatientDetails: React.FC<PatientDetailsProps> = ({
       if (!res.ok || json.error) throw new Error(json.error || 'Failed');
       setPortalPin(json.pin);
       setPortalAction(json.action);
+      loadPortalCredential();
       // Auto-send credentials to the patient via WhatsApp
       sendPinViaWhatsApp(json.pin);
     } catch (err) {
@@ -274,12 +311,10 @@ const PatientDetails: React.FC<PatientDetailsProps> = ({
     }
   };
 
-  const handleCopyPin = () => {
-    if (portalPin) {
-      navigator.clipboard.writeText(portalPin);
-      setPinCopied(true);
-      setTimeout(() => setPinCopied(false), 2000);
-    }
+  const handleCopyPin = (pin: string) => {
+    navigator.clipboard.writeText(pin);
+    setPinCopied(true);
+    setTimeout(() => setPinCopied(false), 2000);
   };
 
   const handleEditPatient = () => {
@@ -725,46 +760,94 @@ const PatientDetails: React.FC<PatientDetailsProps> = ({
             </div>
           )}
 
-          {/* Portal PIN Result */}
-          {portalPin && (
-            <div className="mt-4 p-4 bg-teal-50 border border-teal-200 rounded-lg">
-              <p className="text-sm font-medium text-teal-800 mb-2">
-                {portalAction === 'created' ? 'Portal access created!' : 'PIN reset successfully!'}
-                {' '}Share this PIN with the patient via WhatsApp:
-              </p>
-              <div className="flex items-center gap-3 flex-wrap">
-                <span className="font-mono text-2xl font-bold text-teal-700 tracking-widest">{portalPin}</span>
-                <button
-                  onClick={handleCopyPin}
-                  className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-white border border-teal-300 text-teal-700 rounded-lg hover:bg-teal-50 transition-colors"
-                >
-                  {pinCopied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-                  {pinCopied ? 'Copied!' : 'Copy PIN'}
-                </button>
-                <button
-                  onClick={() => sendPinViaWhatsApp(portalPin)}
-                  disabled={pinWAStatus === 'sending'}
-                  className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-60 transition-colors"
-                >
-                  <Smartphone className="h-3.5 w-3.5" />
-                  {pinWAStatus === 'sending' ? 'Sending...' : pinWAStatus === 'sent' ? 'Resend WhatsApp' : 'Send via WhatsApp'}
-                </button>
+          {/* Portal access — the PIN just generated, or the one this lab last issued.
+              Read back from patient_portal_credentials so it survives a page reload
+              instead of being visible only in the response that created it. */}
+          {(portalPin || portalCred?.portal_access_enabled) && (() => {
+            const currentPin = portalPin || portalCred?.portal_pin || null;
+            const isFresh = Boolean(portalPin);
+
+            return (
+              <div className="mt-4 p-4 bg-teal-50 border border-teal-200 rounded-lg">
+                <div className="flex items-center gap-2 mb-2">
+                  <KeyRound className="h-4 w-4 text-teal-700" />
+                  <p className="text-sm font-medium text-teal-800">
+                    {isFresh
+                      ? `${portalAction === 'created' ? 'Portal access created!' : 'PIN reset successfully!'} Share this PIN with the patient:`
+                      : 'Patient Portal Access'}
+                  </p>
+                </div>
+
+                {currentPin ? (
+                  <>
+                    <div className="flex items-center gap-3 flex-wrap">
+                      <span className="font-mono text-2xl font-bold text-teal-700 tracking-widest">
+                        {isFresh || revealPin ? currentPin : '••••••'}
+                      </span>
+                      {!isFresh && (
+                        <button
+                          onClick={() => setRevealPin((v) => !v)}
+                          className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-white border border-teal-300 text-teal-700 rounded-lg hover:bg-teal-50 transition-colors"
+                        >
+                          {revealPin ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                          {revealPin ? 'Hide' : 'Show PIN'}
+                        </button>
+                      )}
+                      <button
+                        onClick={() => handleCopyPin(currentPin)}
+                        className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-white border border-teal-300 text-teal-700 rounded-lg hover:bg-teal-50 transition-colors"
+                      >
+                        {pinCopied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                        {pinCopied ? 'Copied!' : 'Copy PIN'}
+                      </button>
+                      <button
+                        onClick={() => sendPinViaWhatsApp(currentPin)}
+                        disabled={pinWAStatus === 'sending' || !patient.phone}
+                        className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-60 transition-colors"
+                      >
+                        <Smartphone className="h-3.5 w-3.5" />
+                        {pinWAStatus === 'sending' ? 'Sending...' : pinWAStatus === 'sent' ? 'Resend WhatsApp' : 'Send via WhatsApp'}
+                      </button>
+                    </div>
+                    {!isFresh && portalCred?.pin_recorded_at && (
+                      <p className="text-xs text-teal-600 mt-2">
+                        Issued {new Date(portalCred.pin_recorded_at).toLocaleString('en-IN')}
+                      </p>
+                    )}
+                  </>
+                ) : portalCred?.can_view_pin === false ? (
+                  <p className="text-sm text-teal-700">
+                    Portal access is active. Only an admin, owner or lab manager can view the PIN.
+                  </p>
+                ) : portalCred?.pin_status === 'patient_changed' ? (
+                  <p className="text-sm text-teal-700">
+                    The patient has set their own PIN, so it can no longer be shown here.
+                    Use <span className="font-medium">Reset Portal PIN</span> to issue a new one.
+                  </p>
+                ) : (
+                  <p className="text-sm text-teal-700">
+                    This PIN was issued before PINs were recorded, so it cannot be shown.
+                    Use <span className="font-medium">Reset Portal PIN</span> to issue one you can see.
+                  </p>
+                )}
+
+                {pinWAStatus === 'sent' && (
+                  <p className="text-xs text-green-700 mt-2 flex items-center gap-1">
+                    <Check className="h-3.5 w-3.5" /> Credentials sent to {patient.phone} via WhatsApp.
+                  </p>
+                )}
+                {pinWAStatus === 'failed' && (
+                  <p className="text-xs text-red-600 mt-2">
+                    WhatsApp auto-send failed — share the PIN manually or retry with the button above.
+                  </p>
+                )}
+                <p className="text-xs text-teal-600 mt-2">
+                  Patient logs in at <span className="font-mono">/patient/login</span> with their mobile number + this PIN.
+                  {' '}If the number is registered at other labs too, the PIN decides which lab's reports open.
+                </p>
               </div>
-              {pinWAStatus === 'sent' && (
-                <p className="text-xs text-green-700 mt-2 flex items-center gap-1">
-                  <Check className="h-3.5 w-3.5" /> Credentials sent to {patient.phone} via WhatsApp.
-                </p>
-              )}
-              {pinWAStatus === 'failed' && (
-                <p className="text-xs text-red-600 mt-2">
-                  WhatsApp auto-send failed — share the PIN manually or retry with the button above.
-                </p>
-              )}
-              <p className="text-xs text-teal-600 mt-2">
-                Patient logs in at <span className="font-mono">/patient/login</span> with their mobile number + this PIN.
-              </p>
-            </div>
-          )}
+            );
+          })()}
 
           {/* Action Buttons */}
           <div className="flex items-center justify-end space-x-4 pt-6 border-t border-gray-200 flex-wrap gap-y-2">
@@ -778,7 +861,7 @@ const PatientDetails: React.FC<PatientDetailsProps> = ({
               {portalLoading ? (
                 <><div className="animate-spin rounded-full h-4 w-4 border-b-2 border-teal-600 mr-2" />Generating...</>
               ) : (
-                <><Smartphone className="h-4 w-4 mr-2" />{(patient as any).portal_access_enabled ? 'Reset Portal PIN' : 'Generate Portal Access'}</>
+                <><Smartphone className="h-4 w-4 mr-2" />{(portalCred?.portal_access_enabled ?? (patient as any).portal_access_enabled) ? 'Reset Portal PIN' : 'Generate Portal Access'}</>
               )}
             </button>
 

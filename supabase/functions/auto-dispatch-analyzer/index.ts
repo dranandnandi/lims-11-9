@@ -257,6 +257,21 @@ Deno.serve(async (req) => {
       }
     }
 
+    // 4a. Fetch connection configs to honour receive-only (inbound) analyzers.
+    // A connection marked config.direction = 'receive_only' must never have an
+    // order/worklist staged for it — results are still ingested by barcode.
+    const analyzerConnectionIds = [...byAnalyzer.keys()]
+    const { data: connRows } = await supabase
+      .from('analyzer_connections')
+      .select('id, config')
+      .in('id', analyzerConnectionIds)
+
+    const receiveOnly = new Set(
+      (connRows ?? [])
+        .filter((c: any) => c.config?.direction === 'receive_only')
+        .map((c: any) => c.id)
+    )
+
     // 4. Check for existing queue entries to avoid double-dispatch
     const { data: existingQueue } = await supabase
       .from('analyzer_order_queue')
@@ -272,6 +287,15 @@ Deno.serve(async (req) => {
     const results: any[] = []
 
     for (const [analyzerConnectionId, group] of byAnalyzer) {
+      if (receiveOnly.has(analyzerConnectionId)) {
+        results.push({
+          analyzer_connection_id: analyzerConnectionId,
+          skipped: true,
+          reason: 'Receive-only analyzer — orders are not sent to this instrument',
+        })
+        continue
+      }
+
       if (alreadyDispatched.has(analyzerConnectionId)) {
         results.push({
           analyzer_connection_id: analyzerConnectionId,

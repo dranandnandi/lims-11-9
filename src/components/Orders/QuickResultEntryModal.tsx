@@ -5,7 +5,7 @@
 
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import ReactDOM from "react-dom";
-import { X, Save, CheckCircle, ChevronDown, Loader2, RefreshCw, EyeOff, Link2 } from "lucide-react";
+import { X, Save, CheckCircle, ChevronDown, ChevronRight, Loader2, RefreshCw, EyeOff, Link2, Building2, ShieldCheck, Undo2 } from "lucide-react";
 import { supabase, database } from "../../utils/supabase";
 import { useAuth } from "../../contexts/AuthContext";
 import { calculateFlag, calculateFlagsForResults } from "../../utils/flagCalculation";
@@ -13,6 +13,7 @@ import { selectPreferredCalculatedDependencies } from "../../utils/calculatedDep
 import { evaluateTextCalculation, normalizeCalculationResultType } from "../../utils/calculationRules";
 import SectionEditor, { SectionEditorRef } from "../Results/SectionEditor";
 import InlineDependencyEditor from "../Results/InlineDependencyEditor";
+import OutsourcedReportUpload from "../Results/OutsourcedReportUpload";
 import {
   applyAnalyteInterfaceConversion,
   getAnalyteInterfaceConfig,
@@ -20,6 +21,11 @@ import {
   type AnalyteInterfaceConversionConfig,
 } from "../../utils/analyteInterfaceConversion";
 import { normalizeResultFlagForSave } from "../../utils/referenceRangeService";
+import {
+  FALLBACK_DECIMAL_PLACES,
+  normalizeDecimalPlaces,
+  roundHalfUp,
+} from "../../utils/resultValueFormat";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -43,12 +49,18 @@ interface AnalyteRow {
   formula?: string | null;
   formula_variables?: string[] | string | null;
   calculation_result_type?: string | null;
+  // Report/calculation precision resolved from lab_analytes → analytes.
+  decimal_places?: number | null;
   verify_note?: string;
   is_rerun?: boolean;
   is_hidden_from_report?: boolean;
   hidden_reason?: string;
   interface_config?: AnalyteInterfaceConversionConfig | null;
   interface_conversion_pending?: boolean;
+  // Present only for analytes already persisted to result_values. Needed so a
+  // saved row can be approved / unapproved without leaving the modal.
+  result_value_id?: string | null;
+  verify_status?: string | null;
 }
 
 interface TestGroup {
@@ -70,6 +82,7 @@ interface TestGroup {
 	    formula?: string | null;
 	    formula_variables?: string[] | string | null;
 	    calculation_result_type?: string | null;
+	    decimal_places?: number | null;
 	    expected_normal_values?: string[];
 	    expected_value_flag_map?: Record<string, string>;
 	    value_type?: string;
@@ -77,6 +90,7 @@ interface TestGroup {
 	    default_value?: string | null;
       interface_config?: AnalyteInterfaceConversionConfig | null;
 	    existing_result?: {
+      id?: string;
       value: string;
       unit?: string;
       reference_range?: string;
@@ -89,6 +103,16 @@ interface TestGroup {
       parameter?: string;
     } | null;
   }[];
+}
+
+// Outsourced tests have no analytes to key in — the external lab sends back a
+// PDF. They are kept out of `testGroups` (and therefore out of the save path)
+// and rendered as attach-only panels instead.
+interface OutsourcedGroup {
+  test_group_id: string;
+  test_group_name: string;
+  order_test_id: string;
+  outsourced_lab_name: string | null;
 }
 
 interface QuickResultEntryModalProps {
@@ -174,6 +198,7 @@ const toVariableSlug = (name: string): string => {
   analyteId: string,
   labAnalyteId?: string | null,
   calculationResultType?: string | null,
+  decimalPlaces?: number | null,
 ): string {
   const scope: Record<string, number> = {};
   // Normalize math syntax first so 'pow'/'Math' tokens are handled before Phase 2 scanning.
@@ -230,8 +255,11 @@ const toVariableSlug = (name: string): string => {
   try {
     // eslint-disable-next-line no-new-func
     const result = new Function(`return (${resolved})`)();
+    // Store at the analyte's configured precision so this modal, calculationEngine
+    // and the PDF all agree. Unconfigured stays at 2 dp, as it always was.
+    const decimals = normalizeDecimalPlaces(decimalPlaces) ?? FALLBACK_DECIMAL_PLACES;
     return typeof result === "number" && Number.isFinite(result)
-      ? String(Math.round(result * 100) / 100)
+      ? String(roundHalfUp(result, decimals))
       : "";
   } catch { return ""; }
 }
@@ -242,6 +270,10 @@ const uuidProp = (key: string, value: string | null | undefined) => {
   const id = safeUuid(value);
   return id ? { [key]: id } : {};
 };
+
+// A row is keyed in fresh when it has no saved value yet, or when verification
+// sent it back for a re-run. Everything else is shown in the saved panel.
+const isEditableRow = (r: AnalyteRow) => !r.is_existing || !!r.is_rerun;
 
 const getGroupKey = (tg: Pick<TestGroup, "test_group_id" | "order_test_group_id" | "order_test_id">) => {
   const orderTestGroupId = safeUuid(tg.order_test_group_id);
@@ -261,6 +293,7 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
 
   const [loading, setLoading] = useState(true);
   const [testGroups, setTestGroups] = useState<TestGroup[]>([]);
+  const [outsourcedGroups, setOutsourcedGroups] = useState<OutsourcedGroup[]>([]);
   const [rows, setRows] = useState<AnalyteRow[]>([]);
   const [calcDeps, setCalcDeps] = useState<DepRow[]>([]);
   const [flagOptions, setFlagOptions] = useState(DEFAULT_FLAG_OPTIONS);
@@ -270,6 +303,11 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
   const [groupRemarks, setGroupRemarks] = useState<Record<string, string>>({});
   const [initialGroupRemarks, setInitialGroupRemarks] = useState<Record<string, string>>({});
   const [activeGroupId, setActiveGroupId] = useState<string | null>(null);
+  // Saved analytes render collapsed by default — a group is only expanded once
+  // the user explicitly opens it to review or edit.
+  const [expandedSavedGroups, setExpandedSavedGroups] = useState<Set<string>>(new Set());
+  const [approvingKey, setApprovingKey] = useState<string | null>(null);
+  const [showApproveAllButton, setShowApproveAllButton] = useState(false);
   // result row IDs per test_group_id — needed to render SectionEditor
   const [resultIds, setResultIds] = useState<Map<string, string>>(new Map());
   // Inline dependency editor state
@@ -294,20 +332,39 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
   useEffect(() => {
     loadData();
     loadFlagOptions();
+    loadApproveAllSetting();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [order.id]);
 
   useEffect(() => {
-    if (activeGroupId && !testGroups.some((tg) => tg.test_group_id === activeGroupId)) {
+    if (
+      activeGroupId &&
+      !testGroups.some((tg) => tg.test_group_id === activeGroupId) &&
+      !outsourcedGroups.some((og) => og.test_group_id === activeGroupId)
+    ) {
       setActiveGroupId(null);
     }
-  }, [activeGroupId, testGroups]);
+  }, [activeGroupId, testGroups, outsourcedGroups]);
 
   const loadFlagOptions = async () => {
     try {
       const { data } = await supabase.from("labs").select("flag_options").eq("id", order.lab_id).single();
       if (data?.flag_options?.length) setFlagOptions(data.flag_options);
     } catch { /* keep defaults */ }
+  };
+
+  // Kept as its own query so a lab that has not run the migration yet still gets
+  // its flag options — the button simply stays hidden.
+  const loadApproveAllSetting = async () => {
+    try {
+      const { data, error } = await supabase
+        .from("labs")
+        .select("show_approve_all_in_result_entry")
+        .eq("id", order.lab_id)
+        .single();
+      if (error) throw error;
+      setShowApproveAllButton(!!(data as any)?.show_approve_all_in_result_entry);
+    } catch { setShowApproveAllButton(false); }
   };
 
   const loadData = async () => {
@@ -323,25 +380,26 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
               id, name, is_section_only, ref_range_ai_config,
               test_group_analytes(
                 analyte_id, lab_analyte_id, sort_order, display_order,
-                analytes(id, name, code, unit, reference_range, is_calculated, formula, formula_variables, calculation_result_type, expected_normal_values, expected_value_flag_map, value_type, expected_value_codes),
-                lab_analytes(id, name, unit, reference_range, lab_specific_reference_range, is_calculated, formula, formula_variables, calculation_result_type, expected_normal_values, expected_value_flag_map, value_type, expected_value_codes, default_value, lab_analyte_interface_config(multiply_by, add_offset, lims_unit, apply_to_quick_result_entry))
+                analytes(id, name, code, unit, reference_range, is_calculated, formula, formula_variables, calculation_result_type, decimal_places, expected_normal_values, expected_value_flag_map, value_type, expected_value_codes),
+                lab_analytes(id, name, unit, reference_range, lab_specific_reference_range, is_calculated, formula, formula_variables, calculation_result_type, decimal_places, expected_normal_values, expected_value_flag_map, value_type, expected_value_codes, default_value, lab_analyte_interface_config(multiply_by, add_offset, decimal_places, lims_unit, apply_to_quick_result_entry))
               )
             )
           ),
           order_tests(
             id, test_name, test_group_id, is_canceled, outsourced_lab_id,
+            outsourced_labs(name),
             test_groups(
               id, name, is_section_only, ref_range_ai_config,
               test_group_analytes(
                 analyte_id, lab_analyte_id, sort_order, display_order,
-                analytes(id, name, code, unit, reference_range, is_calculated, formula, formula_variables, calculation_result_type, expected_normal_values, expected_value_flag_map, value_type, expected_value_codes),
-                lab_analytes(id, name, unit, reference_range, lab_specific_reference_range, is_calculated, formula, formula_variables, calculation_result_type, expected_normal_values, expected_value_flag_map, value_type, expected_value_codes, default_value, lab_analyte_interface_config(multiply_by, add_offset, lims_unit, apply_to_quick_result_entry))
+                analytes(id, name, code, unit, reference_range, is_calculated, formula, formula_variables, calculation_result_type, decimal_places, expected_normal_values, expected_value_flag_map, value_type, expected_value_codes),
+                lab_analytes(id, name, unit, reference_range, lab_specific_reference_range, is_calculated, formula, formula_variables, calculation_result_type, decimal_places, expected_normal_values, expected_value_flag_map, value_type, expected_value_codes, default_value, lab_analyte_interface_config(multiply_by, add_offset, decimal_places, lims_unit, apply_to_quick_result_entry))
               )
             )
           ),
           results(
             id, order_test_group_id, order_test_id, test_group_id, notes,
-		            result_values(analyte_id, lab_analyte_id, analyte_name, parameter, value, unit, reference_range, flag, verify_note, verify_status, is_hidden_from_report, hidden_reason)
+		            result_values(id, analyte_id, lab_analyte_id, analyte_name, parameter, value, unit, reference_range, flag, verify_note, verify_status, is_hidden_from_report, hidden_reason)
           )
         `)
         .eq("id", order.id)
@@ -380,6 +438,7 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
             formula: la.formula ?? a?.formula,
             formula_variables: la.formula_variables ?? a?.formula_variables,
             calculation_result_type: la.calculation_result_type ?? a?.calculation_result_type ?? 'numeric',
+            decimal_places: la.decimal_places ?? a?.decimal_places ?? null,
             expected_normal_values: la.expected_normal_values ?? a?.expected_normal_values,
             expected_value_flag_map: la.expected_value_flag_map ?? a?.expected_value_flag_map,
             value_type: la.value_type ?? a?.value_type,
@@ -414,6 +473,25 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
           analytes: mapAnalytes(ot.test_groups.test_group_analytes, data.results, null, ot.id),
         }));
 
+      // Outsourced tests are excluded from analyte entry above, but the lab still
+      // has to attach the report the external lab sends back. Collect them
+      // separately so the save path stays untouched.
+      const outsourced: OutsourcedGroup[] = (data.order_tests || [])
+        .filter((ot: any) => ot.test_groups && ot.test_group_id && !ot.is_canceled && ot.outsourced_lab_id)
+        .map((ot: any) => {
+          const labInfo = Array.isArray(ot.outsourced_labs) ? ot.outsourced_labs[0] : ot.outsourced_labs;
+          return {
+            test_group_id: ot.test_groups.id,
+            test_group_name: ot.test_groups.name,
+            order_test_id: ot.id,
+            outsourced_lab_name: labInfo?.name || null,
+          };
+        })
+        .reduce<OutsourcedGroup[]>((acc, cur) => {
+          if (!acc.some((g) => g.test_group_id === cur.test_group_id)) acc.push(cur);
+          return acc;
+        }, []);
+
       // Merge groups by test_group_id
       const merged = [...tgFromOTG, ...tgFromOT].reduce<TestGroup[]>((acc, cur) => {
         const idx = acc.findIndex(t => t.test_group_id === cur.test_group_id);
@@ -442,7 +520,7 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
 	      if (allLabAnalyteIds.length > 0 && data.lab_id) {
 	        const { data: la } = await supabase
 	          .from("lab_analytes")
-	          .select("id, analyte_id, expected_normal_values, expected_value_flag_map, value_type, expected_value_codes, default_value, reference_range, lab_specific_reference_range, is_calculated, formula, formula_variables, calculation_result_type, lab_analyte_interface_config(multiply_by, add_offset, lims_unit, apply_to_quick_result_entry)")
+	          .select("id, analyte_id, decimal_places, expected_normal_values, expected_value_flag_map, value_type, expected_value_codes, default_value, reference_range, lab_specific_reference_range, is_calculated, formula, formula_variables, calculation_result_type, lab_analyte_interface_config(multiply_by, add_offset, decimal_places, lims_unit, apply_to_quick_result_entry)")
 	          .eq("lab_id", data.lab_id)
 	          .in("id", allLabAnalyteIds);
 	        if (la) {
@@ -453,6 +531,9 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
 	      }
 
       setTestGroups(merged);
+      // A group that also arrives via order_test_groups already has an entry
+      // panel — don't give it a second, attach-only one.
+      setOutsourcedGroups(outsourced.filter((og) => !merged.some((tg) => tg.test_group_id === og.test_group_id)));
       const loadedRemarks = Object.fromEntries(
         merged.map((tg) => {
           const resultRow = (data.results || []).find((r: any) =>
@@ -583,8 +664,11 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
 	            formula: la?.formula ?? a.formula ?? null,
 	            formula_variables: la?.formula_variables ?? a.formula_variables ?? null,
 	            calculation_result_type: la?.calculation_result_type ?? a.calculation_result_type ?? 'numeric',
+	            decimal_places: la?.decimal_places ?? a.decimal_places ?? null,
 	            verify_note: isRerun ? a.existing_result?.verify_note || "" : "",
 	            is_rerun: isRerun,
+	            result_value_id: hasExisting ? a.existing_result?.id || null : null,
+	            verify_status: hasExisting ? a.existing_result?.verify_status || "pending" : null,
 	            is_hidden_from_report: isHiddenExisting,
 	            hidden_reason: a.existing_result?.hidden_reason || "",
 	          };
@@ -640,7 +724,7 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
       const flatWithCalc = flat.map(r => {
         if (!r.is_calculated || !r.formula || r.is_existing) return r;
         const vars = parseFormulaVars(r.formula_variables);
-        const calcVal = evalFormula(r.formula, vars, lookup, loadedDeps, r.analyte_id, r.lab_analyte_id, r.calculation_result_type);
+        const calcVal = evalFormula(r.formula, vars, lookup, loadedDeps, r.analyte_id, r.lab_analyte_id, r.calculation_result_type, r.decimal_places);
         if (!calcVal) return r;
         const autoFlag = normalizeCalculationResultType(r.calculation_result_type) === 'text'
           ? ''
@@ -748,7 +832,7 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
       return next.map(r => {
         if (!r.is_calculated || !r.formula) return r;
         const vars = parseFormulaVars(r.formula_variables);
-        const calcVal = evalFormula(r.formula, vars, lookup, calcDeps, r.analyte_id, r.lab_analyte_id, r.calculation_result_type);
+        const calcVal = evalFormula(r.formula, vars, lookup, calcDeps, r.analyte_id, r.lab_analyte_id, r.calculation_result_type, r.decimal_places);
         if (!calcVal) return r;
         const autoFlag = normalizeCalculationResultType(r.calculation_result_type) === 'text'
           ? ''
@@ -799,7 +883,7 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
       return prev.map(r => {
         if (!r.is_calculated || !r.formula) return r;
         const vars = parseFormulaVars(r.formula_variables);
-        const calcVal = evalFormula(r.formula, vars, lookup, calcDeps, r.analyte_id, r.lab_analyte_id, r.calculation_result_type);
+        const calcVal = evalFormula(r.formula, vars, lookup, calcDeps, r.analyte_id, r.lab_analyte_id, r.calculation_result_type, r.decimal_places);
         if (!calcVal) return r;
         const autoFlag = normalizeCalculationResultType(r.calculation_result_type) === 'text'
           ? ''
@@ -902,21 +986,23 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
     .filter(({ r }) => !r.is_calculated && (!activeGroupId || r.test_group_id === activeGroupId))
     .map(({ i }) => i);
 
+  // Saved analytes only render an input while their panel is expanded, so walk
+  // past any index whose input is not currently mounted.
   const focusNext = (currentRowIdx: number) => {
     const pos = inputableIndexes.indexOf(currentRowIdx);
     if (pos === -1) return;
-    const nextRowIdx = inputableIndexes[pos + 1];
-    if (nextRowIdx !== undefined) {
-      valueRefs.current[nextRowIdx]?.focus();
+    for (let i = pos + 1; i < inputableIndexes.length; i++) {
+      const el = valueRefs.current[inputableIndexes[i]];
+      if (el) { el.focus(); return; }
     }
   };
 
   const focusPrev = (currentRowIdx: number) => {
     const pos = inputableIndexes.indexOf(currentRowIdx);
     if (pos <= 0) return;
-    const prevRowIdx = inputableIndexes[pos - 1];
-    if (prevRowIdx !== undefined) {
-      valueRefs.current[prevRowIdx]?.focus();
+    for (let i = pos - 1; i >= 0; i--) {
+      const el = valueRefs.current[inputableIndexes[i]];
+      if (el) { el.focus(); return; }
     }
   };
 
@@ -928,6 +1014,112 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
     if (e.key === "Tab" && e.shiftKey) {
       e.preventDefault();
       focusPrev(rowIdx);
+    }
+  };
+
+  // ── Approval ────────────────────────────────────────────────────────────────
+
+  const toggleSavedGroup = (testGroupId: string) => {
+    setExpandedSavedGroups(prev => {
+      const next = new Set(prev);
+      if (next.has(testGroupId)) next.delete(testGroupId); else next.add(testGroupId);
+      return next;
+    });
+  };
+
+  // Mirrors the approval write used by the Result Verification console so both
+  // paths leave result_values in the same shape.
+  const approveResultValues = async (resultValueIds: string[], busyKey: string) => {
+    const ids = Array.from(new Set(resultValueIds.filter(Boolean)));
+    if (!ids.length) {
+      setMessage({ text: "Nothing to approve — submit the results first.", type: "error" });
+      return;
+    }
+    setApprovingKey(busyKey);
+    setMessage(null);
+    try {
+      const { data: { user: currentUser } } = await supabase.auth.getUser();
+      const { error } = await supabase
+        .from("result_values")
+        .update({
+          verify_status: "approved",
+          verified: true,
+          verified_by: safeUuid(currentUser?.id),
+          verified_at: new Date().toISOString(),
+        })
+        .in("id", ids);
+      if (error) throw error;
+
+      setRows(prev => prev.map(r =>
+        r.result_value_id && ids.includes(r.result_value_id)
+          ? { ...r, verify_status: "approved" }
+          : r
+      ));
+      setMessage({
+        text: ids.length === 1 ? "Analyte approved." : `${ids.length} analytes approved.`,
+        type: "success",
+      });
+      setTimeout(() => setMessage(null), 3000);
+    } catch (err: any) {
+      setMessage({ text: `Approve failed: ${err.message}`, type: "error" });
+    } finally {
+      setApprovingKey(null);
+    }
+  };
+
+  // Sends an approved analyte back to pending and unlocks its result row so the
+  // corrected value can actually be written on the next submit.
+  const unapproveResultValue = async (row: AnalyteRow) => {
+    if (!row.result_value_id) return;
+    if (!window.confirm(`Reopen "${row.parameter}" for editing? It will go back to pending verification.`)) return;
+    setApprovingKey(row.result_value_id);
+    setMessage(null);
+    try {
+      const { error } = await supabase
+        .from("result_values")
+        .update({
+          verify_status: "pending",
+          verified: false,
+          verified_by: null,
+          verified_at: null,
+          verify_note: "Reopened for editing during result entry",
+        })
+        .eq("id", row.result_value_id);
+      if (error) throw error;
+
+      // The bulk save RPC treats a panel as locked while its results row still
+      // reads as verified/reviewed, and then only inserts missing analytes. Roll
+      // the panel back too, otherwise the corrected value is silently dropped.
+      const reopenPanel = {
+        is_locked: false,
+        locked_reason: null,
+        locked_at: null,
+        locked_by: null,
+        status: "pending_verification",
+        verification_status: "pending_verification",
+        manually_verified: false,
+        verified_at: null,
+        verified_by: null,
+      };
+      const resultId = resultIds.get(row.test_group_id);
+      if (resultId) {
+        await supabase.from("results").update(reopenPanel).eq("id", resultId);
+      } else {
+        await supabase
+          .from("results")
+          .update(reopenPanel)
+          .eq("order_id", order.id)
+          .eq("test_group_id", row.test_group_id);
+      }
+
+      setRows(prev => prev.map(r =>
+        r.result_value_id === row.result_value_id ? { ...r, verify_status: "pending" } : r
+      ));
+      setExpandedSavedGroups(prev => new Set(prev).add(row.test_group_id));
+    } catch (err: any) {
+      setMessage({ text: `Could not reopen: ${err.message}`, type: "error" });
+    } finally {
+      setApprovingKey(null);
     }
   };
 
@@ -984,7 +1176,10 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
 
   // ── Submit ──────────────────────────────────────────────────────────────────
 
-  const handleSubmit = async () => {
+  // Runs the whole save pipeline and reports whether it succeeded. Kept separate
+  // from handleSubmit so "Approve Whole Order" can persist first, then approve,
+  // without closing the modal in between.
+  const persistResults = async (): Promise<boolean> => {
     const valid = rows.filter(r => !r.is_calculated && (r.value.trim() || r.is_hidden_from_report));
     const hasSections = sectionEditorRefs.current.size > 0;
     const hasRemarks = Object.values(groupRemarks).some((remark) => remark.trim());
@@ -992,7 +1187,7 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
       (groupRemarks[tg.test_group_id] || "").trim() !==
       (initialGroupRemarks[tg.test_group_id] || "").trim()
     );
-    if (!valid.length && !hasSections && !hasRemarks && !remarksChanged) { setMessage({ text: "Enter at least one value or report remark before submitting.", type: "error" }); return; }
+    if (!valid.length && !hasSections && !hasRemarks && !remarksChanged) { setMessage({ text: "Enter at least one value or report remark before submitting.", type: "error" }); return false; }
 
     setSubmitting(true);
     setMessage({ text: "Saving results...", type: "success" });
@@ -1084,7 +1279,7 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
           .filter(a => !!a.is_calculated)
           .map(a => {
             const vars = parseFormulaVars(a.formula_variables);
-	            const calcVal = a.formula ? evalFormula(a.formula, vars, valueLookup, deps, a.id, a.lab_analyte_id, a.calculation_result_type) : "";
+	            const calcVal = a.formula ? evalFormula(a.formula, vars, valueLookup, deps, a.id, a.lab_analyte_id, a.calculation_result_type, a.decimal_places) : "";
 	            const existingRow = workingRows.find(r =>
 	              r.test_group_id === tg.test_group_id &&
 	              ((a.lab_analyte_id && r.lab_analyte_id === a.lab_analyte_id) || (!a.lab_analyte_id && r.analyte_id === a.id))
@@ -1103,6 +1298,7 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
 	              hidden_reason: existingRow?.hidden_reason || "",
 	              expected_normal_values: [],
 	              expected_value_flag_map: {},
+	              verify_status: existingRow?.verify_status ?? null,
 	            };
 	          })
 	          .filter(r => hasMeaningfulTextValue(r.value) || r.is_hidden_from_report);
@@ -1130,6 +1326,11 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
             undefined,
             r.value_type,
           );
+          // A panel that is not yet locked is rewritten wholesale by the RPC, so
+          // an analyte approved earlier in this modal has to carry its approval
+          // into the payload or the resave would silently reset it to pending.
+          const keepApproved = r.verify_status === "approved";
+          const approve = keepApproved || r.is_hidden_from_report || autoVerifyOnSubmit;
           return {
           analyte_id: r.analyte_id || null,
           lab_analyte_id: r.lab_analyte_id || null,
@@ -1141,10 +1342,10 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
 	          flag: normalizeResultFlagForSave(autoFlag, rawVal),
 	          flag_source: r.flag ? "manual" : "auto_numeric",
 	          is_auto_calculated: r.is_calculated,
-          verify_status: (r.is_hidden_from_report || autoVerifyOnSubmit) ? "approved" : "pending",
-          verified: r.is_hidden_from_report || autoVerifyOnSubmit,
-	          verified_by: (r.is_hidden_from_report || autoVerifyOnSubmit) ? safeUuid(currentUser?.id) : null,
-          verified_at: (r.is_hidden_from_report || autoVerifyOnSubmit) ? verifiedAt : null,
+          verify_status: approve ? "approved" : "pending",
+          verified: approve,
+	          verified_by: approve ? safeUuid(currentUser?.id) : null,
+          verified_at: approve ? verifiedAt : null,
           verify_note: r.is_hidden_from_report ? (r.hidden_reason || "Hidden from report") : (autoVerifyOnSubmit ? "Auto-verified during result entry." : null),
           is_hidden_from_report: !!r.is_hidden_from_report,
           hidden_reason: r.is_hidden_from_report ? (r.hidden_reason || "Hidden from report") : null,
@@ -1210,32 +1411,115 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
       await Promise.all(sectionSaves);
 
       setMessage({ text: autoVerifyOnSubmit ? "Results saved and auto-verified!" : "Results saved!", type: "success" });
-      onSubmitted();
-      onClose();
+      return true;
     } catch (err: any) {
       console.error("QuickResultEntry submit error:", err);
       setMessage({ text: `Submit failed: ${err.message}`, type: "error" });
+      return false;
     } finally {
       setSubmitting(false);
     }
   };
 
+  const handleSubmit = async () => {
+    const saved = await persistResults();
+    if (!saved) return;
+    onSubmitted();
+    onClose();
+  };
+
+  // Saves anything still pending, then approves every analyte on the order in
+  // one pass. Section-only panels have no analytes, so they are verified on the
+  // results row directly.
+  const handleApproveWholeOrder = async () => {
+    if (!window.confirm(`Approve every result on this order for ${order.patient_name}? Saved values will be verified and the report becomes releasable.`)) return;
+
+    const hasPendingEntry = rows.some(r => !r.is_calculated && isEditableRow(r) && (r.value.trim() || r.is_hidden_from_report));
+    if (hasPendingEntry) {
+      const saved = await persistResults();
+      if (!saved) return;
+    }
+
+    setApprovingKey("order");
+    setMessage({ text: "Approving order...", type: "success" });
+    try {
+      const { data: { user: currentUser } } = await supabase.auth.getUser();
+      const verifiedBy = safeUuid(currentUser?.id);
+      const verifiedAt = new Date().toISOString();
+
+      const { data: orderResults, error: resultsError } = await supabase
+        .from("results")
+        .select("id")
+        .eq("order_id", order.id);
+      if (resultsError) throw resultsError;
+
+      const resultIdList = (orderResults || []).map((r: any) => r.id).filter(Boolean);
+      if (!resultIdList.length) {
+        setMessage({ text: "Nothing to approve — no saved results on this order yet.", type: "error" });
+        return;
+      }
+
+      const { error: valuesError } = await supabase
+        .from("result_values")
+        .update({
+          verify_status: "approved",
+          verified: true,
+          verified_by: verifiedBy,
+          verified_at: verifiedAt,
+        })
+        .in("result_id", resultIdList);
+      if (valuesError) throw valuesError;
+
+      // Covers section-only panels, which the result_values rollup never touches.
+      const { error: rollupError } = await supabase
+        .from("results")
+        .update({
+          verification_status: "verified",
+          manually_verified: true,
+          verified_at: verifiedAt,
+          verified_by: verifiedBy,
+        })
+        .in("id", resultIdList);
+      if (rollupError) throw rollupError;
+
+      setMessage({ text: "Order approved.", type: "success" });
+      onSubmitted();
+      onClose();
+    } catch (err: any) {
+      console.error("QuickResultEntry approve-order error:", err);
+      setMessage({ text: `Approve failed: ${err.message}`, type: "error" });
+    } finally {
+      setApprovingKey(null);
+    }
+  };
+
   // ── Render ──────────────────────────────────────────────────────────────────
 
-  const isEditableRow = (r: AnalyteRow) => !r.is_existing || !!r.is_rerun;
 	  const filledCount = rows.filter(r => !r.is_calculated && isEditableRow(r) && (r.value.trim() || r.is_hidden_from_report)).length;
 	  const hiddenCount = rows.filter(r => !r.is_calculated && isEditableRow(r) && r.is_hidden_from_report).length;
   const totalInputable = rows.filter(r => !r.is_calculated && isEditableRow(r)).length;
   const existingCount = rows.filter(r => !r.is_calculated && r.is_existing && !r.is_rerun).length;
 
-  // Group rows by test group for display — hide already-saved analytes
-  const rowsByGroup: { tg: TestGroup; rows: { row: AnalyteRow; globalIdx: number }[] }[] = testGroups.map(tg => ({
-    tg,
-    rows: tg.analytes.map(a => {
-      const globalIdx = rows.findIndex(r => r.analyte_id === a.id);
+  // Group rows by test group for display. Analytes already saved are split into
+  // their own list so they can be reviewed in a collapsed panel rather than
+  // disappearing from the modal entirely.
+  type GroupRow = { row: AnalyteRow; globalIdx: number };
+  const rowsByGroup: { tg: TestGroup; rows: GroupRow[]; savedRows: GroupRow[] }[] = testGroups.map(tg => {
+    const entries = tg.analytes.map(a => {
+      // Scope by test group as well: the same analyte can be attached to more
+      // than one group in an order and must not resolve to the other group's row.
+      const globalIdx = rows.findIndex(r =>
+        r.test_group_id === tg.test_group_id &&
+        ((a.lab_analyte_id && r.lab_analyte_id === a.lab_analyte_id) || (!a.lab_analyte_id && r.analyte_id === a.id))
+      );
       return { row: rows[globalIdx] || null, globalIdx };
-    }).filter(x => x.row !== null && isEditableRow(x.row)),
-  })).filter(g => g.rows.length > 0 || !!g.tg.is_section_only || resultIds.has(g.tg.test_group_id));
+    }).filter((x): x is GroupRow => x.row !== null);
+    return {
+      tg,
+      rows: entries.filter(x => isEditableRow(x.row)),
+      savedRows: entries.filter(x => !isEditableRow(x.row)),
+    };
+  }).filter(g => g.rows.length > 0 || g.savedRows.length > 0 || !!g.tg.is_section_only || resultIds.has(g.tg.test_group_id));
 
   const visibleRowsByGroup = activeGroupId
     ? rowsByGroup.filter(({ tg }) => tg.test_group_id === activeGroupId)
@@ -1252,8 +1536,357 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
     if (testGroupId) focusFirstGroupInput(testGroupId);
   };
 
+  // An attached report hangs off a result row. Outsourced groups never go
+  // through the bulk save path, and an in-house group may not have been saved
+  // yet, so the row has to be created on demand at upload time.
+  const ensureResultIdForGroup = async (group: {
+    test_group_id: string;
+    test_group_name: string;
+    order_test_id?: string | null;
+    order_test_group_id?: string | null;
+  }): Promise<string | null> => {
+    const cached = resultIds.get(group.test_group_id);
+    if (cached) return cached;
+
+    const { data: existing } = await supabase
+      .from("results")
+      .select("id")
+      .eq("order_id", order.id)
+      .eq("test_group_id", group.test_group_id)
+      .order("entered_date", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (existing?.id) {
+      setResultIds((prev) => new Map(prev).set(group.test_group_id, existing.id));
+      return existing.id;
+    }
+
+    const [{ data: { user: currentUser } }, userLabId] = await Promise.all([
+      supabase.auth.getUser(),
+      database.getCurrentUserLabId(),
+    ]);
+    const currentLabId = safeUuid(userLabId);
+    if (!currentLabId) throw new Error("No valid lab ID found for current user");
+
+    const { data: stub, error } = await supabase
+      .from("results")
+      .upsert({
+        order_id: order.id,
+        patient_id: safeUuid(order.patient_id),
+        patient_name: order.patient_name,
+        test_name: group.test_group_name,
+        status: "pending_verification",
+        entered_by: currentUser?.email || "Unknown",
+        entered_date: new Date().toISOString().split("T")[0],
+        test_group_id: group.test_group_id,
+        lab_id: currentLabId,
+        ...uuidProp("order_test_group_id", group.order_test_group_id),
+        ...uuidProp("order_test_id", group.order_test_id),
+      }, { onConflict: "order_id,test_name", ignoreDuplicates: false })
+      .select()
+      .single();
+    if (error) throw error;
+    if (!stub?.id) return null;
+
+    setResultIds((prev) => new Map(prev).set(group.test_group_id, stub.id));
+    return stub.id;
+  };
+
+  const visibleOutsourcedGroups = activeGroupId
+    ? outsourcedGroups.filter((og) => og.test_group_id === activeGroupId)
+    : outsourcedGroups;
+
   // Re-index valueRefs array size
   valueRefs.current = valueRefs.current.slice(0, rows.length);
+
+  // Autofocus belongs on the first row that is actually keyed in, not on the
+  // first navigable row — saved analytes sit earlier in `rows` but render in a
+  // collapsed panel.
+  const firstEditableIdx = rows.findIndex(r =>
+    !r.is_calculated && isEditableRow(r) && (!activeGroupId || r.test_group_id === activeGroupId)
+  );
+
+  const renderTableHead = (saved: boolean) => (
+    <thead className="sticky top-0 bg-gray-50 border-b z-10">
+      <tr>
+        <th className={`px-4 py-2 text-left text-xs font-semibold text-gray-600 ${saved ? "w-[30%]" : "w-[34%]"}`}>Analyte</th>
+        <th className={`px-4 py-2 text-left text-xs font-semibold text-gray-600 ${saved ? "w-[22%]" : "w-[26%]"}`}>Value</th>
+        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-600 w-[12%]">Unit</th>
+        <th className={`px-4 py-2 text-left text-xs font-semibold text-gray-600 ${saved ? "w-[16%]" : "w-[18%]"}`}>Flag</th>
+        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-600 w-[8%]">Report</th>
+        {saved && <th className="px-4 py-2 text-left text-xs font-semibold text-gray-600 w-[12%]">Approval</th>}
+      </tr>
+    </thead>
+  );
+
+  // Shared between the entry table and the saved-results panel. `saved` adds the
+  // approval column; `readOnly` renders an approved analyte as plain text so it
+  // cannot be edited until it is explicitly reopened.
+  const renderAnalyteRow = (
+    { row, globalIdx }: GroupRow,
+    opts: { saved?: boolean; readOnly?: boolean } = {},
+  ) => {
+    const saved = !!opts.saved;
+    const readOnly = !!opts.readOnly;
+    const isCalc = row.is_calculated;
+    const calcDebugInfo = isCalc ? getCalculatedDebugInfo(row) : null;
+    const isQualitative = row.value_type === 'qualitative';
+    const hasCodes = isQualitative && Object.keys(row.expected_value_codes || {}).length > 0;
+    // If expected_normal_values exist, always show dropdown regardless of value_type
+    const hasDropdown = row.expected_normal_values.length > 0;
+    const hasDraftValue = row.value.trim() !== "";
+    const isDefault = !!row.is_default;
+    const flagLabel = flagOptions.find(f => f.value === row.flag);
+    const flagColor = row.flag === "" ? "text-green-700" : row.flag?.includes("critical") ? "text-red-700 font-semibold" : row.flag === "H" || row.flag === "L" ? "text-orange-600 font-medium" : "text-gray-700";
+    const isApproved = row.verify_status === "approved";
+    const busy = approvingKey === row.result_value_id;
+    // Row bg: default-prefilled = amber tint, manually entered = green tint, blank = plain
+    const rowBg = row.is_hidden_from_report
+      ? "bg-slate-50 text-slate-500"
+      : readOnly ? "bg-emerald-50/40"
+      : isDefault ? "bg-amber-50/50" : hasDraftValue ? "bg-green-50/40" : "hover:bg-blue-50/30";
+
+    return (
+      <tr key={`${row.test_group_id}:${row.lab_analyte_id || row.analyte_id}`} className={`border-b transition-colors ${rowBg}`}>
+
+        {/* Analyte name + ref range hint */}
+        <td className="px-4 py-2.5 overflow-hidden">
+          <span className={`font-medium ${isCalc ? "text-blue-700" : "text-gray-800"}`}>{row.parameter}</span>
+          {isCalc && <span className="ml-1.5 text-xs text-blue-400 italic">auto</span>}
+          {isDefault && <span className="ml-1.5 text-xs text-amber-600 bg-amber-100 px-1 py-0.5 rounded">default</span>}
+          {row.is_rerun && (
+            <span className="ml-1.5 text-xs text-orange-700 bg-orange-100 px-1.5 py-0.5 rounded font-medium">RE-RUN</span>
+          )}
+          {row.is_hidden_from_report && (
+            <span className="ml-1.5 text-xs text-slate-600 bg-slate-200 px-1.5 py-0.5 rounded font-medium">hidden</span>
+          )}
+          {row.reference && (
+            <div className="text-xs text-gray-400 mt-0.5">{row.reference}</div>
+          )}
+          {isCalc && calcDebugInfo?.formula && (
+            <div className="mt-1 text-[11px] bg-blue-50 border border-blue-100 rounded px-2 py-1 space-y-0.5 overflow-hidden">
+              <div className="font-mono text-blue-700 break-all" title={calcDebugInfo.formula}>
+                f: {calcDebugInfo.formula}
+              </div>
+              {calcDebugInfo.hasDependencies && calcDebugInfo.missing.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setEditingDependency({ row, missingVariables: calcDebugInfo.missing })}
+                  className="text-red-700 hover:text-red-900 hover:underline flex items-center gap-1 cursor-pointer"
+                >
+                  <Link2 className="h-3 w-3" />
+                  Missing: {calcDebugInfo.missing.join(", ")}
+                </button>
+              )}
+              {!calcDebugInfo.hasDependencies && calcDebugInfo.missing.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setEditingDependency({ row, missingVariables: calcDebugInfo.missing })}
+                  className="text-amber-700 hover:text-amber-900 hover:underline flex items-center gap-1 cursor-pointer"
+                >
+                  <Link2 className="h-3 w-3" />
+                  No dependencies saved — open Dependency Manager
+                </button>
+              )}
+            </div>
+          )}
+          {row.verify_note && (
+            <div className="text-xs text-orange-600 mt-1">{row.verify_note}</div>
+          )}
+        </td>
+
+        {/* Value input */}
+        <td className="px-4 py-2">
+          {readOnly ? (
+            <div className="px-2 py-1.5 bg-emerald-50 border border-emerald-200 rounded text-emerald-900 text-sm font-medium min-h-[34px] flex items-center">
+              {row.value || <span className="text-emerald-300 italic">no value</span>}
+            </div>
+          ) : isCalc ? (
+            <div className="flex items-center gap-1.5">
+              <div className="flex-1 px-2 py-1.5 bg-blue-50 border border-blue-200 rounded text-blue-800 text-sm font-medium min-h-[34px] flex items-center">
+                {row.value || <span className="text-blue-300 italic">calculated</span>}
+              </div>
+              <button
+                type="button"
+                title="Recalculate from saved values"
+                onClick={handleRecalculate}
+                className="p-1.5 text-blue-500 hover:text-blue-700 hover:bg-blue-100 rounded transition-colors"
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          ) : hasDropdown ? (
+            <select
+              ref={el => { valueRefs.current[globalIdx] = el; }}
+              value={row.value}
+              onChange={e => {
+                const val = e.target.value;
+                const autoFlag = row.expected_value_flag_map[val] ?? "";
+                setRows(prev => prev.map((r, i) => i !== globalIdx ? r : { ...r, value: val, flag: autoFlag, is_default: false }));
+              }}
+              onKeyDown={e => {
+                // Quick code resolution: e.g. pressing "1" selects "Non-Reactive"
+                if (hasCodes && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                  const code = e.key.toUpperCase();
+                  const resolved = (row.expected_value_codes || {})[code];
+                  if (resolved) {
+                    e.preventDefault();
+                    const autoFlag = row.expected_value_flag_map[resolved] ?? "";
+                    setRows(prev => prev.map((r, i) => i !== globalIdx ? r : { ...r, value: resolved, flag: autoFlag, is_default: false }));
+                    focusNext(globalIdx);
+                    return;
+                  }
+                }
+                handleKeyDown(e, globalIdx);
+              }}
+              className={`w-full px-2 py-1.5 border rounded text-sm focus:outline-none focus:ring-2 ${
+                isDefault
+                  ? "border-amber-300 bg-amber-50 text-amber-800 italic focus:ring-amber-400"
+                  : row.value ? "border-green-300 bg-green-50 focus:ring-green-400" : "border-gray-300 focus:ring-green-400"
+              }`}
+            >
+              <option value="">Select...</option>
+              {row.expected_normal_values.map(opt => (
+                <option key={opt} value={opt}>{opt}</option>
+              ))}
+              {/* Show quick code hints if available */}
+              {hasCodes && <option disabled>── Quick codes ──</option>}
+              {hasCodes && Object.entries(row.expected_value_codes || {}).map(([code, val]) => (
+                <option key={`hint-${code}`} disabled>{code} → {val}</option>
+              ))}
+            </select>
+          ) : isQualitative ? (
+            // Qualitative without dropdown values: free-text with quick-code resolution.
+            // Amber border/bg when pre-filled by default; purple when manually entered.
+            <div className="relative">
+              <input
+                ref={el => { valueRefs.current[globalIdx] = el; }}
+                type="text"
+                list={hasCodes ? `qcodes-${globalIdx}` : undefined}
+                value={row.value}
+                placeholder={hasCodes ? "type code or value..." : "value..."}
+                onChange={e => {
+                  const typed = e.target.value;
+                  if (hasCodes && typed.trim()) {
+                    const key = typed.trim().toUpperCase();
+                    const resolved = row.expected_value_codes![key];
+                    if (resolved) {
+                      setRows(prev => prev.map((r, i) => i !== globalIdx ? r : { ...r, value: resolved, is_default: false }));
+                      return;
+                    }
+                  }
+                  setRows(prev => prev.map((r, i) => i !== globalIdx ? r : { ...r, value: typed, is_default: false }));
+                }}
+                onKeyDown={e => handleKeyDown(e, globalIdx)}
+                className={`w-full px-2 py-1.5 border rounded text-sm focus:outline-none focus:ring-2 ${
+                  isDefault
+                    ? "border-amber-300 bg-amber-50 text-amber-800 italic focus:ring-amber-400"
+                    : row.value
+                      ? "border-purple-300 bg-purple-50 font-medium focus:ring-purple-400"
+                      : "border-gray-300 focus:ring-purple-400"
+                }`}
+                autoFocus={!saved && globalIdx === firstEditableIdx}
+              />
+              {hasCodes && (
+                <datalist id={`qcodes-${globalIdx}`}>
+                  {Object.entries(row.expected_value_codes!).map(([code, val]) => (
+                    <option key={code} value={val}>{code} → {val}</option>
+                  ))}
+                </datalist>
+              )}
+            </div>
+          ) : (
+            <input
+              ref={el => { valueRefs.current[globalIdx] = el; }}
+              type="text"
+              value={row.value}
+              placeholder={row.reference ? `e.g. ${row.reference.split("-")[0]?.trim()}` : "value..."}
+              onChange={e => {
+                const raw = e.target.value.replace(/,/g, '');
+                setRows(prev => prev.map((r, i) => i !== globalIdx ? r : {
+                  ...r,
+                  value: raw,
+                  is_default: false,
+                  interface_conversion_pending: true,
+                }));
+              }}
+              onBlur={e => handleValueBlur(globalIdx, e.target.value)}
+              onKeyDown={e => handleKeyDown(e, globalIdx)}
+              className={`w-full px-2 py-1.5 border rounded text-sm focus:outline-none focus:ring-2 ${
+                isDefault
+                  ? "border-amber-300 bg-amber-50 text-amber-800 italic focus:ring-amber-400"
+                  : row.value ? "border-green-400 bg-green-50 font-medium focus:ring-green-400" : "border-gray-300 focus:ring-green-400"
+              }`}
+              autoFocus={!saved && globalIdx === firstEditableIdx}
+            />
+          )}
+        </td>
+
+        {/* Unit (read-only) */}
+        <td className="px-4 py-2 text-gray-500 text-sm">{row.unit || "—"}</td>
+
+        {/* Flag select */}
+        <td className="px-4 py-2">
+          {isCalc || readOnly ? (
+            <span className={`text-sm ${flagColor}`}>{flagLabel?.label || "—"}</span>
+          ) : (
+            <select
+              value={row.flag}
+              onChange={e => setRowField(globalIdx, "flag", e.target.value)}
+              className={`w-full px-1.5 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-1 focus:ring-green-400 ${flagColor}`}
+            >
+              {flagOptions.map(opt => (
+                <option key={opt.value} value={opt.value}>{opt.label}</option>
+              ))}
+            </select>
+          )}
+        </td>
+        <td className="px-4 py-2">
+          <button
+            type="button"
+            onClick={() => toggleHiddenFromReport(globalIdx)}
+            disabled={readOnly}
+            className={`inline-flex items-center justify-center rounded border px-2 py-1 text-xs transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+              row.is_hidden_from_report
+                ? "border-slate-400 bg-slate-100 text-slate-700"
+                : "border-gray-200 bg-white text-gray-500 hover:bg-gray-50"
+            }`}
+            title={readOnly ? "Reopen the analyte to change this" : row.is_hidden_from_report ? "Show this analyte on report" : "Hide this analyte from report"}
+          >
+            <EyeOff className="h-3.5 w-3.5" />
+          </button>
+        </td>
+
+        {saved && (
+          <td className="px-4 py-2">
+            {isApproved ? (
+              <button
+                type="button"
+                onClick={() => unapproveResultValue(row)}
+                disabled={busy || !row.result_value_id}
+                className="inline-flex items-center gap-1 rounded border border-emerald-300 bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700 transition-colors hover:bg-emerald-100 disabled:opacity-50"
+                title="Reopen this analyte for editing"
+              >
+                {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Undo2 className="h-3.5 w-3.5" />}
+                Approved
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => approveResultValues([row.result_value_id!], row.result_value_id!)}
+                disabled={busy || !row.result_value_id}
+                className="inline-flex items-center gap-1 rounded bg-emerald-600 px-2 py-1 text-xs font-medium text-white transition-colors hover:bg-emerald-700 disabled:opacity-50"
+                title={row.result_value_id ? "Approve this analyte" : "Submit the results before approving"}
+              >
+                {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5" />}
+                Approve
+              </button>
+            )}
+          </td>
+        )}
+      </tr>
+    );
+  };
 
   const modal = (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black">
@@ -1299,7 +1932,7 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
           {resultIds.size > 0 && <span><kbd className="bg-gray-200 px-1.5 py-0.5 rounded text-gray-700 font-mono text-xs">A B C…</kbd> select section options</span>}
         </div>
 
-        {rowsByGroup.length > 1 && (
+        {rowsByGroup.length + outsourcedGroups.length > 1 && (
           <div className="border-b bg-white px-5 py-2">
             <div className="flex gap-2 overflow-x-auto pb-1">
               <button
@@ -1313,9 +1946,10 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
               >
                 All Groups
               </button>
-              {rowsByGroup.map(({ tg, rows: groupRows }) => {
+              {rowsByGroup.map(({ tg, rows: groupRows, savedRows }) => {
                 const groupFilled = groupRows.filter(({ row }) => !row.is_calculated && (row.value.trim() || row.is_hidden_from_report)).length;
                 const groupInputable = groupRows.filter(({ row }) => !row.is_calculated).length;
+                const groupSaved = savedRows.length;
                 const isActive = activeGroupId === tg.test_group_id;
                 return (
                   <button
@@ -1330,7 +1964,29 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
                     title={`Open ${tg.test_group_name}`}
                   >
                     <span className="block max-w-48 truncate font-semibold">{tg.test_group_name}</span>
-                    <span className={isActive ? "text-green-100" : "text-gray-500"}>{groupFilled}/{groupInputable} handled</span>
+                    <span className={isActive ? "text-green-100" : "text-gray-500"}>
+                      {groupInputable > 0 ? `${groupFilled}/${groupInputable} handled` : "all saved"}
+                      {groupSaved > 0 && groupInputable > 0 ? ` · ${groupSaved} saved` : ""}
+                    </span>
+                  </button>
+                );
+              })}
+              {outsourcedGroups.map((og) => {
+                const isActive = activeGroupId === og.test_group_id;
+                return (
+                  <button
+                    key={`outsourced:${og.test_group_id}`}
+                    type="button"
+                    onClick={() => selectGroup(og.test_group_id)}
+                    className={`shrink-0 rounded-md border px-3 py-1.5 text-left text-xs transition-colors ${
+                      isActive
+                        ? "border-purple-600 bg-purple-600 text-white shadow-sm"
+                        : "border-purple-200 bg-white text-purple-700 hover:border-purple-300 hover:bg-purple-50"
+                    }`}
+                    title={`${og.test_group_name} — outsourced${og.outsourced_lab_name ? ` to ${og.outsourced_lab_name}` : ""}. Attach the external lab report.`}
+                  >
+                    <span className="block max-w-48 truncate font-semibold">🏥 {og.test_group_name}</span>
+                    <span className={isActive ? "text-purple-100" : "text-purple-500"}>attach report</span>
                   </button>
                 );
               })}
@@ -1345,14 +2001,24 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
               <Loader2 className="h-6 w-6 animate-spin" />
               <span>Loading analytes...</span>
             </div>
-          ) : rowsByGroup.length === 0 ? (
+          ) : rowsByGroup.length === 0 && outsourcedGroups.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-16 gap-3 text-gray-500">
               <CheckCircle className="h-10 w-10 text-green-500" />
               <p className="text-base font-medium text-green-700">All results already saved</p>
               <p className="text-sm text-gray-400">{existingCount} analyte{existingCount !== 1 ? "s" : ""} submitted previously</p>
             </div>
           ) : (
-            visibleRowsByGroup.map(({ tg, rows: groupRows }) => (
+            <>
+            {visibleRowsByGroup.map(({ tg, rows: groupRows, savedRows }) => {
+              const savedApproved = savedRows.filter(({ row }) => row.verify_status === "approved").length;
+              const savedPending = savedRows.length - savedApproved;
+              const savedExpanded = expandedSavedGroups.has(tg.test_group_id);
+              const pendingIds = savedRows
+                .filter(({ row }) => row.verify_status !== "approved" && row.result_value_id)
+                .map(({ row }) => row.result_value_id!);
+              const groupBusy = approvingKey === `group:${tg.test_group_id}`;
+
+              return (
               <div key={tg.test_group_id}>
                 {/* Test group header (only shown if >1 group) */}
                 {testGroups.length > 1 && (
@@ -1362,243 +2028,75 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
                   </div>
                 )}
 
-                <table className="w-full text-sm table-fixed">
-                  <thead className="sticky top-0 bg-gray-50 border-b z-10">
-                    <tr>
-	                      <th className="px-4 py-2 text-left text-xs font-semibold text-gray-600 w-[34%]">Analyte</th>
-	                      <th className="px-4 py-2 text-left text-xs font-semibold text-gray-600 w-[26%]">Value</th>
-	                      <th className="px-4 py-2 text-left text-xs font-semibold text-gray-600 w-[14%]">Unit</th>
-	                      <th className="px-4 py-2 text-left text-xs font-semibold text-gray-600 w-[18%]">Flag</th>
-	                      <th className="px-4 py-2 text-left text-xs font-semibold text-gray-600 w-[8%]">Report</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {groupRows.map(({ row, globalIdx }) => {
-                      const isCalc = row.is_calculated;
-                      const calcDebugInfo = isCalc ? getCalculatedDebugInfo(row) : null;
-                      const isQualitative = row.value_type === 'qualitative';
-                      const hasCodes = isQualitative && Object.keys(row.expected_value_codes || {}).length > 0;
-                      // If expected_normal_values exist, always show dropdown regardless of value_type
-                      const hasDropdown = row.expected_normal_values.length > 0;
-                      const hasDraftValue = row.value.trim() !== "";
-                      const isDefault = !!row.is_default;
-                      const flagLabel = flagOptions.find(f => f.value === row.flag);
-                      const flagColor = row.flag === "" ? "text-green-700" : row.flag?.includes("critical") ? "text-red-700 font-semibold" : row.flag === "H" || row.flag === "L" ? "text-orange-600 font-medium" : "text-gray-700";
-                      // Row bg: default-prefilled = amber tint, manually entered = green tint, blank = plain
-	                      const rowBg = row.is_hidden_from_report
-	                        ? "bg-slate-50 text-slate-500"
-	                        : isDefault ? "bg-amber-50/50" : hasDraftValue ? "bg-green-50/40" : "hover:bg-blue-50/30";
+                {groupRows.length > 0 && (
+                  <table className="w-full text-sm table-fixed">
+                    {renderTableHead(false)}
+                    <tbody>
+                      {groupRows.map(entry => renderAnalyteRow(entry))}
+                    </tbody>
+                  </table>
+                )}
 
-                      return (
-	                        <tr key={`${row.test_group_id}:${row.lab_analyte_id || row.analyte_id}`} className={`border-b transition-colors ${rowBg}`}>
+                {/* Already-saved analytes — collapsed until the user opens them */}
+                {savedRows.length > 0 && (
+                  <div className="border-t border-emerald-100 bg-emerald-50/30">
+                    <button
+                      type="button"
+                      onClick={() => toggleSavedGroup(tg.test_group_id)}
+                      className="flex w-full items-center gap-2 px-4 py-2.5 text-left transition-colors hover:bg-emerald-50"
+                    >
+                      {savedExpanded
+                        ? <ChevronDown className="h-4 w-4 shrink-0 text-emerald-600" />
+                        : <ChevronRight className="h-4 w-4 shrink-0 text-emerald-600" />}
+                      <span className="text-sm font-semibold text-emerald-800">
+                        {savedRows.length} saved result{savedRows.length !== 1 ? "s" : ""}
+                      </span>
+                      {savedApproved > 0 && (
+                        <span className="rounded-full bg-emerald-600 px-2 py-0.5 text-xs font-medium text-white">
+                          {savedApproved} approved
+                        </span>
+                      )}
+                      {savedPending > 0 && (
+                        <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">
+                          {savedPending} awaiting approval
+                        </span>
+                      )}
+                      <span className="ml-auto text-xs font-medium text-emerald-700">
+                        {savedExpanded ? "Close" : "Open & edit"}
+                      </span>
+                    </button>
 
-                          {/* Analyte name + ref range hint */}
-                          <td className="px-4 py-2.5 overflow-hidden">
-                            <span className={`font-medium ${isCalc ? "text-blue-700" : "text-gray-800"}`}>{row.parameter}</span>
-                            {isCalc && <span className="ml-1.5 text-xs text-blue-400 italic">auto</span>}
-                            {isDefault && <span className="ml-1.5 text-xs text-amber-600 bg-amber-100 px-1 py-0.5 rounded">default</span>}
-	                            {row.is_rerun && (
-	                              <span className="ml-1.5 text-xs text-orange-700 bg-orange-100 px-1.5 py-0.5 rounded font-medium">RE-RUN</span>
-	                            )}
-	                            {row.is_hidden_from_report && (
-	                              <span className="ml-1.5 text-xs text-slate-600 bg-slate-200 px-1.5 py-0.5 rounded font-medium">hidden</span>
-	                            )}
-                            {row.reference && (
-                              <div className="text-xs text-gray-400 mt-0.5">{row.reference}</div>
-                            )}
-                            {isCalc && calcDebugInfo?.formula && (
-                              <div className="mt-1 text-[11px] bg-blue-50 border border-blue-100 rounded px-2 py-1 space-y-0.5 overflow-hidden">
-                                <div className="font-mono text-blue-700 break-all" title={calcDebugInfo.formula}>
-                                  f: {calcDebugInfo.formula}
-                                </div>
-                                {calcDebugInfo.hasDependencies && calcDebugInfo.missing.length > 0 && (
-                                  <button
-                                    type="button"
-                                    onClick={() => setEditingDependency({ row, missingVariables: calcDebugInfo.missing })}
-                                    className="text-red-700 hover:text-red-900 hover:underline flex items-center gap-1 cursor-pointer"
-                                  >
-                                    <Link2 className="h-3 w-3" />
-                                    Missing: {calcDebugInfo.missing.join(", ")}
-                                  </button>
-                                )}
-                                {!calcDebugInfo.hasDependencies && calcDebugInfo.missing.length > 0 && (
-                                  <button
-                                    type="button"
-                                    onClick={() => setEditingDependency({ row, missingVariables: calcDebugInfo.missing })}
-                                    className="text-amber-700 hover:text-amber-900 hover:underline flex items-center gap-1 cursor-pointer"
-                                  >
-                                    <Link2 className="h-3 w-3" />
-                                    No dependencies saved — open Dependency Manager
-                                  </button>
-                                )}
-                              </div>
-                            )}
-                            {row.verify_note && (
-                              <div className="text-xs text-orange-600 mt-1">{row.verify_note}</div>
-                            )}
-                          </td>
-
-                          {/* Value input */}
-                          <td className="px-4 py-2">
-                            {isCalc ? (
-                              <div className="flex items-center gap-1.5">
-                                <div className="flex-1 px-2 py-1.5 bg-blue-50 border border-blue-200 rounded text-blue-800 text-sm font-medium min-h-[34px] flex items-center">
-                                  {row.value || <span className="text-blue-300 italic">calculated</span>}
-                                </div>
-                                <button
-                                  type="button"
-                                  title="Recalculate from saved values"
-                                  onClick={handleRecalculate}
-                                  className="p-1.5 text-blue-500 hover:text-blue-700 hover:bg-blue-100 rounded transition-colors"
-                                >
-                                  <RefreshCw className="h-3.5 w-3.5" />
-                                </button>
-                              </div>
-                            ) : hasDropdown ? (
-                              <select
-                                ref={el => { valueRefs.current[globalIdx] = el; }}
-                                value={row.value}
-                                onChange={e => {
-                                  const val = e.target.value;
-                                  const autoFlag = row.expected_value_flag_map[val] ?? "";
-                                  setRows(prev => prev.map((r, i) => i !== globalIdx ? r : { ...r, value: val, flag: autoFlag, is_default: false }));
-                                }}
-                                onKeyDown={e => {
-                                  // Quick code resolution: e.g. pressing "1" selects "Non-Reactive"
-                                  if (hasCodes && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
-                                    const code = e.key.toUpperCase();
-                                    const resolved = (row.expected_value_codes || {})[code];
-                                    if (resolved) {
-                                      e.preventDefault();
-                                      const autoFlag = row.expected_value_flag_map[resolved] ?? "";
-                                      setRows(prev => prev.map((r, i) => i !== globalIdx ? r : { ...r, value: resolved, flag: autoFlag, is_default: false }));
-                                      focusNext(globalIdx);
-                                      return;
-                                    }
-                                  }
-                                  handleKeyDown(e, globalIdx);
-                                }}
-                                className={`w-full px-2 py-1.5 border rounded text-sm focus:outline-none focus:ring-2 ${
-                                  isDefault
-                                    ? "border-amber-300 bg-amber-50 text-amber-800 italic focus:ring-amber-400"
-                                    : row.value ? "border-green-300 bg-green-50 focus:ring-green-400" : "border-gray-300 focus:ring-green-400"
-                                }`}
-                              >
-                                <option value="">Select...</option>
-                                {row.expected_normal_values.map(opt => (
-                                  <option key={opt} value={opt}>{opt}</option>
-                                ))}
-                                {/* Show quick code hints if available */}
-                                {hasCodes && <option disabled>── Quick codes ──</option>}
-                                {hasCodes && Object.entries(row.expected_value_codes || {}).map(([code, val]) => (
-                                  <option key={`hint-${code}`} disabled>{code} → {val}</option>
-                                ))}
-                              </select>
-                            ) : isQualitative ? (
-                              // Qualitative without dropdown values: free-text with quick-code resolution.
-                              // Amber border/bg when pre-filled by default; purple when manually entered.
-                              <div className="relative">
-                                <input
-                                  ref={el => { valueRefs.current[globalIdx] = el; }}
-                                  type="text"
-                                  list={hasCodes ? `qcodes-${globalIdx}` : undefined}
-                                  value={row.value}
-                                  placeholder={hasCodes ? "type code or value..." : "value..."}
-                                  onChange={e => {
-                                    const typed = e.target.value;
-                                    if (hasCodes && typed.trim()) {
-                                      const key = typed.trim().toUpperCase();
-                                      const resolved = row.expected_value_codes![key];
-                                      if (resolved) {
-                                        setRows(prev => prev.map((r, i) => i !== globalIdx ? r : { ...r, value: resolved, is_default: false }));
-                                        return;
-                                      }
-                                    }
-                                    setRows(prev => prev.map((r, i) => i !== globalIdx ? r : { ...r, value: typed, is_default: false }));
-                                  }}
-                                  onKeyDown={e => handleKeyDown(e, globalIdx)}
-                                  className={`w-full px-2 py-1.5 border rounded text-sm focus:outline-none focus:ring-2 ${
-                                    isDefault
-                                      ? "border-amber-300 bg-amber-50 text-amber-800 italic focus:ring-amber-400"
-                                      : row.value
-                                        ? "border-purple-300 bg-purple-50 font-medium focus:ring-purple-400"
-                                        : "border-gray-300 focus:ring-purple-400"
-                                  }`}
-                                  autoFocus={globalIdx === inputableIndexes[0]}
-                                />
-                                {hasCodes && (
-                                  <datalist id={`qcodes-${globalIdx}`}>
-                                    {Object.entries(row.expected_value_codes!).map(([code, val]) => (
-                                      <option key={code} value={val}>{code} → {val}</option>
-                                    ))}
-                                  </datalist>
-                                )}
-                              </div>
-                            ) : (
-                              <input
-                                ref={el => { valueRefs.current[globalIdx] = el; }}
-                                type="text"
-                                value={row.value}
-                                placeholder={row.reference ? `e.g. ${row.reference.split("-")[0]?.trim()}` : "value..."}
-                                onChange={e => {
-                                  const raw = e.target.value.replace(/,/g, '');
-                                  setRows(prev => prev.map((r, i) => i !== globalIdx ? r : {
-                                    ...r,
-                                    value: raw,
-                                    is_default: false,
-                                    interface_conversion_pending: true,
-                                  }));
-                                }}
-                                onBlur={e => handleValueBlur(globalIdx, e.target.value)}
-                                onKeyDown={e => handleKeyDown(e, globalIdx)}
-                                className={`w-full px-2 py-1.5 border rounded text-sm focus:outline-none focus:ring-2 ${
-                                  isDefault
-                                    ? "border-amber-300 bg-amber-50 text-amber-800 italic focus:ring-amber-400"
-                                    : row.value ? "border-green-400 bg-green-50 font-medium focus:ring-green-400" : "border-gray-300 focus:ring-green-400"
-                                }`}
-                                autoFocus={globalIdx === inputableIndexes[0]}
-                              />
-                            )}
-                          </td>
-
-                          {/* Unit (read-only) */}
-                          <td className="px-4 py-2 text-gray-500 text-sm">{row.unit || "—"}</td>
-
-	                          {/* Flag select */}
-	                          <td className="px-4 py-2">
-                            {isCalc ? (
-                              <span className={`text-sm ${flagColor}`}>{flagLabel?.label || "—"}</span>
-                            ) : (
-                              <select
-                                value={row.flag}
-                                onChange={e => setRowField(globalIdx, "flag", e.target.value)}
-                                className={`w-full px-1.5 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-1 focus:ring-green-400 ${flagColor}`}
-                              >
-                                {flagOptions.map(opt => (
-                                  <option key={opt.value} value={opt.value}>{opt.label}</option>
-                                ))}
-                              </select>
-	                            )}
-	                          </td>
-	                          <td className="px-4 py-2">
-	                            <button
-	                              type="button"
-	                              onClick={() => toggleHiddenFromReport(globalIdx)}
-	                              className={`inline-flex items-center justify-center rounded border px-2 py-1 text-xs transition-colors ${
-	                                row.is_hidden_from_report
-	                                  ? "border-slate-400 bg-slate-100 text-slate-700"
-	                                  : "border-gray-200 bg-white text-gray-500 hover:bg-gray-50"
-	                              }`}
-	                              title={row.is_hidden_from_report ? "Show this analyte on report" : "Hide this analyte from report"}
-	                            >
-	                              <EyeOff className="h-3.5 w-3.5" />
-	                            </button>
-	                          </td>
-	                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
+                    {savedExpanded && (
+                      <div className="border-t border-emerald-100">
+                        {savedPending > 0 && (
+                          <div className="flex items-center justify-between gap-3 px-4 py-2">
+                            <p className="text-xs text-emerald-800">
+                              Approved analytes are read-only. Use the tick to reopen one before correcting it.
+                            </p>
+                            <button
+                              type="button"
+                              onClick={() => approveResultValues(pendingIds, `group:${tg.test_group_id}`)}
+                              disabled={groupBusy || pendingIds.length === 0}
+                              className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-emerald-700 disabled:opacity-50"
+                            >
+                              {groupBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5" />}
+                              Approve all in {tg.test_group_name}
+                            </button>
+                          </div>
+                        )}
+                        <table className="w-full text-sm table-fixed">
+                          {renderTableHead(true)}
+                          <tbody>
+                            {savedRows.map(entry => renderAnalyteRow(entry, {
+                              saved: true,
+                              readOnly: entry.row.verify_status === "approved",
+                            }))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 <div className="border-t border-amber-100 bg-amber-50/40 px-4 py-3">
                   <label className="mb-1 block text-xs font-semibold uppercase tracking-wide text-amber-800">
@@ -1620,6 +2118,18 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
                   </p>
                 </div>
 
+                {/* In-house test that was sent out on the day — collapsed until needed */}
+                <div className="border-t px-4 py-2">
+                  <OutsourcedReportUpload
+                    orderId={order.id}
+                    testGroupId={tg.test_group_id}
+                    labId={order.lab_id}
+                    patientId={order.patient_id}
+                    ensureResultId={() => ensureResultIdForGroup(tg)}
+                    collapsible
+                  />
+                </div>
+
                 {/* Report Sections (technician-editable) */}
                 {resultIds.get(tg.test_group_id) && (
                   <div className="border-t border-blue-100 bg-blue-50/30 px-4 py-3">
@@ -1633,7 +2143,29 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
                   </div>
                 )}
               </div>
-            ))
+              );
+            })}
+
+            {/* Outsourced tests: no analytes to key in — attach the external lab's report */}
+            {visibleOutsourcedGroups.map((og) => (
+              <div key={`outsourced:${og.test_group_id}`}>
+                <div className="px-5 py-2 bg-purple-50 border-b text-sm font-semibold text-purple-800 flex items-center gap-2">
+                  <Building2 className="h-4 w-4 text-purple-400" />
+                  {og.test_group_name}
+                  <span className="text-xs font-normal text-purple-600">no analytes to key in — attach the external report below</span>
+                </div>
+                <div className="px-4 py-3">
+                  <OutsourcedReportUpload
+                    orderId={order.id}
+                    testGroupId={og.test_group_id}
+                    labId={order.lab_id}
+                    patientId={order.patient_id}
+                    ensureResultId={() => ensureResultIdForGroup(og)}
+                  />
+                </div>
+              </div>
+            ))}
+            </>
           )}
         </div>
 
@@ -1665,6 +2197,17 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
             )}
           </div>
           <div className="flex gap-2">
+            {showApproveAllButton && (
+              <button
+                onClick={handleApproveWholeOrder}
+                disabled={saving || submitting || loading || approvingKey !== null}
+                className="flex items-center gap-1.5 px-4 py-2 text-sm bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 disabled:opacity-50 transition-colors font-medium"
+                title="Save anything pending, then approve every analyte on this order"
+              >
+                {approvingKey === "order" ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
+                Approve Whole Order
+              </button>
+            )}
             <button
               onClick={handleSaveDraft}
               disabled={saving || submitting || loading}
