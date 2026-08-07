@@ -541,7 +541,7 @@ const EnhancedOrdersPage: React.FC<EnhancedOrdersPageProps> = ({
             name,
             package_test_groups(
               test_group_id,
-              test_groups(id, name)
+              test_groups(id, name, is_active)
             )
           `)
           .in('id', packageIds);
@@ -559,7 +559,8 @@ const EnhancedOrdersPage: React.FC<EnhancedOrdersPageProps> = ({
           const pkgDetails = packageDetails?.find(pd => pd.id === pkg.id);
           if (pkgDetails?.package_test_groups) {
             pkgDetails.package_test_groups.forEach((ptg: any) => {
-              if (ptg.test_groups) {
+              // Skip test groups deactivated after they were linked
+              if (ptg.test_groups && ptg.test_groups.is_active !== false) {
                 newOrderTests.push({
                   order_id: selectedOrderId,
                   test_name: ptg.test_groups.name,

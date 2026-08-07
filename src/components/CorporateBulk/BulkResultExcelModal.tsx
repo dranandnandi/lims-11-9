@@ -55,9 +55,10 @@ interface CascadeLevel {
 }
 
 interface SectionConfig {
-  mode?: 'flat' | 'cascading' | 'matrix';
+  mode?: 'flat' | 'cascading' | 'matrix' | 'preset';
   cascade_levels?: CascadeLevel[];
   matrix?: MatrixConfig;
+  preset?: PresetConfig;
 }
 
 interface MatrixConfig {
@@ -67,11 +68,29 @@ interface MatrixConfig {
   reportStyle?: 'color' | 'bold' | 'plain';
 }
 
+interface PresetField {
+  key: string;
+  label: string;
+}
+
+interface PresetRow {
+  id: string;
+  name: string;
+  values: Record<string, string>;
+}
+
+interface PresetConfig {
+  label?: string;
+  layout?: 'table' | 'lines';
+  fields?: PresetField[];
+  presets?: PresetRow[];
+}
+
 interface ColumnInfo {
   id: string; // analyte_id or section_id
   lab_analyte_id?: string | null;
   name: string;
-  type: 'analyte' | 'section' | 'cascade_field' | 'matrix_cell' | 'matrix_note';
+  type: 'analyte' | 'section' | 'cascade_field' | 'matrix_cell' | 'matrix_note' | 'preset_select' | 'preset_field';
   unit?: string;
   reference_range?: string;
   value_type?: string;
@@ -86,6 +105,8 @@ interface ColumnInfo {
   multi_select?: boolean;
   matrix_row?: string;
   matrix_column?: string;
+  // For preset (condition template) sections
+  preset_field_key?: string;
 }
 
 interface ParsedRow {
@@ -113,6 +134,8 @@ interface SaveResult {
 const MATRIX_CELL_PREFIX = 'matrix:';
 const MATRIX_COL_LABEL_PREFIX = 'col_label:';
 const MATRIX_COL_ORDER_KEY = 'matrix_col_order';
+const PRESET_SELECTED_KEY = 'preset_selected';
+const PRESET_FIELD_PREFIX = 'preset:';
 const ORDER_UUID_HEADER = 'Order UUID';
 const TEST_GROUP_UUID_HEADER = 'Test Group UUID';
 const ORDER_ID_HEADER = 'Order ID';
@@ -177,6 +200,57 @@ function buildMatrixHtml(config: MatrixConfig | undefined, selections: Record<st
     : '';
 
   return `<table style="width:100%;border-collapse:collapse;font-size:13px;"><thead><tr><th style="border:1px solid #9ca3af;padding:8px;background:#f8fafc;"></th>${headerHtml}</tr></thead><tbody>${bodyHtml}</tbody></table>${notesHtml}`;
+}
+
+// Keep in sync with SectionEditor's preset helpers.
+function presetFieldKey(fieldKey: string): string {
+  return `${PRESET_FIELD_PREFIX}${fieldKey}`;
+}
+
+function getPresetFields(config: PresetConfig | undefined): PresetField[] {
+  return (config?.fields || []).filter(field => field && field.key);
+}
+
+function findPresetByName(config: PresetConfig | undefined, name: string): PresetRow | undefined {
+  const normalized = name.trim().toLowerCase();
+  if (!normalized) return undefined;
+  return (config?.presets || []).find(preset => preset.name.trim().toLowerCase() === normalized);
+}
+
+function buildPresetContent(
+  config: PresetConfig | undefined,
+  selections: Record<string, unknown> | undefined,
+  customText: string,
+): string {
+  const rows = getPresetFields(config)
+    .map(field => {
+      const raw = selections?.[presetFieldKey(field.key)];
+      const value = Array.isArray(raw) ? String(raw[0] || '') : typeof raw === 'string' ? raw : '';
+      return { label: (field.label || field.key).trim(), value: value.trim() };
+    })
+    .filter(row => row.value);
+
+  if (rows.length === 0) return customText.trim();
+
+  if (config?.layout === 'lines') {
+    const text = rows.map(row => `${row.label}: ${row.value}`).join('\n');
+    return customText.trim() ? `${text}\n\n${customText.trim()}` : text;
+  }
+
+  const bodyHtml = rows
+    .map(row => (
+      `<tr>` +
+      `<td style="border:1px solid #d1d5db;padding:6px 10px;width:30%;font-weight:600;vertical-align:top;">${escapeHtml(row.label)}</td>` +
+      `<td style="border:1px solid #d1d5db;padding:6px 10px;vertical-align:top;">${escapeHtml(row.value).replace(/\n/g, '<br/>')}</td>` +
+      `</tr>`
+    ))
+    .join('');
+
+  const notesHtml = customText.trim()
+    ? `<div style="margin-top:10px;white-space:pre-wrap;">${escapeHtml(customText.trim()).replace(/\n/g, '<br/>')}</div>`
+    : '';
+
+  return `<table style="width:100%;border-collapse:collapse;font-size:13px;"><tbody>${bodyHtml}</tbody></table>${notesHtml}`;
 }
 
 interface BulkResultExcelModalProps {
@@ -430,6 +504,26 @@ const BulkResultExcelModal: React.FC<BulkResultExcelModalProps> = ({
 	          section_id: sec.id,
 	          section_config: config,
 	        });
+	      } else if (config?.mode === 'preset' && getPresetFields(config.preset).length > 0) {
+	        // One column for the condition name, plus one per field so values can be overridden.
+	        columns.push({
+	          id: `${sec.id}:preset_select`,
+	          name: `${sec.section_name} - ${config.preset?.label?.trim() || 'Condition'}`,
+	          type: 'preset_select',
+	          section_id: sec.id,
+	          cascade_options: (config.preset?.presets || []).map(preset => preset.name).filter(Boolean),
+	          section_config: config,
+	        });
+	        for (const field of getPresetFields(config.preset)) {
+	          columns.push({
+	            id: `${sec.id}:${presetFieldKey(field.key)}`,
+	            name: `${sec.section_name} - ${field.label || field.key}`,
+	            type: 'preset_field',
+	            section_id: sec.id,
+	            preset_field_key: field.key,
+	            section_config: config,
+	          });
+	        }
 	      } else {
         // Flat or unknown mode - single column for the section
         columns.push({
@@ -575,6 +669,7 @@ const BulkResultExcelModal: React.FC<BulkResultExcelModalProps> = ({
 
         const parsed: ParsedSheet[] = [];
         const invalidQualitativeValues: string[] = [];
+        const invalidPresetValues: string[] = [];
 
         for (const sheetName of workbook.SheetNames) {
           const sheet = workbook.Sheets[sheetName];
@@ -620,6 +715,11 @@ const BulkResultExcelModal: React.FC<BulkResultExcelModalProps> = ({
                   );
                   continue;
                 }
+                if (col.type === 'preset_select' && !findPresetByName(col.section_config?.preset, normalizedValue)) {
+                  const orderLabel = String(row[ORDER_ID_HEADER] || row[ORDER_UUID_HEADER] || 'unknown order');
+                  invalidPresetValues.push(`${orderLabel}: ${col.name} = "${normalizedValue}"`);
+                  continue;
+                }
                 values[col.name] = normalizedValue;
               }
             }
@@ -649,6 +749,18 @@ const BulkResultExcelModal: React.FC<BulkResultExcelModalProps> = ({
           setError(
             `Upload blocked: ${invalidQualitativeValues.length} invalid qualitative result${invalidQualitativeValues.length === 1 ? '' : 's'}. ` +
             `${examples}${remaining > 0 ? `; and ${remaining} more` : ''}`
+          );
+          setStep('ready');
+          return;
+        }
+
+        if (invalidPresetValues.length > 0) {
+          const examples = invalidPresetValues.slice(0, 5).join('; ');
+          const remaining = invalidPresetValues.length - 5;
+          setParsedSheets([]);
+          setError(
+            `Upload blocked: ${invalidPresetValues.length} unknown condition name${invalidPresetValues.length === 1 ? '' : 's'}. ` +
+            `Use a name exactly as listed in the Options/Ref row. ${examples}${remaining > 0 ? `; and ${remaining} more` : ''}`
           );
           setStep('ready');
           return;
@@ -836,6 +948,10 @@ const BulkResultExcelModal: React.FC<BulkResultExcelModalProps> = ({
     return group.columns.find(col => col.section_id === sectionId)?.section_config?.matrix;
   }
 
+  function getPresetConfigForSection(group: TestGroupInfo, sectionId: string): PresetConfig | undefined {
+    return group.columns.find(col => col.section_id === sectionId)?.section_config?.preset;
+  }
+
   function findCascadeLevel(levels: CascadeLevel[] | undefined, levelId: string): CascadeLevel | null {
     for (const level of levels || []) {
       if (level.id === levelId) return level;
@@ -916,7 +1032,7 @@ const BulkResultExcelModal: React.FC<BulkResultExcelModalProps> = ({
 	              skippedCount += analyteSave.skippedCount;
 	            }
 
-		            if (group.columns.some(col => col.type === 'section' || col.type === 'cascade_field' || col.type === 'matrix_cell' || col.type === 'matrix_note')) {
+		            if (group.columns.some(col => col.type !== 'analyte')) {
 		              // Save report section content
 		              const sectionSave = await saveSectionResults(
 	                row.order_id,
@@ -1231,6 +1347,7 @@ const BulkResultExcelModal: React.FC<BulkResultExcelModalProps> = ({
     // Group columns by section_id for cascade fields
 	    const sectionGroups = new Map<string, { sectionId: string; cascadeValues: Map<string, string> }>();
 	    const matrixGroups = new Map<string, { sectionId: string; cellValues: Map<string, string>; note: string; config?: MatrixConfig }>();
+	    const presetGroups = new Map<string, { sectionId: string; presetName: string; fieldValues: Map<string, string>; config?: PresetConfig }>();
 	    const flatSections: ColumnInfo[] = [];
 
 	    for (const col of group.columns) {
@@ -1266,6 +1383,23 @@ const BulkResultExcelModal: React.FC<BulkResultExcelModalProps> = ({
 	          });
 	        }
 	        matrixGroups.get(col.section_id)!.note = content;
+	      } else if ((col.type === 'preset_select' || col.type === 'preset_field') && col.section_id) {
+	        const content = values[col.name];
+	        if (!content) continue;
+	        if (!presetGroups.has(col.section_id)) {
+	          presetGroups.set(col.section_id, {
+	            sectionId: col.section_id,
+	            presetName: '',
+	            fieldValues: new Map(),
+	            config: getPresetConfigForSection(group, col.section_id),
+	          });
+	        }
+	        const entry = presetGroups.get(col.section_id)!;
+	        if (col.type === 'preset_select') {
+	          entry.presetName = content;
+	        } else if (col.preset_field_key) {
+	          entry.fieldValues.set(col.preset_field_key, content);
+	        }
 	      } else if (col.type === 'section') {
 	        flatSections.push(col);
 	      }
@@ -1337,6 +1471,34 @@ const BulkResultExcelModal: React.FC<BulkResultExcelModalProps> = ({
 	      if (!error) savedCount += cellValues.size + (note.trim() ? 1 : 0);
 	    }
 
+	    // Save preset (condition template) sections
+	    for (const [sectionId, { presetName, fieldValues, config }] of presetGroups) {
+	      const matched = findPresetByName(config, presetName);
+	      if (!matched && fieldValues.size === 0) continue;
+
+	      const presetSelections: Record<string, unknown> = {};
+	      if (matched) presetSelections[PRESET_SELECTED_KEY] = matched.id;
+	      for (const field of getPresetFields(config)) {
+	        // A filled field column overrides the condition's stored value.
+	        presetSelections[presetFieldKey(field.key)] = fieldValues.get(field.key) ?? matched?.values?.[field.key] ?? '';
+	      }
+
+	      const finalContent = buildPresetContent(config, presetSelections, '');
+	      if (!finalContent.trim()) continue;
+
+	      const { error } = await database.resultSectionContent.upsert({
+	        result_id: resultId,
+	        section_id: sectionId,
+	        selected_options: [],
+	        custom_text: '',
+	        final_content: finalContent,
+	        image_urls: [],
+	        cascading_selections: presetSelections as Record<string, string[]>,
+	      }, userId);
+
+	      if (!error) savedCount += (matched ? 1 : 0) + fieldValues.size;
+	    }
+
     // Save flat sections
     for (const col of flatSections) {
       const content = values[col.name];
@@ -1375,7 +1537,7 @@ const BulkResultExcelModal: React.FC<BulkResultExcelModalProps> = ({
 
   function getColumnSummary(group: TestGroupInfo): string {
     const analyteCount = group.columns.filter(col => col.type === 'analyte').length;
-    const sectionCount = group.columns.filter(col => col.type === 'section' || col.type === 'cascade_field').length;
+    const sectionCount = group.columns.filter(col => col.type !== 'analyte').length;
     const parts: string[] = [];
 
     if (analyteCount > 0) parts.push(`${analyteCount} analyte${analyteCount === 1 ? '' : 's'}`);

@@ -48,11 +48,32 @@ interface MatrixConfig {
   reportStyle?: 'color' | 'bold' | 'plain';
 }
 
+// Preset ("Condition / Template") mode: one dropdown fills several labelled fields at once.
+// e.g. PBS → pick "NNBP" and RBC / WBC / Platelet / Impression are filled in, still editable.
+interface PresetField {
+  key: string;
+  label: string;
+}
+
+interface PresetRow {
+  id: string;
+  name: string;
+  values: Record<string, string>;
+}
+
+interface PresetConfig {
+  label?: string; // dropdown label, defaults to "Condition / Template"
+  layout?: 'table' | 'lines';
+  fields: PresetField[];
+  presets: PresetRow[];
+}
+
 interface SectionConfig {
-  mode: 'flat' | 'cascading' | 'matrix';
+  mode: 'flat' | 'cascading' | 'matrix' | 'preset';
   icon?: string;
   cascade_levels: CascadeLevel[];
   matrix: MatrixConfig;
+  preset?: PresetConfig;
 }
 
 // ── Cascade helpers ────────────────────────────────────────────────────────
@@ -340,6 +361,160 @@ function buildMatrixHtml(config: MatrixConfig | undefined, selections: Record<st
 
   return `<table style="width:100%;border-collapse:collapse;font-size:13px;"><thead><tr><th style="border:1px solid #9ca3af;padding:8px;background:#f8fafc;"></th>${headerHtml}</tr></thead><tbody>${bodyHtml}</tbody></table>${notesHtml}`;
 }
+
+// ── Preset (condition template) helpers ────────────────────────────────────
+
+const PRESET_SELECTED_KEY = 'preset_selected';
+const PRESET_FIELD_PREFIX = 'preset:';
+const DEFAULT_PRESET_LABEL = 'Condition / Template';
+
+function presetFieldKey(fieldKey: string): string {
+  return `${PRESET_FIELD_PREFIX}${fieldKey}`;
+}
+
+function readSelectionString(selections: Record<string, unknown> | undefined, key: string): string {
+  const raw = selections?.[key];
+  if (Array.isArray(raw)) return String(raw[0] || '');
+  return typeof raw === 'string' ? raw : '';
+}
+
+function getPresetSelectedId(selections: Record<string, unknown> | undefined): string {
+  return readSelectionString(selections, PRESET_SELECTED_KEY);
+}
+
+function getPresetFieldValue(selections: Record<string, unknown> | undefined, fieldKey: string): string {
+  return readSelectionString(selections, presetFieldKey(fieldKey));
+}
+
+function getPresetFields(config: PresetConfig | undefined): PresetField[] {
+  return (config?.fields || []).filter(field => field && field.key);
+}
+
+function buildPresetContent(
+  config: PresetConfig | undefined,
+  selections: Record<string, unknown> | undefined,
+  customText: string,
+): string {
+  const rows = getPresetFields(config)
+    .map(field => ({ label: (field.label || field.key).trim(), value: getPresetFieldValue(selections, field.key).trim() }))
+    .filter(row => row.value);
+
+  if (rows.length === 0) return (customText || '').trim();
+
+  if (config?.layout === 'lines') {
+    const text = rows.map(row => `${row.label}: ${row.value}`).join('\n');
+    return combineContentParts([text, customText]);
+  }
+
+  const bodyHtml = rows
+    .map(row => (
+      `<tr>` +
+      `<td style="border:1px solid #d1d5db;padding:6px 10px;width:30%;font-weight:600;vertical-align:top;">${escapeHtml(row.label)}</td>` +
+      `<td style="border:1px solid #d1d5db;padding:6px 10px;vertical-align:top;">${escapeHtml(row.value).replace(/\n/g, '<br/>')}</td>` +
+      `</tr>`
+    ))
+    .join('');
+
+  const notesHtml = customText.trim()
+    ? `<div style="margin-top:10px;white-space:pre-wrap;">${escapeHtml(customText.trim()).replace(/\n/g, '<br/>')}</div>`
+    : '';
+
+  return `<table style="width:100%;border-collapse:collapse;font-size:13px;"><tbody>${bodyHtml}</tbody></table>${notesHtml}`;
+}
+
+interface PresetSelectorProps {
+  section: TemplateSection;
+  values: Record<string, any>;
+  customText: string;
+  disabled?: boolean;
+  onChange: (newSelections: Record<string, any>, finalContent: string) => void;
+}
+
+const PresetSelector: React.FC<PresetSelectorProps> = ({ section, values, customText, disabled, onChange }) => {
+  const config = section.section_config?.preset;
+  const fields = getPresetFields(config);
+  const presets = config?.presets || [];
+
+  if (fields.length === 0) {
+    return <div className="text-sm text-gray-400 italic py-2">No condition templates configured for this section.</div>;
+  }
+
+  const selectedId = getPresetSelectedId(values);
+
+  const emit = (nextSelections: Record<string, any>) => {
+    onChange(nextSelections, buildPresetContent(config, nextSelections, customText));
+  };
+
+  const applyPreset = (presetId: string) => {
+    const next: Record<string, any> = { ...(values || {}), [PRESET_SELECTED_KEY]: presetId };
+    const preset = presets.find(p => p.id === presetId);
+    for (const field of fields) {
+      next[presetFieldKey(field.key)] = preset ? (preset.values?.[field.key] || '') : '';
+    }
+    emit(next);
+  };
+
+  const updateField = (fieldKey: string, value: string) => {
+    emit({ ...(values || {}), [presetFieldKey(fieldKey)]: value });
+  };
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <label className="block text-sm font-medium text-gray-700 mb-2">
+          {config?.label?.trim() || DEFAULT_PRESET_LABEL}
+        </label>
+        <div className="flex items-center gap-2">
+          <select
+            value={selectedId}
+            onChange={(e) => applyPreset(e.target.value)}
+            disabled={disabled}
+            className={`flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 ${
+              disabled ? 'bg-gray-100 cursor-not-allowed' : 'bg-white'
+            }`}
+          >
+            <option value="">— Select a condition —</option>
+            {presets.map(preset => (
+              <option key={preset.id} value={preset.id}>{preset.name}</option>
+            ))}
+          </select>
+          {!disabled && selectedId && (
+            <button
+              type="button"
+              onClick={() => applyPreset('')}
+              className="px-3 py-2 text-sm text-gray-600 border border-gray-300 rounded-lg hover:bg-gray-50"
+            >
+              Clear
+            </button>
+          )}
+        </div>
+        <p className="text-xs text-gray-500 mt-1.5">
+          Picking a condition fills every field below — edit any of them afterwards if needed.
+        </p>
+      </div>
+
+      <div className="space-y-3">
+        {fields.map(field => (
+          <div key={field.key}>
+            <label className="block text-xs font-semibold text-gray-600 uppercase tracking-wide mb-1">
+              {field.label || field.key}
+            </label>
+            <textarea
+              value={getPresetFieldValue(values, field.key)}
+              onChange={(e) => updateField(field.key, e.target.value)}
+              disabled={disabled}
+              rows={2}
+              placeholder={`Enter ${(field.label || field.key).toLowerCase()}...`}
+              className={`w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 ${
+                disabled ? 'bg-gray-100 cursor-not-allowed' : 'bg-white'
+              }`}
+            />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
 
 // ── CascadeSelector component ──────────────────────────────────────────────
 
@@ -899,8 +1074,10 @@ const SectionEditor = forwardRef<SectionEditorRef, SectionEditorProps>(({
       let baseContent: string;
       if (section?.section_config?.mode === 'cascading' && section.section_config.cascade_levels.length > 0) {
         baseContent = buildCascadeContent(section.section_config.cascade_levels, content.cascading_selections || {});
-      } else if (section?.section_config?.mode === 'matrix') {
-        baseContent = buildMatrixHtml(section.section_config.matrix, content.cascading_selections || {}, text);
+      } else if (section?.section_config?.mode === 'matrix' || section?.section_config?.mode === 'preset') {
+        baseContent = section.section_config.mode === 'matrix'
+          ? buildMatrixHtml(section.section_config.matrix, content.cascading_selections || {}, text)
+          : buildPresetContent(section.section_config.preset, content.cascading_selections || {}, text);
         newMap.set(sectionId, {
           ...content,
           custom_text: text,
@@ -1165,6 +1342,8 @@ const SectionEditor = forwardRef<SectionEditorRef, SectionEditorProps>(({
 
       const finalContent = section?.section_config?.mode === 'matrix'
         ? buildMatrixHtml(section.section_config.matrix, content.cascading_selections || {}, newCustomText)
+        : section?.section_config?.mode === 'preset'
+        ? buildPresetContent(section.section_config.preset, content.cascading_selections || {}, newCustomText)
         : combineContentParts([
           ...content.selected_options
             .sort((a, b) => a - b)
@@ -1352,6 +1531,26 @@ const SectionEditor = forwardRef<SectionEditorRef, SectionEditorProps>(({
                       }}
                       disabled={isLocked}
                     />
+                  ) : section.section_config?.mode === 'preset' ? (
+                    <PresetSelector
+                      section={section}
+                      values={content?.cascading_selections || {}}
+                      customText={content?.custom_text || ''}
+                      disabled={isLocked}
+                      onChange={(newSelections, finalContent) => {
+                        setContents(prev => {
+                          const newMap = new Map(prev);
+                          const existing = newMap.get(section.id);
+                          if (!existing || existing.is_finalized) return prev;
+                          newMap.set(section.id, {
+                            ...existing,
+                            cascading_selections: newSelections,
+                            final_content: finalContent,
+                          });
+                          return newMap;
+                        });
+                      }}
+                    />
                   ) : section.section_config?.mode === 'matrix' ? (
                     <MatrixEditor
                       section={section}
@@ -1420,13 +1619,13 @@ const SectionEditor = forwardRef<SectionEditorRef, SectionEditorProps>(({
                     <div>
                       <div className="flex items-center justify-between mb-2">
                         <label className="block text-sm font-medium text-gray-700">
-                          {section.section_config?.mode === 'matrix'
-                            ? 'Add notes below table (optional):'
+                          {section.section_config?.mode === 'matrix' || section.section_config?.mode === 'preset'
+                            ? 'Add notes below (optional):'
                             : section.predefined_options?.length > 0
                               ? 'Add custom text (optional):'
                               : 'Enter content:'}
                         </label>
-                        {section.section_config?.mode !== 'matrix' && canEditText && (
+                        {section.section_config?.mode !== 'matrix' && section.section_config?.mode !== 'preset' && canEditText && (
                           <label className="inline-flex items-center px-2.5 py-1 rounded-md border border-gray-300 bg-white text-xs text-gray-700 hover:bg-gray-50 cursor-pointer transition-colors">
                             {importingWordSection === section.id ? (
                               <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
@@ -1447,7 +1646,7 @@ const SectionEditor = forwardRef<SectionEditorRef, SectionEditorProps>(({
                           </label>
                         )}
                       </div>
-                      {section.section_config?.mode === 'matrix' ? (
+                      {section.section_config?.mode === 'matrix' || section.section_config?.mode === 'preset' ? (
                         <textarea
                           value={content?.custom_text || ''}
                           onChange={(e) => canEditText && updateCustomText(section.id, e.target.value)}

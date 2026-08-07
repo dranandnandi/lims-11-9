@@ -56,7 +56,7 @@ const B2BBookingModal: React.FC<B2BBookingModalProps> = ({ accountId, labId, onC
                         .select(`
                             id, name, price, category,
                             package_test_groups(
-                                test_groups(id, name)
+                                test_groups(id, name, is_active)
                             )
                         `)
                         .eq('is_active', true)
@@ -83,6 +83,8 @@ const B2BBookingModal: React.FC<B2BBookingModalProps> = ({ accountId, labId, onC
                     type: 'package',
                     category: p.category,
                     includedTests: (p.package_test_groups || [])
+                        // Skip test groups deactivated after they were linked
+                        .filter((ptg: any) => ptg.test_groups?.is_active !== false)
                         .map((ptg: any) => ptg.test_groups?.name)
                         .filter(Boolean),
                 }));

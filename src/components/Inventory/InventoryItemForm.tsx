@@ -30,6 +30,7 @@ const InventoryItemForm: React.FC<InventoryItemFormProps> = ({ item, locationId,
     unit_price: '' as string | number,
     supplier_name: '',
     supplier_contact: '',
+    is_partner_orderable: false,
     notes: '',
   });
 
@@ -53,6 +54,7 @@ const InventoryItemForm: React.FC<InventoryItemFormProps> = ({ item, locationId,
         unit_price: item.unit_price || '',
         supplier_name: item.supplier_name || '',
         supplier_contact: item.supplier_contact || '',
+        is_partner_orderable: item.is_partner_orderable ?? false,
         notes: item.notes || '',
       });
     }
@@ -60,6 +62,11 @@ const InventoryItemForm: React.FC<InventoryItemFormProps> = ({ item, locationId,
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => {
     const { name, value, type } = e.target;
+    if (type === 'checkbox') {
+      const { checked } = e.target as HTMLInputElement;
+      setFormData(prev => ({ ...prev, [name]: checked }));
+      return;
+    }
     setFormData(prev => ({
       ...prev,
       [name]: type === 'number' ? (value === '' ? '' : Number(value)) : value,
@@ -429,6 +436,27 @@ const InventoryItemForm: React.FC<InventoryItemFormProps> = ({ item, locationId,
                 />
               </div>
             </div>
+          </div>
+
+          {/* Partner catalog */}
+          <div className="rounded-lg border border-gray-200 p-4">
+            <label className="flex items-start gap-3 cursor-pointer">
+              <input
+                type="checkbox"
+                name="is_partner_orderable"
+                checked={formData.is_partner_orderable}
+                onChange={handleChange}
+                className="mt-0.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+              />
+              <span>
+                <span className="block text-sm font-medium text-gray-700">
+                  Available to partners
+                </span>
+                <span className="block text-xs text-gray-500">
+                  Franchise / B2B accounts can request this item from their portal
+                </span>
+              </span>
+            </label>
           </div>
 
           {/* Notes */}

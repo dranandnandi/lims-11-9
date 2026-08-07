@@ -33,6 +33,8 @@ interface GatewayFormData {
   cancel_url: string;
   is_active: boolean;
   is_default: boolean;
+  allow_patient_payments: boolean;
+  payment_link_expiry_minutes: number;
   // CCAvenue
   merchant_id?: string;
   access_code?: string;
@@ -68,6 +70,8 @@ const PaymentGatewaySettings: React.FC<PaymentGatewaySettingsProps> = ({ labId }
   const ccavenueWebhookUrl =
     import.meta.env.VITE_CCAVENUE_WEBHOOK_URL ||
     `${paymentFunctionsBaseUrl}/functions/v1/payment-webhook?provider=ccavenue`;
+  // Must match PAYMENT_APP_BASE_URL on the edge functions, which build the link itself.
+  const payLinkBaseUrl = (import.meta.env.VITE_PAYMENT_APP_BASE_URL || window.location.origin).replace(/\/+$/, '');
 
   const [gateways, setGateways] = useState<LabPaymentGateway[]>([]);
   const [loading, setLoading] = useState(true);
@@ -85,6 +89,8 @@ const PaymentGatewaySettings: React.FC<PaymentGatewaySettingsProps> = ({ labId }
     cancel_url: '',
     is_active: true,
     is_default: false,
+    allow_patient_payments: false,
+    payment_link_expiry_minutes: 1440,
   });
 
   useEffect(() => {
@@ -152,6 +158,8 @@ const PaymentGatewaySettings: React.FC<PaymentGatewaySettingsProps> = ({ labId }
         cancel_url: formData.cancel_url,
         is_active: formData.is_active,
         is_default: formData.is_default,
+        allow_patient_payments: formData.allow_patient_payments,
+        payment_link_expiry_minutes: formData.payment_link_expiry_minutes || 1440,
         credentials_encrypted: credentials,
       };
 
@@ -198,6 +206,8 @@ const PaymentGatewaySettings: React.FC<PaymentGatewaySettingsProps> = ({ labId }
       cancel_url: gateway.cancel_url || '',
       is_active: gateway.is_active,
       is_default: gateway.is_default,
+      allow_patient_payments: (gateway as any).allow_patient_payments ?? false,
+      payment_link_expiry_minutes: (gateway as any).payment_link_expiry_minutes ?? 1440,
       merchant_id: creds?.merchant_id,
       access_code: creds?.access_code,
       working_key: creds?.working_key,
@@ -259,6 +269,8 @@ const PaymentGatewaySettings: React.FC<PaymentGatewaySettingsProps> = ({ labId }
       cancel_url: '',
       is_active: true,
       is_default: false,
+      allow_patient_payments: false,
+      payment_link_expiry_minutes: 1440,
     });
     setEditingId(null);
     setShowForm(false);
@@ -396,6 +408,47 @@ const PaymentGatewaySettings: React.FC<PaymentGatewaySettingsProps> = ({ labId }
                   />
                   <span className="text-sm">Set as Default</span>
                 </label>
+              </div>
+            </div>
+
+            {/* Patient payments — off by default so enabling it is a deliberate act */}
+            <div className="border-t pt-4 mt-4">
+              <h4 className="text-sm font-medium text-gray-700 mb-3 flex items-center gap-2">
+                <Shield className="h-4 w-4" />
+                Patient Payments
+              </h4>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <label className="flex items-start gap-2">
+                  <input
+                    type="checkbox"
+                    checked={formData.allow_patient_payments}
+                    onChange={(e) => setFormData({ ...formData, allow_patient_payments: e.target.checked })}
+                    className="rounded border-gray-300 mt-0.5"
+                  />
+                  <span className="text-sm">
+                    Allow patient payments
+                    <span className="block text-xs text-gray-500 mt-0.5">
+                      Lets staff raise a QR / WhatsApp pay link for a patient invoice, and lets patients
+                      pay outstanding bills from the patient portal.
+                    </span>
+                  </span>
+                </label>
+                <div>
+                  <label className="block text-sm text-gray-600 mb-1">Payment link validity (minutes)</label>
+                  <input
+                    type="number"
+                    min={5}
+                    max={43200}
+                    value={formData.payment_link_expiry_minutes}
+                    onChange={(e) =>
+                      setFormData({ ...formData, payment_link_expiry_minutes: Number(e.target.value) })
+                    }
+                    className="w-full border border-gray-300 rounded-lg px-3 py-2"
+                  />
+                  <p className="text-xs text-gray-500 mt-1">
+                    How long a pay link stays usable. Default 1440 (24 hours).
+                  </p>
+                </div>
               </div>
             </div>
 
@@ -782,6 +835,10 @@ const PaymentGatewaySettings: React.FC<PaymentGatewaySettingsProps> = ({ labId }
 	            <code className="bg-blue-100 px-1 rounded">
 	              {ccavenueWebhookUrl}
 	            </code>
+	          </li>
+	          <li>
+	            Patient pay links are issued under:{' '}
+	            <code className="bg-blue-100 px-1 rounded">{payLinkBaseUrl}/pay/&lt;token&gt;</code>
 	          </li>
         </ul>
       </div>

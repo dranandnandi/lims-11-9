@@ -80,6 +80,7 @@ interface TestGroup {
     showSampleType?: boolean;
     showSampleCondition?: boolean;
     showSignature?: boolean;
+    forceTableLayout?: boolean;
   } | null;
   group_interpretation?: string | null;
   global_test_catalog_id?: string | null;
@@ -2053,11 +2054,17 @@ const TestGroupForm: React.FC<TestGroupFormProps> = ({ onClose, onSubmit, testGr
                     { key: 'flagAsteriskCritical', label: 'Critical Double **', disabledWhen: !(formData.print_options as any)?.flagAsterisk },
                     { key: 'boldAllValues', label: 'Bold All Values' },
                     { key: 'boldAbnormalValues', label: 'Bold Abnormal Values' },
+                    { key: 'underlineAbnormalValues', label: 'Underline Abnormal Values' },
                     { key: 'alternateRows', label: 'Alternate Row Shading' },
                     { key: 'showSampleType', label: 'Show Sample Type on Report' },
                     { key: 'showSampleCondition', label: 'Show Sample Condition on Report' },
                     { key: 'showSignature', label: 'Show Signature on Report' },
-                  ] as { key: string; label: string; disabledWhen?: boolean }[]).map(({ key, label, disabledWhen }) => {
+                    {
+                      key: 'forceTableLayout',
+                      label: 'Force Table Layout',
+                      hint: 'On = always the TEST NAME / VALUE / UNITS table · Off = always the narrative key–value list · ↩ Lab = auto-detect (groups with no units and non-numeric ranges, e.g. Urine Routine, default to narrative)',
+                    },
+                  ] as { key: string; label: string; disabledWhen?: boolean; hint?: string }[]).map(({ key, label, disabledWhen, hint }) => {
                     const opts = (formData.print_options || {}) as Record<string, unknown>;
                     const isSet = key in opts && opts[key] !== undefined;
                     const val = opts[key];
@@ -2068,9 +2075,12 @@ const TestGroupForm: React.FC<TestGroupFormProps> = ({ onClose, onSubmit, testGr
                     });
                     const setKey = (k: string, v: unknown) => setFormData(prev => ({ ...prev, print_options: { ...(prev.print_options || {}), [k]: v } }));
                     return (
-                      <div key={key} className={`flex items-center justify-between${disabledWhen ? ' opacity-40 pointer-events-none' : ''}`}>
-                        <span className="text-sm text-gray-700">{label}</span>
-                        <div className="flex items-center gap-1">
+                      <div key={key} className={`flex items-start justify-between gap-3${disabledWhen ? ' opacity-40 pointer-events-none' : ''}`}>
+                        <div className="min-w-0">
+                          <span className="text-sm text-gray-700">{label}</span>
+                          {hint && <p className="text-xs text-gray-500 mt-0.5">{hint}</p>}
+                        </div>
+                        <div className="flex items-center gap-1 flex-shrink-0">
                           {(['lab', 'on', 'off'] as const).map(opt => {
                             const active = opt === 'lab' ? !isSet : opt === 'on' ? val === true : val === false;
                             return (

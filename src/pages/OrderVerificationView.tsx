@@ -1721,6 +1721,11 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
             groupInterpretation: panel.test_group_id
               ? (groupInterpretations.get(panel.test_group_id) ?? null)
               : null,
+            // Per-group overrides the preview reads directly (e.g. forceTableLayout),
+            // since resolvedPrintOptions below collapses to a single group's set.
+            printOptions: panel.test_group_id
+              ? (groupPrintOptions.get(panel.test_group_id) ?? null)
+              : null,
           };
 	        })
 	        .filter(g => g.analytes.length > 0);

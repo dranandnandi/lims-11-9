@@ -19,7 +19,13 @@ export type PaymentPurpose =
   | 'credit_topup'
   | 'order_payment'
   | 'shortfall_payment'
-  | 'advance_payment';
+  | 'advance_payment'
+  | 'patient_invoice';
+
+/** Who a payment attempt belongs to. Patient attempts settle against an invoice. */
+export type PayerType = 'b2b_account' | 'patient';
+
+export type PaymentLinkStatus = 'active' | 'paid' | 'failed' | 'expired' | 'cancelled';
 
 export type CreditLedgerEntryType =
   | 'OPENING_BALANCE'
@@ -49,6 +55,8 @@ export interface LabPaymentGateway {
   default_currency: string;
   is_active: boolean;
   is_default: boolean;
+  allow_patient_payments: boolean;
+  payment_link_expiry_minutes: number;
   created_at: string;
   updated_at: string;
 }
@@ -76,7 +84,15 @@ export type PaymentGatewayCredentials = CCavenueCredentials | RazorpayCredential
 export interface B2BPaymentAttempt {
   id: string;
   lab_id: string;
-  account_id: string;
+  /** Null for patient payments — see payer_type. */
+  account_id: string | null;
+  payer_type: PayerType;
+  invoice_id?: string | null;
+  order_id?: string | null;
+  patient_id?: string | null;
+  payer_name?: string | null;
+  payer_phone?: string | null;
+  payer_email?: string | null;
   pending_order_id?: string;
   gateway_id: string;
   provider: PaymentProvider;
@@ -144,6 +160,8 @@ export interface CreditCheckResponse {
   open_order_amount?: number;
   pending_booking_amount?: number;
   payment_credit_amount?: number;
+  /** Cash/cheque/bank receipts recorded by the lab from Account Master */
+  manual_credit_amount?: number;
   effective_credit_used?: number;
   available_credit: number;
   order_amount: number;
@@ -219,4 +237,57 @@ export interface PaymentHistoryFilters {
   provider?: PaymentProvider;
   date_from?: string;
   date_to?: string;
+}
+
+// Tokenised patient payment link (/pay/:token)
+export interface PaymentLink {
+  id: string;
+  lab_id: string;
+  token: string;
+  invoice_id?: string | null;
+  order_id?: string | null;
+  patient_id?: string | null;
+  amount: number;
+  currency: string;
+  payer_name?: string | null;
+  payer_phone?: string | null;
+  payer_email?: string | null;
+  payment_attempt_id?: string | null;
+  status: PaymentLinkStatus;
+  expires_at: string;
+  opened_at?: string | null;
+  open_count: number;
+  whatsapp_sent_at?: string | null;
+  whatsapp_sent_to?: string | null;
+  created_at: string;
+  updated_at: string;
+  created_by?: string | null;
+}
+
+export interface CreatePaymentLinkRequest {
+  lab_id: string;
+  invoice_id?: string;
+  order_id?: string;
+  patient_id?: string;
+  amount: number;
+  payer_name?: string;
+  payer_phone?: string;
+  payer_email?: string;
+  expires_in_minutes?: number;
+}
+
+export interface CreatePaymentLinkResponse {
+  success: boolean;
+  reused: boolean;
+  token: string;
+  /** Absolute URL — this is what the QR encodes and WhatsApp carries. */
+  url: string;
+  amount: number;
+  currency: string;
+  expires_at: string;
+  invoice_id: string;
+  invoice_number?: string | null;
+  payer_name?: string | null;
+  payer_phone?: string | null;
+  error?: string;
 }

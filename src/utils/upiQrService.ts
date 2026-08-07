@@ -111,6 +111,36 @@ export async function generateUPIQRCodeDataURL(
 }
 
 /**
+ * Generate a QR code for an arbitrary URL as a Data URL.
+ *
+ * Used for gateway pay links (/pay/:token). Unlike the UPI QRs above, this one
+ * is not a `upi://` intent — CCAvenue's integration is an encrypted form POST
+ * and exposes no shareable URL of its own, so we encode our own pay page and
+ * let the patient's browser take it from there (card / UPI / netbanking).
+ */
+export async function generateLinkQRCodeDataURL(
+  url: string,
+  options: QRCodeOptions = {}
+): Promise<string> {
+  const qrOptions = {
+    width: options.size || 220,
+    margin: options.margin ?? 1,
+    errorCorrectionLevel: options.errorCorrectionLevel || 'M',
+    color: {
+      dark: options.darkColor || '#000000',
+      light: options.lightColor || '#ffffff',
+    },
+  };
+
+  try {
+    return await QRCode.toDataURL(url, qrOptions);
+  } catch (error) {
+    console.error('Failed to generate payment link QR code:', error);
+    throw new Error('Failed to generate payment link QR code');
+  }
+}
+
+/**
  * Generate UPI QR code as SVG string
  * Better for high-resolution printing
  */

@@ -102,11 +102,31 @@ interface MatrixConfig {
   reportStyle?: 'color' | 'bold' | 'plain';
 }
 
+// Preset ("Condition / Template") mode: one dropdown fills several labelled fields at once.
+interface PresetField {
+  key: string;
+  label: string;
+}
+
+interface PresetRow {
+  id: string;
+  name: string;
+  values: Record<string, string>;
+}
+
+interface PresetConfig {
+  label?: string;
+  layout?: 'table' | 'lines';
+  fields: PresetField[];
+  presets: PresetRow[];
+}
+
 interface SectionConfig {
-  mode: 'flat' | 'cascading' | 'matrix';
+  mode: 'flat' | 'cascading' | 'matrix' | 'preset';
   icon?: string;
   cascade_levels: CascadeLevel[];
   matrix: MatrixConfig;
+  preset?: PresetConfig;
 }
 
 // ============================================
@@ -118,6 +138,58 @@ const DEFAULT_MATRIX_CONFIG: MatrixConfig = {
   rows: ['RE', 'LE'],
   columns: ['SPH', 'CYL', 'AXIS', 'ADD'],
 };
+
+const DEFAULT_PRESET_CONFIG: PresetConfig = {
+  label: 'Condition / Template',
+  layout: 'table',
+  fields: [],
+  presets: [],
+};
+
+const slugifyFieldKey = (label: string, fallbackIndex: number) =>
+  label.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || `field_${fallbackIndex + 1}`;
+
+function uniqueFieldKey(label: string, index: number, taken: Set<string>): string {
+  const base = slugifyFieldKey(label, index);
+  let key = base;
+  let suffix = 2;
+  while (taken.has(key)) key = `${base}_${suffix++}`;
+  taken.add(key);
+  return key;
+}
+
+// Parses a table pasted from Excel/Sheets (tab-separated, comma as fallback).
+// Row 1 = header: first cell is the dropdown label, the rest are field labels.
+// Rows 2+ = one condition each: first cell is its name, the rest are field values.
+function parsePresetTable(raw: string): { label: string; fields: PresetField[]; presets: PresetRow[] } | null {
+  const lines = raw.split(/\r?\n/).map(line => line.trimEnd()).filter(line => line.trim() !== '');
+  if (lines.length < 2) return null;
+
+  const delimiter = lines[0].includes('\t') ? '\t' : ',';
+  const header = lines[0].split(delimiter).map(cell => cell.trim());
+  if (header.length < 2) return null;
+
+  const taken = new Set<string>();
+  const fields: PresetField[] = header.slice(1).map((label, idx) => ({
+    key: uniqueFieldKey(label, idx, taken),
+    label,
+  }));
+
+  const presets: PresetRow[] = [];
+  for (const line of lines.slice(1)) {
+    const cells = line.split(delimiter).map(cell => cell.trim());
+    const name = cells[0];
+    if (!name) continue;
+    const values: Record<string, string> = {};
+    fields.forEach((field, idx) => {
+      values[field.key] = cells[idx + 1] || '';
+    });
+    presets.push({ id: genId(), name, values });
+  }
+
+  if (presets.length === 0) return null;
+  return { label: header[0] || DEFAULT_PRESET_CONFIG.label!, fields, presets };
+}
 
 function updateLevelLabelInTree(levels: CascadeLevel[], levelId: string, label: string): CascadeLevel[] {
   return levels.map(lvl =>
@@ -481,6 +553,240 @@ const MatrixBuilder: React.FC<MatrixBuilderProps> = ({ config, onChange }) => {
   );
 };
 
+// ============================================
+// PRESET (CONDITION TEMPLATE) BUILDER
+// ============================================
+
+interface PresetBuilderProps {
+  config: PresetConfig;
+  onChange: (config: PresetConfig) => void;
+}
+
+const PresetBuilder: React.FC<PresetBuilderProps> = ({ config, onChange }) => {
+  const [pasteText, setPasteText] = useState('');
+  const [showPaste, setShowPaste] = useState(false);
+  const [pasteError, setPasteError] = useState<string | null>(null);
+
+  const fields = config.fields || [];
+  const presets = config.presets || [];
+
+  const addField = () => {
+    const taken = new Set(fields.map(f => f.key));
+    const key = uniqueFieldKey(`field_${fields.length + 1}`, fields.length, taken);
+    onChange({ ...config, fields: [...fields, { key, label: '' }] });
+  };
+
+  const updateFieldLabel = (key: string, label: string) => {
+    onChange({ ...config, fields: fields.map(f => (f.key === key ? { ...f, label } : f)) });
+  };
+
+  const removeField = (key: string) => {
+    onChange({
+      ...config,
+      fields: fields.filter(f => f.key !== key),
+      presets: presets.map(p => {
+        const values = { ...p.values };
+        delete values[key];
+        return { ...p, values };
+      }),
+    });
+  };
+
+  const addPreset = () => {
+    onChange({ ...config, presets: [...presets, { id: genId(), name: '', values: {} }] });
+  };
+
+  const updatePresetName = (id: string, name: string) => {
+    onChange({ ...config, presets: presets.map(p => (p.id === id ? { ...p, name } : p)) });
+  };
+
+  const updatePresetValue = (id: string, fieldKey: string, value: string) => {
+    onChange({
+      ...config,
+      presets: presets.map(p => (p.id === id ? { ...p, values: { ...p.values, [fieldKey]: value } } : p)),
+    });
+  };
+
+  const removePreset = (id: string) => {
+    onChange({ ...config, presets: presets.filter(p => p.id !== id) });
+  };
+
+  const handleImport = () => {
+    const parsed = parsePresetTable(pasteText);
+    if (!parsed) {
+      setPasteError('Could not read that table. Paste a header row plus at least one condition row (tab or comma separated).');
+      return;
+    }
+    setPasteError(null);
+    onChange({ ...config, label: parsed.label, fields: parsed.fields, presets: parsed.presets });
+    setPasteText('');
+    setShowPaste(false);
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="text-xs text-gray-500 bg-blue-50 border border-blue-100 rounded-lg px-3 py-2">
+        <strong>How it works:</strong> the doctor picks one condition from a dropdown and every field below it
+        (e.g. RBC / WBC / Platelet / Impression) is filled in automatically — still editable afterwards.
+      </div>
+
+      {/* Dropdown label + report layout */}
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <label className="block text-xs font-medium text-gray-600 mb-1">Dropdown label</label>
+          <input
+            type="text"
+            value={config.label ?? ''}
+            onChange={e => onChange({ ...config, label: e.target.value })}
+            placeholder="Condition / Template"
+            className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500"
+          />
+        </div>
+        <div>
+          <label className="block text-xs font-medium text-gray-600 mb-1">Report layout</label>
+          <select
+            value={config.layout || 'table'}
+            onChange={e => onChange({ ...config, layout: e.target.value as PresetConfig['layout'] })}
+            className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 bg-white"
+          >
+            <option value="table">Two-column table (label | value)</option>
+            <option value="lines">Plain lines (LABEL: value)</option>
+          </select>
+        </div>
+      </div>
+
+      {/* Bulk paste */}
+      <div>
+        <button
+          type="button"
+          onClick={() => { setShowPaste(v => !v); setPasteError(null); }}
+          className="text-sm text-blue-600 hover:text-blue-700"
+        >
+          {showPaste ? '− Hide spreadsheet import' : '+ Paste from Excel / Google Sheets'}
+        </button>
+        {showPaste && (
+          <div className="mt-2 space-y-2">
+            <textarea
+              value={pasteText}
+              onChange={e => setPasteText(e.target.value)}
+              rows={6}
+              placeholder={'Condition / Template\tRBC FINDINGS\tWBC FINDINGS\tPLATELET FINDINGS\tIMPRESSION\nNNBP\tNORMOCYTIC NORMOCHROMIC...\t...\t...\t...'}
+              className="w-full px-3 py-2 border rounded-lg text-xs font-mono focus:ring-2 focus:ring-blue-500"
+            />
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={handleImport}
+                className="px-3 py-1.5 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700"
+              >
+                Import table
+              </button>
+              <span className="text-xs text-gray-500">
+                First row = column headers. Replaces the fields and conditions below.
+              </span>
+            </div>
+            {pasteError && <p className="text-xs text-red-600">{pasteError}</p>}
+          </div>
+        )}
+      </div>
+
+      {/* Fields */}
+      <div>
+        <div className="flex items-center justify-between mb-2">
+          <span className="text-sm font-medium text-gray-700">Fields filled by each condition</span>
+          <button type="button" onClick={addField} className="text-sm text-blue-600 hover:text-blue-700">
+            + Add Field
+          </button>
+        </div>
+        {fields.length === 0 ? (
+          <p className="text-xs text-gray-500 italic">No fields yet — add one or paste a table above.</p>
+        ) : (
+          <div className="flex flex-wrap gap-2">
+            {fields.map(field => (
+              <div key={field.key} className="flex items-center gap-1 bg-gray-50 border border-gray-200 rounded-lg px-2 py-1">
+                <input
+                  type="text"
+                  value={field.label}
+                  onChange={e => updateFieldLabel(field.key, e.target.value)}
+                  placeholder="e.g. RBC FINDINGS"
+                  className="px-2 py-1 border border-gray-300 rounded text-sm w-44 focus:ring-2 focus:ring-blue-400"
+                />
+                <button type="button" onClick={() => removeField(field.key)} className="p-1 text-gray-400 hover:text-red-600">
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Preset rows */}
+      {fields.length > 0 && (
+        <div>
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-sm font-medium text-gray-700">
+              Conditions ({presets.length})
+            </span>
+            <button type="button" onClick={addPreset} className="text-sm text-blue-600 hover:text-blue-700">
+              + Add Condition
+            </button>
+          </div>
+          <div className="max-h-96 overflow-auto border border-gray-200 rounded-lg">
+            <table className="min-w-full text-sm">
+              <thead className="bg-gray-50 sticky top-0">
+                <tr>
+                  <th className="px-2 py-2 text-left font-medium text-gray-600 min-w-[160px]">
+                    {config.label?.trim() || 'Condition / Template'}
+                  </th>
+                  {fields.map(field => (
+                    <th key={field.key} className="px-2 py-2 text-left font-medium text-gray-600 min-w-[220px]">
+                      {field.label || field.key}
+                    </th>
+                  ))}
+                  <th className="w-8" />
+                </tr>
+              </thead>
+              <tbody>
+                {presets.map(preset => (
+                  <tr key={preset.id} className="border-t border-gray-100">
+                    <td className="px-1.5 py-1">
+                      <input
+                        type="text"
+                        value={preset.name}
+                        onChange={e => updatePresetName(preset.id, e.target.value)}
+                        placeholder="e.g. NNBP"
+                        className="w-full px-2 py-1.5 border rounded text-sm font-medium focus:ring-2 focus:ring-blue-400"
+                      />
+                    </td>
+                    {fields.map(field => (
+                      <td key={field.key} className="px-1.5 py-1">
+                        <input
+                          type="text"
+                          value={preset.values?.[field.key] || ''}
+                          onChange={e => updatePresetValue(preset.id, field.key, e.target.value)}
+                          className="w-full px-2 py-1.5 border rounded text-sm focus:ring-2 focus:ring-blue-400"
+                        />
+                      </td>
+                    ))}
+                    <td className="px-1 py-1 align-middle">
+                      <button type="button" onClick={() => removePreset(preset.id)} className="p-1 text-gray-400 hover:text-red-600">
+                        <X className="w-4 h-4" />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {presets.length === 0 && (
+            <p className="text-xs text-gray-500 italic mt-2">No conditions yet — add one or paste a table above.</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
 const ManageReportSections: React.FC = () => {
   // State
   const [sections, setSections] = useState<TemplateSection[]>([]);
@@ -518,7 +824,7 @@ const ManageReportSections: React.FC = () => {
     allow_images: false,
     allow_technician_entry: false,
     placeholder_key: '',
-    section_config: { mode: 'flat', cascade_levels: [], matrix: DEFAULT_MATRIX_CONFIG },
+    section_config: { mode: 'flat', cascade_levels: [], matrix: DEFAULT_MATRIX_CONFIG, preset: DEFAULT_PRESET_CONFIG },
   });
 
   // AI Assistant state
@@ -573,7 +879,7 @@ const ManageReportSections: React.FC = () => {
       allow_images: false,
       allow_technician_entry: false,
       placeholder_key: '',
-      section_config: { mode: 'flat', cascade_levels: [], matrix: DEFAULT_MATRIX_CONFIG },
+      section_config: { mode: 'flat', cascade_levels: [], matrix: DEFAULT_MATRIX_CONFIG, preset: DEFAULT_PRESET_CONFIG },
     });
     setEditingSection(null);
     setShowAIPanel(false);
@@ -699,6 +1005,7 @@ const ManageReportSections: React.FC = () => {
         icon: (section as any).section_config?.icon || getSectionTypeIcon(section.section_type),
         cascade_levels: (section as any).section_config?.cascade_levels || [],
         matrix: (section as any).section_config?.matrix || DEFAULT_MATRIX_CONFIG,
+        preset: (section as any).section_config?.preset || DEFAULT_PRESET_CONFIG,
       },
     });
     setShowForm(true);
@@ -717,7 +1024,7 @@ const ManageReportSections: React.FC = () => {
     allow_images: false,
     allow_technician_entry: false,
     placeholder_key: '',
-    section_config: { mode: 'flat' as const, cascade_levels: [], matrix: DEFAULT_MATRIX_CONFIG },
+    section_config: { mode: 'flat' as const, cascade_levels: [], matrix: DEFAULT_MATRIX_CONFIG, preset: DEFAULT_PRESET_CONFIG },
   });
 
   const handleSubmit = async (
@@ -738,7 +1045,7 @@ const ManageReportSections: React.FC = () => {
       }
 
       // Filter out empty options (only used in flat mode)
-      const usesStructuredConfig = formData.section_config.mode === 'cascading' || formData.section_config.mode === 'matrix';
+      const usesStructuredConfig = formData.section_config.mode !== 'flat';
       const cleanedOptions = usesStructuredConfig
         ? []
         : formData.predefined_options.filter(opt => opt.trim() !== '');
@@ -814,7 +1121,7 @@ const ManageReportSections: React.FC = () => {
           allow_images: section.allow_images ?? false,
           allow_technician_entry: section.allow_technician_entry ?? false,
           placeholder_key: section.placeholder_key || section.section_type,
-          section_config: (section as any).section_config || { mode: 'flat', cascade_levels: [], matrix: DEFAULT_MATRIX_CONFIG },
+          section_config: (section as any).section_config || { mode: 'flat', cascade_levels: [], matrix: DEFAULT_MATRIX_CONFIG, preset: DEFAULT_PRESET_CONFIG },
         });
         if (createErr) throw createErr;
       }
@@ -1023,6 +1330,13 @@ const ManageReportSections: React.FC = () => {
                                   </span>
                                 )}
                               </div>
+                            </div>
+                          )}
+
+                          {(section as any).section_config?.mode === 'preset' && (
+                            <div className="mt-2 text-xs text-gray-500">
+                              {((section as any).section_config?.preset?.presets || []).length} condition templates ×{' '}
+                              {((section as any).section_config?.preset?.fields || []).length} fields
                             </div>
                           )}
 
@@ -1378,6 +1692,24 @@ const ManageReportSections: React.FC = () => {
 	                  >
 	                    Matrix Table
 	                  </button>
+	                  <button
+	                    type="button"
+	                    onClick={() => setFormData(prev => ({
+	                      ...prev,
+	                      section_config: {
+	                        ...prev.section_config,
+	                        mode: 'preset',
+	                        preset: prev.section_config.preset || DEFAULT_PRESET_CONFIG,
+	                      },
+	                    }))}
+	                    className={`flex-1 py-2 text-sm font-medium transition-colors border-l ${
+	                      formData.section_config.mode === 'preset'
+	                        ? 'bg-blue-600 text-white'
+	                        : 'bg-white text-gray-600 hover:bg-gray-50'
+	                    }`}
+	                  >
+	                    Condition Templates
+	                  </button>
 	                </div>
 
                 {formData.section_config.mode === 'flat' ? (
@@ -1431,6 +1763,16 @@ const ManageReportSections: React.FC = () => {
                       />
                     </div>
                   </div>
+                ) : formData.section_config.mode === 'preset' ? (
+                  <PresetBuilder
+                    config={formData.section_config.preset || DEFAULT_PRESET_CONFIG}
+                    onChange={(preset) =>
+                      setFormData(prev => ({
+                        ...prev,
+                        section_config: { ...prev.section_config, preset },
+                      }))
+                    }
+                  />
                 ) : (
                   <div>
                     <MatrixBuilder

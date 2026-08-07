@@ -1,10 +1,12 @@
 import React, { useState, useEffect, useMemo } from 'react';
+import { Link } from 'react-router-dom';
 import {
     Calculator, Download, Search, Calendar,
     ChevronDown, ChevronRight, Users, IndianRupee, FileText,
-    TrendingUp, AlertCircle, RefreshCw, Bike, Stethoscope
+    TrendingUp, AlertCircle, RefreshCw, Bike, Stethoscope, FileDown
 } from 'lucide-react';
 import { supabase, database } from '../utils/supabase';
+import { downloadCommissionReportPdf } from '../utils/commissionReportPdf';
 
 interface PhlebotomistVisit {
     order_id: string;
@@ -22,12 +24,39 @@ interface Doctor {
     name: string;
 }
 
+type AdjustmentMode = 'none' | 'exclude_from_base' | 'deduct_from_commission' | 'split_50_50';
+
+interface SharingSettings {
+    default_sharing_percent: number;
+    dr_discount_mode: AdjustmentMode;
+    outsource_cost_mode: AdjustmentMode;
+    package_diff_mode: AdjustmentMode;
+}
+
+/**
+ * Used when a doctor has no row in doctor_sharing. Commission stays at zero so the
+ * doctor still shows up as a referral listing (patients + tests) instead of vanishing.
+ */
+const UNCONFIGURED_SHARING: SharingSettings = {
+    default_sharing_percent: 0,
+    dr_discount_mode: 'none',
+    outsource_cost_mode: 'none',
+    package_diff_mode: 'none'
+};
+
 interface DoctorCommission {
     doctor_id: string;
     doctor_name: string;
+    /** false when the doctor has no doctor_sharing row — report is referrals only */
+    is_configured: boolean;
+    /** Billed orders only — the payable figures */
     total_revenue: number;
     total_commission: number;
     orders_count: number;
+    /** Not-yet-billed orders, tracked separately so payable totals stay trustworthy */
+    unbilled_revenue: number;
+    unbilled_commission: number;
+    unbilled_orders_count: number;
     details: CommissionDetail[];
 }
 
@@ -35,6 +64,8 @@ interface CommissionDetail {
     order_id: string;
     patient_name: string;
     date: string;
+    billing_status: string | null;
+    is_billed: boolean;
     gross_amount: number;
     discount_amount: number;
     discount_source: string | null;
@@ -84,7 +115,11 @@ const DoctorCommissionReport: React.FC = () => {
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [expandedDoctors, setExpandedDoctors] = useState<Set<string>>(new Set());
+    const [doctorsWithNoOrders, setDoctorsWithNoOrders] = useState<string[]>([]);
+    const [includeUnbilled, setIncludeUnbilled] = useState(false);
     const [searchQuery, setSearchQuery] = useState('');
+    const [pdfBusy, setPdfBusy] = useState(false);
+    const [pdfIncludeItems, setPdfIncludeItems] = useState(true);
 
     // Phlebotomist Visits tab
     const [activeTab, setActiveTab] = useState<'doctor' | 'phlebotomist'>('doctor');
@@ -179,25 +214,30 @@ const DoctorCommissionReport: React.FC = () => {
         try {
             const labId = await database.getCurrentUserLabId();
             const results: DoctorCommission[] = [];
+            const emptyDoctors: string[] = [];
 
             for (const doctorId of selectedDoctorIds) {
                 const doctor = doctors.find(d => d.id === doctorId);
                 if (!doctor) continue;
 
                 // Get sharing settings for this doctor
-                const { data: settings, error: settingsError } = await supabase
+                const { data: savedSettings, error: settingsError } = await supabase
                     .from('doctor_sharing')
                     .select('*')
                     .eq('doctor_id', doctorId)
-                    .single();
+                    .maybeSingle();
 
-                console.debug('[Commission] doctor_sharing lookup:', { doctorId, settings, settingsError });
+                console.debug('[Commission] doctor_sharing lookup:', { doctorId, savedSettings, settingsError });
 
-                if (!settings) {
-                    // No settings configured, skip
-                    console.warn('[Commission] No sharing settings for doctor, skipping:', doctorId);
-                    continue;
-                }
+                // No sharing config: still list the doctor's patients and tests, with zero commission
+                const settings: SharingSettings = savedSettings
+                    ? {
+                        default_sharing_percent: Number(savedSettings.default_sharing_percent || 0),
+                        dr_discount_mode: (savedSettings.dr_discount_mode || 'none') as AdjustmentMode,
+                        outsource_cost_mode: (savedSettings.outsource_cost_mode || 'none') as AdjustmentMode,
+                        package_diff_mode: (savedSettings.package_diff_mode || 'none') as AdjustmentMode
+                    }
+                    : UNCONFIGURED_SHARING;
 
                 // Get test-wise overrides
                 const { data: testOverrides } = await supabase
@@ -220,6 +260,9 @@ const DoctorCommissionReport: React.FC = () => {
 	                    (billingOverrides || []).map(o => [o.billing_item_type_id, o.sharing_percent])
 	                );
 
+                // A doctor counts as configured if there is a sharing row OR any per-item override.
+                const isConfigured = Boolean(savedSettings) || testSharingMap.size > 0 || billingSharingMap.size > 0;
+
                 // Get all packages with their included tests for package diff calculation
                 const { data: packagesData } = await supabase
                     .from('packages')
@@ -228,7 +271,7 @@ const DoctorCommissionReport: React.FC = () => {
                         price,
                         package_test_groups(
                             test_group_id,
-                            test_groups(price)
+                            test_groups(price, is_active)
                         )
                     `)
                     .eq('lab_id', labId)
@@ -238,19 +281,22 @@ const DoctorCommissionReport: React.FC = () => {
                 const packageTestSumMap = new Map<string, number>();
                 for (const pkg of (packagesData || [])) {
                     const testSum = (pkg.package_test_groups || []).reduce((sum: number, ptg: any) => {
+                        // Skip test groups deactivated after they were linked
+                        if (ptg.test_groups?.is_active === false) return sum;
                         return sum + (ptg.test_groups?.price || 0);
                     }, 0);
                     packageTestSumMap.set(pkg.id, testSum);
                 }
 
                 // Get orders for this doctor in date range
-                const { data: orders, error: ordersError } = await supabase
+                let ordersQuery = supabase
                     .from('orders')
                     .select(`
                         id,
                         order_display,
                         sample_id,
                         created_at,
+                        billing_status,
                         total_amount,
                         final_amount,
                         patients(name),
@@ -274,15 +320,23 @@ const DoctorCommissionReport: React.FC = () => {
                     .eq('lab_id', labId)
                     .eq('referring_doctor_id', doctorId)
                     .gte('created_at', dateFrom)
-                    .lte('created_at', dateTo + 'T23:59:59')
-                    .eq('billing_status', 'billed');
+                    .lte('created_at', dateTo + 'T23:59:59');
+
+                if (!includeUnbilled) {
+                    ordersQuery = ordersQuery.eq('billing_status', 'billed');
+                }
+
+                const { data: orders, error: ordersError } = await ordersQuery;
 
                 if (ordersError) throw ordersError;
 
-                console.debug('[Commission] orders fetched:', { doctorId, count: orders?.length, orders });
+                console.debug('[Commission] orders fetched:', { doctorId, count: orders?.length, includeUnbilled, orders });
 
                 let totalRevenue = 0;
                 let totalCommission = 0;
+                let unbilledRevenue = 0;
+                let unbilledCommission = 0;
+                let unbilledCount = 0;
                 const details: CommissionDetail[] = [];
 
                 for (const order of (orders || [])) {
@@ -423,13 +477,23 @@ const DoctorCommissionReport: React.FC = () => {
                     // Final commission = calculated commission - all deductions (minimum 0)
                     const finalOrderCommission = Math.max(0, orderCommission - totalDeductFromCommission);
 
-                    totalRevenue += grossAmount;
-                    totalCommission += finalOrderCommission;
+                    // Unbilled orders are listed but kept out of the payable totals
+                    const isBilled = (order as any).billing_status === 'billed';
+                    if (isBilled) {
+                        totalRevenue += grossAmount;
+                        totalCommission += finalOrderCommission;
+                    } else {
+                        unbilledRevenue += grossAmount;
+                        unbilledCommission += finalOrderCommission;
+                        unbilledCount += 1;
+                    }
 
 	                    details.push({
 	                        order_id: order.order_display || order.sample_id || order.id,
 	                        patient_name: patientName,
 	                        date: order.created_at,
+	                        billing_status: (order as any).billing_status ?? null,
+	                        is_billed: isBilled,
 	                        gross_amount: grossAmount,
 	                        discount_amount: displayedDiscount,
 	                        discount_source: discountSource,
@@ -449,15 +513,22 @@ const DoctorCommissionReport: React.FC = () => {
                     results.push({
                         doctor_id: doctorId,
                         doctor_name: doctor.name,
+                        is_configured: isConfigured,
                         total_revenue: totalRevenue,
                         total_commission: totalCommission,
-                        orders_count: details.length,
+                        orders_count: details.length - unbilledCount,
+                        unbilled_revenue: unbilledRevenue,
+                        unbilled_commission: unbilledCommission,
+                        unbilled_orders_count: unbilledCount,
                         details
                     });
+                } else {
+                    emptyDoctors.push(doctor.name);
                 }
             }
 
             setCommissions(results);
+            setDoctorsWithNoOrders(emptyDoctors);
         } catch (err) {
             console.error('Error calculating commissions:', err);
             setError('Failed to calculate commissions');
@@ -494,13 +565,22 @@ const DoctorCommissionReport: React.FC = () => {
         return commissions.reduce((acc, c) => ({
             revenue: acc.revenue + c.total_revenue,
             commission: acc.commission + c.total_commission,
-            orders: acc.orders + c.orders_count
-        }), { revenue: 0, commission: 0, orders: 0 });
+            orders: acc.orders + c.orders_count,
+            unbilledRevenue: acc.unbilledRevenue + c.unbilled_revenue,
+            unbilledCommission: acc.unbilledCommission + c.unbilled_commission,
+            unbilledOrders: acc.unbilledOrders + c.unbilled_orders_count
+        }), { revenue: 0, commission: 0, orders: 0, unbilledRevenue: 0, unbilledCommission: 0, unbilledOrders: 0 });
     }, [commissions]);
 
+    const unconfiguredDoctors = useMemo(
+        () => commissions.filter(c => !c.is_configured),
+        [commissions]
+    );
+
     const handleExportCSV = () => {
+        const csvCell = (value: string) => `"${String(value ?? '').replace(/"/g, '""')}"`;
         const rows: string[] = [
-            'Doctor,Order ID,Patient,Date,Gross Amount,Adjustments,Sharing Base,Commission'
+            'Doctor,Sharing Status,Order ID,Billing Status,Patient,Date,Tests & Items,Gross Amount,Discount,Paid,Due,Payment Status,Adjustments,Sharing Base,Commission'
         ];
 
         for (const commission of commissions) {
@@ -511,15 +591,26 @@ const DoctorCommissionReport: React.FC = () => {
                     detail.adjustments.package_diff ? `Package: Rs. ${detail.adjustments.package_diff.toFixed(2)}` : ''
                 ].filter(Boolean).join('; ');
 
+                const itemsStr = detail.line_items
+                    .map(item => `${item.name} (Rs. ${item.amount.toFixed(2)})`)
+                    .join('; ');
+
                 rows.push([
-                    commission.doctor_name,
-                    detail.order_id,
-                    detail.patient_name,
+                    csvCell(commission.doctor_name),
+                    commission.is_configured ? 'Configured' : 'Not configured',
+                    csvCell(detail.order_id),
+                    detail.is_billed ? 'billed' : (detail.billing_status || 'unbilled'),
+                    csvCell(detail.patient_name),
                     new Date(detail.date).toLocaleDateString(),
+                    csvCell(itemsStr),
                     detail.gross_amount.toFixed(2),
-                    `"${adjustmentsStr}"`,
+                    detail.discount_amount.toFixed(2),
+                    detail.paid_amount.toFixed(2),
+                    detail.due_amount.toFixed(2),
+                    detail.payment_status,
+                    csvCell(adjustmentsStr),
                     detail.sharing_base.toFixed(2),
-                    detail.commission.toFixed(2)
+                    commission.is_configured ? detail.commission.toFixed(2) : ''
                 ].join(','));
             }
         }
@@ -533,12 +624,41 @@ const DoctorCommissionReport: React.FC = () => {
         a.click();
     };
 
+    const handleExportPDF = async () => {
+        setPdfBusy(true);
+        try {
+            let labName: string | undefined;
+            try {
+                const labId = await database.getCurrentUserLabId();
+                const { data } = await supabase.from('labs').select('name').eq('id', labId).single();
+                labName = data?.name || undefined;
+            } catch {
+                // Header falls back to a generic title if the lab name can't be read
+            }
+
+            downloadCommissionReportPdf(commissions, {
+                dateFrom,
+                dateTo,
+                labName,
+                includeItems: pdfIncludeItems
+            });
+        } catch (err) {
+            console.error('Error generating commission PDF:', err);
+            setError('Failed to generate PDF');
+        } finally {
+            setPdfBusy(false);
+        }
+    };
+
     return (
         <div className="space-y-6">
             {/* Page Header */}
             <div>
                 <h1 className="text-2xl font-bold text-gray-900">Commission Report</h1>
-                <p className="text-gray-600 mt-1">Calculate doctor commissions based on sharing settings</p>
+                <p className="text-gray-600 mt-1">
+                    Calculate doctor commissions based on sharing settings. Doctors without sharing
+                    configured still show their patient and test listing.
+                </p>
             </div>
 
             {/* Tab Switcher */}
@@ -653,7 +773,7 @@ const DoctorCommissionReport: React.FC = () => {
                 </div>
 
                 {/* Actions */}
-                <div className="mt-4 flex items-center gap-4">
+                <div className="mt-4 flex flex-wrap items-center gap-4">
                     {activeTab === 'doctor' ? (
                         <>
                             <button
@@ -665,14 +785,48 @@ const DoctorCommissionReport: React.FC = () => {
                                 Calculate
                             </button>
                             {commissions.length > 0 && (
-                                <button
-                                    onClick={handleExportCSV}
-                                    className="flex items-center gap-2 px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50"
-                                >
-                                    <Download className="h-4 w-4" />
-                                    Export CSV
-                                </button>
+                                <>
+                                    <button
+                                        onClick={handleExportCSV}
+                                        className="flex items-center gap-2 px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50"
+                                    >
+                                        <Download className="h-4 w-4" />
+                                        Export CSV
+                                    </button>
+                                    <button
+                                        onClick={handleExportPDF}
+                                        disabled={pdfBusy}
+                                        title="Download an A4 landscape commission statement"
+                                        className="flex items-center gap-2 px-4 py-2 border border-emerald-300 bg-emerald-50 text-emerald-700 rounded-lg hover:bg-emerald-100 disabled:opacity-50"
+                                    >
+                                        {pdfBusy ? <RefreshCw className="h-4 w-4 animate-spin" /> : <FileDown className="h-4 w-4" />}
+                                        Export PDF (A4 landscape)
+                                    </button>
+                                    <label className="flex items-center gap-2 cursor-pointer select-none">
+                                        <input
+                                            type="checkbox"
+                                            checked={pdfIncludeItems}
+                                            onChange={(e) => setPdfIncludeItems(e.target.checked)}
+                                            className="rounded border-gray-300 text-emerald-600 focus:ring-emerald-500"
+                                        />
+                                        <span className="text-sm text-gray-700">
+                                            Test-wise breakup in PDF
+                                        </span>
+                                    </label>
+                                </>
                             )}
+                            <label className="flex items-center gap-2 cursor-pointer select-none">
+                                <input
+                                    type="checkbox"
+                                    checked={includeUnbilled}
+                                    onChange={(e) => setIncludeUnbilled(e.target.checked)}
+                                    className="rounded border-gray-300 text-emerald-600 focus:ring-emerald-500"
+                                />
+                                <span className="text-sm text-gray-700">
+                                    Include unbilled orders
+                                    <span className="ml-1 text-xs text-gray-500">(listed separately, kept out of payable totals)</span>
+                                </span>
+                            </label>
                         </>
                     ) : (
                         <button
@@ -694,6 +848,34 @@ const DoctorCommissionReport: React.FC = () => {
                 )}
             </div>
 
+            {/* Doctors without sharing config — still listed, commission omitted */}
+            {unconfiguredDoctors.length > 0 && (
+                <div className="rounded-xl border border-amber-200 bg-amber-50 p-4">
+                    <div className="flex items-start gap-3">
+                        <AlertCircle className="h-5 w-5 text-amber-600 mt-0.5 flex-shrink-0" />
+                        <div className="text-sm text-amber-900">
+                            <p className="font-medium">
+                                {unconfiguredDoctors.length} doctor{unconfiguredDoctors.length > 1 ? 's have' : ' has'} no sharing configuration
+                            </p>
+                            <p className="mt-0.5 text-amber-800">
+                                {unconfiguredDoctors.map(d => d.doctor_name).join(', ')} — showing the patient and test listing only.
+                                Commission is not calculated until sharing is set up in{' '}
+                                <Link to="/doctor-sharing/settings" className="underline font-medium hover:text-amber-950">
+                                    Doctor Sharing Settings
+                                </Link>.
+                            </p>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Selected doctors with no billed orders in range */}
+            {activeTab === 'doctor' && !loading && doctorsWithNoOrders.length > 0 && (
+                <div className="rounded-xl border border-gray-200 bg-gray-50 px-4 py-3 text-sm text-gray-600">
+                    No {includeUnbilled ? '' : 'billed '}orders in this date range for: {doctorsWithNoOrders.join(', ')}
+                </div>
+            )}
+
             {/* Summary Cards */}
             {commissions.length > 0 && (
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -703,8 +885,13 @@ const DoctorCommissionReport: React.FC = () => {
                                 <IndianRupee className="h-6 w-6 text-blue-600" />
                             </div>
                             <div>
-                                <p className="text-sm text-gray-500">Total Revenue</p>
+                                <p className="text-sm text-gray-500">Billed Revenue</p>
                                 <p className="text-2xl font-bold text-gray-900">Rs. {totals.revenue.toLocaleString()}</p>
+                                {totals.unbilledRevenue > 0 && (
+                                    <p className="text-xs text-amber-600 mt-0.5">
+                                        + Rs. {totals.unbilledRevenue.toLocaleString()} unbilled
+                                    </p>
+                                )}
                             </div>
                         </div>
                     </div>
@@ -715,8 +902,13 @@ const DoctorCommissionReport: React.FC = () => {
                                 <TrendingUp className="h-6 w-6 text-emerald-600" />
                             </div>
                             <div>
-                                <p className="text-sm text-gray-500">Total Commission</p>
+                                <p className="text-sm text-gray-500">Payable Commission</p>
                                 <p className="text-2xl font-bold text-emerald-600">Rs. {totals.commission.toLocaleString()}</p>
+                                {totals.unbilledCommission > 0 && (
+                                    <p className="text-xs text-amber-600 mt-0.5">
+                                        Rs. {totals.unbilledCommission.toLocaleString()} pending billing
+                                    </p>
+                                )}
                             </div>
                         </div>
                     </div>
@@ -727,8 +919,13 @@ const DoctorCommissionReport: React.FC = () => {
                                 <FileText className="h-6 w-6 text-amber-600" />
                             </div>
                             <div>
-                                <p className="text-sm text-gray-500">Total Orders</p>
+                                <p className="text-sm text-gray-500">Billed Orders</p>
                                 <p className="text-2xl font-bold text-gray-900">{totals.orders}</p>
+                                {totals.unbilledOrders > 0 && (
+                                    <p className="text-xs text-amber-600 mt-0.5">
+                                        + {totals.unbilledOrders} unbilled
+                                    </p>
+                                )}
                             </div>
                         </div>
                     </div>
@@ -757,13 +954,36 @@ const DoctorCommissionReport: React.FC = () => {
                                             <ChevronRight className="h-5 w-5 text-gray-400" />
                                         )}
                                         <div className="text-left">
-                                            <p className="font-medium text-gray-900">{commission.doctor_name}</p>
-                                            <p className="text-sm text-gray-500">{commission.orders_count} orders</p>
+                                            <div className="flex items-center gap-2">
+                                                <p className="font-medium text-gray-900">{commission.doctor_name}</p>
+                                                {!commission.is_configured && (
+                                                    <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-700">
+                                                        Sharing not configured
+                                                    </span>
+                                                )}
+                                            </div>
+                                            <p className="text-sm text-gray-500">
+                                                {commission.orders_count} billed orders
+                                                {commission.unbilled_orders_count > 0 && (
+                                                    <span className="text-amber-600"> · {commission.unbilled_orders_count} unbilled</span>
+                                                )}
+                                                {!commission.is_configured && ' · referral listing only'}
+                                            </p>
                                         </div>
                                     </div>
                                     <div className="text-right">
                                         <p className="text-sm text-gray-500">Revenue: Rs. {commission.total_revenue.toLocaleString()}</p>
-                                        <p className="font-semibold text-emerald-600">Commission: Rs. {commission.total_commission.toLocaleString()}</p>
+                                        {commission.is_configured ? (
+                                            <p className="font-semibold text-emerald-600">Commission: Rs. {commission.total_commission.toLocaleString()}</p>
+                                        ) : (
+                                            <p className="text-sm font-medium text-amber-600">Commission: not configured</p>
+                                        )}
+                                        {commission.unbilled_orders_count > 0 && (
+                                            <p className="text-xs text-amber-600">
+                                                Unbilled: Rs. {commission.unbilled_revenue.toLocaleString()}
+                                                {commission.is_configured && ` (Rs. ${commission.unbilled_commission.toLocaleString()} pending)`}
+                                            </p>
+                                        )}
                                     </div>
                                 </button>
                                 
@@ -787,8 +1007,15 @@ const DoctorCommissionReport: React.FC = () => {
                                             <tbody className="divide-y divide-gray-100">
 	                                                {commission.details.map((detail, idx) => (
 	                                                    <React.Fragment key={idx}>
-	                                                    <tr>
-                                                        <td className="py-2 text-gray-900">{detail.order_id}</td>
+	                                                    <tr className={detail.is_billed ? '' : 'bg-amber-50'}>
+                                                        <td className="py-2 text-gray-900">
+                                                            {detail.order_id}
+                                                            {!detail.is_billed && (
+                                                                <span className="ml-2 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium uppercase text-amber-700">
+                                                                    {detail.billing_status || 'unbilled'}
+                                                                </span>
+                                                            )}
+                                                        </td>
                                                         <td className="py-2 text-gray-700">{detail.patient_name}</td>
                                                         <td className="py-2 text-gray-600">
                                                             {new Date(detail.date).toLocaleDateString()}
@@ -839,8 +1066,17 @@ const DoctorCommissionReport: React.FC = () => {
                                                         <td className="py-2 text-right text-gray-700">
                                                             Rs. {detail.sharing_base.toLocaleString()}
                                                         </td>
-                                                        <td className="py-2 text-right font-medium text-emerald-600">
-                                                            Rs. {detail.commission.toLocaleString()}
+                                                        <td className={`py-2 text-right font-medium ${detail.is_billed ? 'text-emerald-600' : 'text-amber-600'}`}>
+                                                            {!commission.is_configured ? (
+                                                                <span className="text-gray-400 font-normal">—</span>
+                                                            ) : (
+                                                                <>
+                                                                    Rs. {detail.commission.toLocaleString()}
+                                                                    {!detail.is_billed && (
+                                                                        <span className="block text-[10px] font-normal">pending billing</span>
+                                                                    )}
+                                                                </>
+                                                            )}
                                                         </td>
 	                                                    </tr>
 	                                                    {detail.line_items.length > 0 && (
@@ -863,9 +1099,9 @@ const DoctorCommissionReport: React.FC = () => {
 	                                                                                </span>
 	                                                                            </span>
 	                                                                            <span className="text-right">Rs. {item.amount.toLocaleString()}</span>
-	                                                                            <span className="text-right">{item.sharing_percent}%</span>
+	                                                                            <span className="text-right">{commission.is_configured ? `${item.sharing_percent}%` : <span className="text-gray-400">—</span>}</span>
 	                                                                            <span className="text-right">Rs. {item.sharing_base.toLocaleString()}</span>
-	                                                                            <span className="text-right font-medium text-emerald-600">Rs. {item.commission.toLocaleString()}</span>
+	                                                                            <span className="text-right font-medium text-emerald-600">{commission.is_configured ? `Rs. ${item.commission.toLocaleString()}` : <span className="text-gray-400 font-normal">—</span>}</span>
 	                                                                        </div>
 	                                                                    ))}
 	                                                                </div>
@@ -885,7 +1121,7 @@ const DoctorCommissionReport: React.FC = () => {
             )}
 
             {/* Empty State */}
-            {activeTab === 'doctor' && !loading && commissions.length === 0 && (
+            {activeTab === 'doctor' && !loading && commissions.length === 0 && doctorsWithNoOrders.length === 0 && (
                 <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-12 text-center">
                     <Calculator className="h-12 w-12 text-gray-300 mx-auto mb-4" />
                     <h3 className="text-lg font-medium text-gray-900">No Commission Data</h3>

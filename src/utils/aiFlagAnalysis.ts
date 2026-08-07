@@ -20,6 +20,15 @@ import { findResolvedReferenceRange, isPlaceholderReferenceRange, resolveReferen
 // Netlify function URL for AI interpretation (keeps API key secure)
 const AI_FLAG_FUNCTION_URL = '/.netlify/functions/ai-flag-interpretation';
 
+// A blank reference range is a deliberate lab choice ("this analyte prints no
+// range"), so AI must never fill it in. Only a non-blank dynamic placeholder
+// such as "Age-specific" asks to be resolved; otherwise the test group's
+// "Enable AI Reference Range Determination" toggle is the only trigger.
+const isDynamicPlaceholderRange = (range?: string | null): boolean => {
+  const trimmed = String(range || '').trim();
+  return trimmed !== '' && isPlaceholderReferenceRange(trimmed);
+};
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -816,9 +825,12 @@ export async function runAIFlagAnalysis(
             }
 
             for (const [tgId, groupRvs] of Object.entries(rvsByGroup)) {
-               // Check if any result in this group uses "Age-specific" or generic text
-               const needsResolution = aiRangeEnabledGroupIds.has(tgId) || groupRvs.some(rv =>
-                 isPlaceholderReferenceRange(rv.reference_range)
+               // Resolve only when the test group has AI reference ranges enabled,
+               // or when a saved range is a dynamic placeholder ("Age-specific").
+               // A blank range is left blank — see isDynamicPlaceholderRange.
+               const aiEnabledForGroup = aiRangeEnabledGroupIds.has(tgId);
+               const needsResolution = aiEnabledForGroup || groupRvs.some(rv =>
+                 isDynamicPlaceholderRange(rv.reference_range)
                );
 
                if (needsResolution) {
@@ -841,6 +853,9 @@ export async function runAIFlagAnalysis(
                    resolved.forEach(res => {
                     if (res.used_reference_range) {
                       const match = groupRvs.find(rv => findResolvedReferenceRange([res], rv));
+                      // With the group toggle off, only the analytes carrying a
+                      // dynamic placeholder may be filled — never the blank ones.
+                      if (match && !aiEnabledForGroup && !isDynamicPlaceholderRange(match.reference_range)) return;
                       if (match && match.reference_range !== res.used_reference_range) {
                         console.log(`[AI Flag] ✅ Resolved Range for ${match.parameter}: "${match.reference_range}" -> "${res.used_reference_range}"`);
                         match.reference_range = res.used_reference_range;

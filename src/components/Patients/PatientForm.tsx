@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { X, User, Phone, Mail, MapPin, Calendar, Upload, FileText, Brain, Zap, Plus, Minus, TestTube, CheckCircle, AlertTriangle, RotateCcw, UserCheck, Heart, Droplets, ClipboardList } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
 import { supabase, uploadFile, generateFilePath, database, LabPatientFieldConfig, DEFAULT_PATIENT_FORM_SETTINGS, type LabPatientFormSettings } from '../../utils/supabase';
+import { notificationTriggerService, formatName } from '../../utils/notificationTriggerService';
 import { useAuth } from '../../contexts/AuthContext';
 
 interface Patient {
@@ -119,6 +120,10 @@ const PatientForm: React.FC<PatientFormProps> = ({
   // Patient form settings
   const [formSettings, setFormSettings] = useState<LabPatientFormSettings>(DEFAULT_PATIENT_FORM_SETTINGS);
 
+  // Lab-wide name case format (Settings → Notifications → Name Display Format)
+  const [nameCaseFormat, setNameCaseFormat] = useState<'proper' | 'upper'>('proper');
+  const nameInputStyle = nameCaseFormat === 'upper' ? { textTransform: 'uppercase' as const } : undefined;
+
   // Active section for navigation
   const [activeSection, setActiveSection] = useState<'personal' | 'contact' | 'medical' | 'tests'>('personal');
 
@@ -225,6 +230,15 @@ const PatientForm: React.FC<PatientFormProps> = ({
     }).catch(() => {});
   }, []);
 
+  // Load lab name case format (drives live uppercase in the name inputs + save formatting)
+  React.useEffect(() => {
+    database.getCurrentUserLabId().then(async labId => {
+      if (!labId) return;
+      const s = await notificationTriggerService.getSettings(labId);
+      if (s?.name_case_format) setNameCaseFormat(s.name_case_format);
+    }).catch(() => {});
+  }, []);
+
   React.useEffect(() => {
     const loadCustomFieldConfigs = async () => {
       const { data } = await database.labPatientFieldConfigs.getAll();
@@ -303,6 +317,8 @@ const PatientForm: React.FC<PatientFormProps> = ({
     e.preventDefault();
     onSubmit({
       ...formData,
+      firstName: formatName(formData.firstName, nameCaseFormat),
+      lastName: formatName(formData.lastName, nameCaseFormat),
       requestedTests,
       ocrResults,
       attachmentId,
@@ -596,6 +612,7 @@ const PatientForm: React.FC<PatientFormProps> = ({
                         required
                         value={formData.firstName}
                         onChange={handleChange}
+                        style={nameInputStyle}
                         className="w-full px-4 py-3 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all bg-gray-50 hover:bg-white"
                         placeholder="Enter first name"
                       />
@@ -608,6 +625,7 @@ const PatientForm: React.FC<PatientFormProps> = ({
                         required
                         value={formData.lastName}
                         onChange={handleChange}
+                        style={nameInputStyle}
                         className="w-full px-4 py-3 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all bg-gray-50 hover:bg-white"
                         placeholder="Enter last name"
                       />

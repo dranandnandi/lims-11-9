@@ -34,6 +34,8 @@ export interface TemplateData {
   DueAmount?: string | number;
   PaidAmount?: string | number;
   InvoiceNumber?: string;
+  PaymentLink?: string;
+  ExpiryTime?: string;
 
   // Loyalty info
   LoyaltyPointsEarned?: string | number;
@@ -265,6 +267,11 @@ export const DEFAULT_TEMPLATES = {
     message: 'Hello [PatientName], this is a reminder that payment of ₹[DueAmount] is pending for Order #[OrderNumber]. Please visit [LabName] to complete payment.',
     requires_attachment: false,
   },
+  payment_link: {
+    name: 'Payment Link',
+    message: 'Hello [PatientName],\n\nPlease complete your payment of ₹[Amount] for Invoice [InvoiceNumber].\n\nTap to pay securely (Card / UPI / Net Banking):\n[PaymentLink]\n\nThis link is valid until [ExpiryTime].\n\nThank you,\n[LabName]',
+    requires_attachment: false,
+  },
   invoice_generated: {
     name: 'Invoice Generated',
     message: 'Hello [PatientName],\n\nYour invoice for Order #[OrderNumber] has been generated.\nTotal Amount: ₹[Amount]\n\nPlease find the invoice attached.\n\nThank you,\n[LabName]',
@@ -304,6 +311,7 @@ export const TEMPLATE_CATEGORIES = [
   { key: 'registration_confirmation', label: 'Registration Confirmation', description: 'Sent to patient when order is registered' },
   { key: 'doctor_registration_confirmation', label: 'Registration Confirmation (Doctor)', description: 'Sent to referring doctor when order is registered' },
   { key: 'payment_reminder', label: 'Payment Reminder', description: 'Sent for pending payments' },
+  { key: 'payment_link', label: 'Payment Link', description: 'Sent with a secure online payment link (Card / UPI / Net Banking)' },
   { key: 'appointment_reminder', label: 'Appointment Reminder', description: 'Sent before scheduled appointments' },
   { key: 'test_results', label: 'Test Results Available', description: 'Notification that results are ready for pickup' },
   { key: 'doctor_notification', label: 'Doctor Status Update', description: 'General order status updates for doctors' },

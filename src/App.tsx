@@ -78,6 +78,9 @@ import B2BPaymentSuccess from './pages/B2BPaymentSuccess';
 import B2BPaymentFailed from './pages/B2BPaymentFailed';
 import ProtectedB2BRoute from './components/Auth/ProtectedB2BRoute';
 
+// ⬇️ Public patient payment link (/pay/:token) - no session required
+import PayLink from './pages/PayLink';
+
 // ⬇️ Patient Portal
 import PatientLogin from './pages/PatientLogin';
 import PatientPortal from './pages/PatientPortal';
@@ -155,6 +158,10 @@ const AppRoutes: React.FC = () => {
           }
         />
         <Route path="/verify" element={<VerificationPage />} />
+        {/* Public pay link - must be reachable without a patient session */}
+        <Route path="/pay/:token" element={<PayLink />} />
+        <Route path="/pay/:token/success" element={<PayLink />} />
+        <Route path="/pay/:token/failed" element={<PayLink />} />
         <Route path="*" element={<Navigate to="/patient/login" replace />} />
       </Routes>
     );
@@ -214,6 +221,11 @@ const AppRoutes: React.FC = () => {
         path="/verify"
         element={<VerificationPage />}
       />
+
+      {/* Public patient payment link - the QR / WhatsApp target, no session required */}
+      <Route path="/pay/:token" element={<PayLink />} />
+      <Route path="/pay/:token/success" element={<PayLink />} />
+      <Route path="/pay/:token/failed" element={<PayLink />} />
 
       {/* B2B Portal routes */}
       <Route

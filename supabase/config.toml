@@ -419,6 +419,18 @@ enabled = true
 verify_jwt = true
 entrypoint = "./functions/initiate-payment/index.ts"
 
+# Issue a tokenised patient payment link (QR / WhatsApp) - authorises the caller itself
+[functions.create-payment-link]
+enabled = true
+verify_jwt = true
+entrypoint = "./functions/create-payment-link/index.ts"
+
+# Public pay page backend (/pay/:token) - no JWT, the link token is the bearer
+[functions.pay-link]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/pay-link/index.ts"
+
 # Create auth user - admin creates users for their lab
 [functions.create-auth-user]
 enabled = true

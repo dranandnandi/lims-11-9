@@ -89,6 +89,7 @@ interface CollectionRow {
   orderDate: string;
   orderNumber: number | null;
   patientName: string;
+  patientPhone: string;
   referredBy: string;
   total: number;
   totalRec: number;
@@ -122,6 +123,7 @@ function CollectionReport() {
   const [phlebGroups, setPhlebGroups] = useState<CollectionGroup[]>([]);
   const [phlebGrandTotal, setPhlebGrandTotal] = useState({ total: 0, totalRec: 0, currRec: 0, due: 0, discount: 0 });
   const [selectedPhlebo, setSelectedPhlebo] = useState<string>('all');
+  const [showPhone, setShowPhone] = useState(false);
 
   const loadReport = useCallback(async () => {
     setLoading(true);
@@ -131,6 +133,12 @@ function CollectionReport() {
       if (err || !data) throw err || new Error('No data returned');
 
       const { orders, invoices, payments, users } = data as any;
+
+      // patients is embedded as an object (or array, depending on the join shape)
+      const phoneOf = (order: any) => {
+        const p = Array.isArray(order.patients) ? order.patients[0] : order.patients;
+        return p?.phone || '—';
+      };
 
       // Build invoice map (order_id -> ALL invoices) to support multi-invoice orders
       const invoicesByOrder = new Map<string, any[]>();
@@ -193,6 +201,7 @@ function CollectionReport() {
           orderDate: order.order_date,
           orderNumber: order.order_number,
           patientName: order.patient_name || '—',
+          patientPhone: phoneOf(order),
           referredBy: order.doctor || '—',
           total,
           totalRec,
@@ -273,7 +282,7 @@ function CollectionReport() {
           phlebMap.set(phlebId, { userId: phlebId, userName: pname, rows: [], subtotalTotal: 0, subtotalTotalRec: 0, subtotalCurrRec: 0, subtotalDue: 0, subtotalDiscount: 0 });
         }
         const grp = phlebMap.get(phlebId)!;
-        grp.rows.push({ orderId: order.id, orderDate: order.order_date, orderNumber: order.order_number, patientName: order.patient_name || '—', referredBy: order.doctor || '—', total, totalRec, currRec, due, discount, mode: modes });
+        grp.rows.push({ orderId: order.id, orderDate: order.order_date, orderNumber: order.order_number, patientName: order.patient_name || '—', patientPhone: phoneOf(order), referredBy: order.doctor || '—', total, totalRec, currRec, due, discount, mode: modes });
         grp.subtotalTotal += total;
         grp.subtotalTotalRec += totalRec;
         grp.subtotalCurrRec += currRec;
@@ -402,6 +411,11 @@ function CollectionReport() {
           <Printer className="h-4 w-4 mr-2" />
           Print
         </button>
+        <label className="flex items-center gap-2 px-3 py-2 text-sm text-gray-700 cursor-pointer select-none">
+          <input type="checkbox" checked={showPhone} onChange={e => setShowPhone(e.target.checked)}
+            className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500" />
+          Show Patient Phone
+        </label>
       </div>
       </div>{/* end controls space-y-3 */}
 
@@ -429,6 +443,8 @@ function CollectionReport() {
         const label = viewMode === 'user' ? 'User' : 'Phlebotomist';
         const headerColor = viewMode === 'user' ? 'bg-blue-50 text-blue-800' : 'bg-orange-50 text-orange-800';
         const subtotalLabel = viewMode === 'user' ? 'User' : 'Phlebotomist';
+        const colCount = showPhone ? 11 : 10;
+        const labelSpan = showPhone ? 5 : 4;
 
         if (!loading && activeGroups.length === 0 && groups.length > 0) {
           return <div className="no-print text-center py-12 text-gray-500">No data found for the selected {label.toLowerCase()}.</div>;
@@ -452,6 +468,7 @@ function CollectionReport() {
                     <th className="px-3 py-2 text-left font-semibold border border-gray-300 whitespace-nowrap">Sample Date</th>
                     <th className="px-3 py-2 text-left font-semibold border border-gray-300 whitespace-nowrap">Lab ID</th>
                     <th className="px-3 py-2 text-left font-semibold border border-gray-300">Patient Name</th>
+                    {showPhone && <th className="px-3 py-2 text-left font-semibold border border-gray-300 whitespace-nowrap">Phone</th>}
                     <th className="px-3 py-2 text-left font-semibold border border-gray-300">Ref By</th>
                     <th className="px-3 py-2 text-right font-semibold border border-gray-300 whitespace-nowrap">Total</th>
                     <th className="px-3 py-2 text-right font-semibold border border-gray-300 whitespace-nowrap">Total Rec.</th>
@@ -465,7 +482,7 @@ function CollectionReport() {
                   {activeGroups.map(grp => (
                     <React.Fragment key={grp.userId}>
                       <tr className={headerColor}>
-                        <td colSpan={10} className={`px-3 py-1.5 font-semibold border border-gray-300 text-sm`}>
+                        <td colSpan={colCount} className={`px-3 py-1.5 font-semibold border border-gray-300 text-sm`}>
                           {label}: {grp.userName}
                         </td>
                       </tr>
@@ -474,6 +491,7 @@ function CollectionReport() {
                           <td className="px-3 py-1.5 border border-gray-200 whitespace-nowrap">{fmtDate(row.orderDate)}</td>
                           <td className="px-3 py-1.5 border border-gray-200 whitespace-nowrap font-mono text-xs">{row.orderNumber || row.orderId.slice(-8).toUpperCase()}</td>
                           <td className="px-3 py-1.5 border border-gray-200">{row.patientName}</td>
+                          {showPhone && <td className="px-3 py-1.5 border border-gray-200 whitespace-nowrap">{row.patientPhone}</td>}
                           <td className="px-3 py-1.5 border border-gray-200">{row.referredBy}</td>
                           <td className="px-3 py-1.5 border border-gray-200 text-right">{row.total.toLocaleString('en-IN')}</td>
                           <td className="px-3 py-1.5 border border-gray-200 text-right">{row.totalRec.toLocaleString('en-IN')}</td>
@@ -484,7 +502,7 @@ function CollectionReport() {
                         </tr>
                       ))}
                       <tr className="bg-gray-100 font-semibold text-gray-800">
-                        <td colSpan={4} className="px-3 py-1.5 border border-gray-300 text-right text-xs">{subtotalLabel} [ {grp.userName} ] Total :</td>
+                        <td colSpan={labelSpan} className="px-3 py-1.5 border border-gray-300 text-right text-xs">{subtotalLabel} [ {grp.userName} ] Total :</td>
                         <td className="px-3 py-1.5 border border-gray-300 text-right">{grp.subtotalTotal.toLocaleString('en-IN')}</td>
                         <td className="px-3 py-1.5 border border-gray-300 text-right">{grp.subtotalTotalRec.toLocaleString('en-IN')}</td>
                         <td className="px-3 py-1.5 border border-gray-300 text-right">{grp.subtotalCurrRec.toLocaleString('en-IN')}</td>
@@ -495,7 +513,7 @@ function CollectionReport() {
                     </React.Fragment>
                   ))}
                   <tr className="bg-gray-200 font-bold text-gray-900">
-                    <td colSpan={4} className="px-3 py-2 border border-gray-300 text-right">Grand Total :</td>
+                    <td colSpan={labelSpan} className="px-3 py-2 border border-gray-300 text-right">Grand Total :</td>
                     <td className="px-3 py-2 border border-gray-300 text-right">{activeGrand.total.toLocaleString('en-IN')}</td>
                     <td className="px-3 py-2 border border-gray-300 text-right">{activeGrand.totalRec.toLocaleString('en-IN')}</td>
                     <td className="px-3 py-2 border border-gray-300 text-right">{activeGrand.currRec.toLocaleString('en-IN')}</td>

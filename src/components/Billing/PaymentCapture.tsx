@@ -1,11 +1,12 @@
 import React, { useState, useEffect } from 'react';
 import { X, Check, FileText } from 'lucide-react';
 import { database } from '../../utils/supabase';
+import OnlinePaymentQR from './OnlinePaymentQR';
 
 interface Payment {
   id: string;
   amount: number;
-  payment_method: 'cash' | 'card' | 'upi' | 'bank' | 'credit_adjustment';
+  payment_method: 'cash' | 'card' | 'upi' | 'bank' | 'online' | 'credit_adjustment';
   payment_reference?: string | null;
   payment_date: string;
   location_id?: string | null;
@@ -34,10 +35,11 @@ const PaymentCapture: React.FC<PaymentCaptureProps> = ({ invoiceId, orderId, onC
 
   // Payment form state
   const [amount, setAmount] = useState('');
-  const [paymentMethod, setPaymentMethod] = useState<'cash' | 'card' | 'upi' | 'bank'>('cash');
+  const [paymentMethod, setPaymentMethod] = useState<'cash' | 'card' | 'upi' | 'bank' | 'online'>('cash');
   const [paymentReference, setPaymentReference] = useState('');
   const [paymentDate, setPaymentDate] = useState(new Date().toISOString().split('T')[0]);
   const [notes, setNotes] = useState('');
+  const [onlineAmount, setOnlineAmount] = useState(0);
 
   useEffect(() => {
     loadInvoiceAndPayments();
@@ -120,7 +122,18 @@ const PaymentCapture: React.FC<PaymentCaptureProps> = ({ invoiceId, orderId, onC
     return (inv.total_after_discount || inv.total || 0) - invPaid;
   };
 
-  const methodChoices: Payment['payment_method'][] = ['cash', 'card', 'upi', 'bank'];
+  // 'online' hands off to the gateway (QR / pay link) instead of recording a
+  // reference by hand — the webhook writes the payments row on confirmation.
+  const methodChoices: Payment['payment_method'][] = ['cash', 'card', 'upi', 'bank', 'online'];
+
+  const isOnline = paymentMethod === 'online';
+
+  // Snapshot the amount when Online is picked. Reading `amount` live would mint a
+  // fresh payment link on every keystroke.
+  const resolveOnlineAmount = () => {
+    const parsed = parseFloat(amount);
+    return !Number.isNaN(parsed) && parsed > 0 ? parsed : getInvoiceBalance(selectedInvoiceId);
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -130,7 +143,7 @@ const PaymentCapture: React.FC<PaymentCaptureProps> = ({ invoiceId, orderId, onC
       alert('Please enter a valid amount');
       return;
     }
-    
+
     const selectedBalance = getInvoiceBalance(selectedInvoiceId);
     if (amt > selectedBalance + 0.01) {
       alert(`Payment amount cannot exceed invoice balance of ₹${selectedBalance.toFixed(2)}`);
@@ -320,12 +333,18 @@ const PaymentCapture: React.FC<PaymentCaptureProps> = ({ invoiceId, orderId, onC
                     min="0.01"
                     max={getInvoiceBalance(selectedInvoiceId)}
                     step="0.01"
-                    value={amount}
+                    value={isOnline ? onlineAmount.toFixed(2) : amount}
+                    disabled={isOnline}
                     onChange={(e) => setAmount(e.target.value)}
-                    className="w-full pl-8 pr-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    className="w-full pl-8 pr-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
                     placeholder="0.00"
                   />
                 </div>
+                {isOnline && (
+                  <p className="text-xs text-gray-500 mt-1">
+                    Locked to the amount on the payment link. Switch method to change it.
+                  </p>
+                )}
               </div>
 
               <div>
@@ -335,20 +354,24 @@ const PaymentCapture: React.FC<PaymentCaptureProps> = ({ invoiceId, orderId, onC
                   required
                   value={paymentDate}
                   max={new Date().toISOString().split('T')[0]}
+                  disabled={isOnline}
                   onChange={(e) => setPaymentDate(e.target.value)}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
                 />
               </div>
             </div>
 
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-2">Payment Method *</label>
-              <div className="grid grid-cols-4 gap-2">
+              <div className="grid grid-cols-3 sm:grid-cols-5 gap-2">
                 {methodChoices.map((m) => (
                   <button
                     key={m}
                     type="button"
-                    onClick={() => setPaymentMethod(m as any)}
+                    onClick={() => {
+                      if (m === 'online') setOnlineAmount(resolveOnlineAmount());
+                      setPaymentMethod(m as any);
+                    }}
                     className={`px-3 py-2 rounded-md text-sm font-medium border ${paymentMethod === m ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
                       }`}
                   >
@@ -358,46 +381,66 @@ const PaymentCapture: React.FC<PaymentCaptureProps> = ({ invoiceId, orderId, onC
               </div>
             </div>
 
-            {paymentMethod !== 'cash' && (
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Reference Number *</label>
-                <input
-                  type="text"
-                  required
-                  value={paymentReference}
-                  onChange={(e) => setPaymentReference(e.target.value)}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  placeholder={
-                    paymentMethod === 'card' ? 'Transaction ID' : paymentMethod === 'upi' ? 'UPI Reference' : 'Bank Reference'
-                  }
-                />
-              </div>
-            )}
-
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Notes (Optional)</label>
-              <textarea
-                value={notes}
-                onChange={(e) => setNotes(e.target.value)}
-                rows={3}
-                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                placeholder="Add any notes about this payment..."
+            {isOnline ? (
+              /* Gateway collection: the QR / pay link replaces manual entry, and
+                 the payments row is written server-side on confirmation. */
+              <OnlinePaymentQR
+                labId={primaryInvoice?.lab_id}
+                invoiceId={selectedInvoiceId}
+                patientId={primaryInvoice?.patient_id}
+                amount={onlineAmount}
+                payerName={primaryInvoice?.patient_name}
+                invoiceNumber={
+                  invoices.find((i) => i.id === selectedInvoiceId)?.invoice_number ||
+                  primaryInvoice?.invoice_number
+                }
+                onPaid={() => onSuccess()}
+                onCancel={() => setPaymentMethod('cash')}
               />
-            </div>
+            ) : (
+              <>
+                {paymentMethod !== 'cash' && (
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Reference Number *</label>
+                    <input
+                      type="text"
+                      required
+                      value={paymentReference}
+                      onChange={(e) => setPaymentReference(e.target.value)}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      placeholder={
+                        paymentMethod === 'card' ? 'Transaction ID' : paymentMethod === 'upi' ? 'UPI Reference' : 'Bank Reference'
+                      }
+                    />
+                  </div>
+                )}
 
-            <div className="flex justify-end gap-3 pt-4 border-t">
-              <button type="button" onClick={onClose} className="px-4 py-2 text-gray-700 bg-gray-100 rounded-md hover:bg-gray-200" disabled={processing}>
-                Cancel
-              </button>
-              <button
-                type="submit"
-                className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 flex items-center gap-2"
-                disabled={processing}
-              >
-                {processing ? <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white" /> : <Check className="w-4 h-4" />}
-                {processing ? 'Processing...' : 'Record Payment'}
-              </button>
-            </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Notes (Optional)</label>
+                  <textarea
+                    value={notes}
+                    onChange={(e) => setNotes(e.target.value)}
+                    rows={3}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    placeholder="Add any notes about this payment..."
+                  />
+                </div>
+
+                <div className="flex justify-end gap-3 pt-4 border-t">
+                  <button type="button" onClick={onClose} className="px-4 py-2 text-gray-700 bg-gray-100 rounded-md hover:bg-gray-200" disabled={processing}>
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 flex items-center gap-2"
+                    disabled={processing}
+                  >
+                    {processing ? <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white" /> : <Check className="w-4 h-4" />}
+                    {processing ? 'Processing...' : 'Record Payment'}
+                  </button>
+                </div>
+              </>
+            )}
           </form>
         )}
 

@@ -1,9 +1,12 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, Search, Edit, Trash2, X, DollarSign, Lock, Unlock as LockOpen, Package, Eye, EyeOff } from 'lucide-react';
+import { Plus, Search, Edit, Trash2, X, DollarSign, Lock, Unlock as LockOpen, Package, Eye, EyeOff, MessageSquare, Wallet } from 'lucide-react';
 import { database, supabase } from '../../utils/supabase';
 import { getUserRoleCode } from '../../utils/permissions';
 import { createB2BAccountUser } from '../../utils/b2bAuth';
 import HeaderFooterUpload from '../Settings/HeaderFooterUpload';
+import AccountCreditModal from './AccountCreditModal';
+import PartnerDeskModal from '../B2B/PartnerDeskModal';
+import { fetchLabUnreadCounts, fetchOpenMaterialRequestCounts } from '../../utils/partnerCommsService';
 
 // Reuse Doctor types or create Account specific types?
 // Let's define specific types here for simplicity and later move to types.ts
@@ -140,6 +143,14 @@ const AccountMaster: React.FC = () => {
     // Price Masters (for dropdown in form)
     const [availablePriceMasters, setAvailablePriceMasters] = useState<PriceMaster[]>([]);
 
+    // Credit & payments (record cash received against the account's credit)
+    const [creditModalAccount, setCreditModalAccount] = useState<Account | null>(null);
+
+    // Partner desk (two-way chat + material requests)
+    const [partnerDesk, setPartnerDesk] = useState<{ account: Account; tab: 'chat' | 'materials' } | null>(null);
+    const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
+    const [openRequestCounts, setOpenRequestCounts] = useState<Record<string, number>>({});
+
     // Package Pricing State
     const [priceTab, setPriceTab] = useState<'tests' | 'packages'>('tests');
     const [packages, setPackages] = useState<{ id: string; name: string; code: string; price: number }[]>([]);
@@ -163,6 +174,7 @@ const AccountMaster: React.FC = () => {
             if (id) {
                 setLabId(id);
                 loadAccounts(id);
+                loadPartnerCounts(id);
                 // Load price masters for the form dropdown
                 supabase
                     .from('price_masters')
@@ -199,6 +211,19 @@ const AccountMaster: React.FC = () => {
         } finally {
             setLoading(false);
         }
+    };
+
+    // Unread chat messages / open material requests per account, for the row badges
+    const loadPartnerCounts = async (currentLabId?: string) => {
+        const activeLabId = currentLabId || labId;
+        if (!activeLabId) return;
+
+        const [unread, openRequests] = await Promise.all([
+            fetchLabUnreadCounts(activeLabId),
+            fetchOpenMaterialRequestCounts(activeLabId),
+        ]);
+        setUnreadCounts(unread);
+        setOpenRequestCounts(openRequests);
     };
 
     const handleSearch = async () => {
@@ -709,6 +734,37 @@ const AccountMaster: React.FC = () => {
                                             {isAccountEffectivelyLocked(account) ? <Lock className="w-4 h-4" /> : <LockOpen className="w-4 h-4" />}
                                         </button>
                                     )}
+                                    <button
+                                        onClick={() => setPartnerDesk({ account, tab: 'chat' })}
+                                        className="relative text-blue-600 hover:text-blue-900 p-1"
+                                        title="Chat with this partner"
+                                    >
+                                        <MessageSquare className="w-4 h-4" />
+                                        {unreadCounts[account.id] > 0 && (
+                                            <span className="absolute -top-1 -right-1 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-semibold text-white">
+                                                {unreadCounts[account.id]}
+                                            </span>
+                                        )}
+                                    </button>
+                                    <button
+                                        onClick={() => setPartnerDesk({ account, tab: 'materials' })}
+                                        className="relative text-emerald-600 hover:text-emerald-900 p-1"
+                                        title="Material requests"
+                                    >
+                                        <Package className="w-4 h-4" />
+                                        {openRequestCounts[account.id] > 0 && (
+                                            <span className="absolute -top-1 -right-1 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-amber-500 px-1 text-[10px] font-semibold text-white">
+                                                {openRequestCounts[account.id]}
+                                            </span>
+                                        )}
+                                    </button>
+                                    <button
+                                        onClick={() => setCreditModalAccount(account)}
+                                        className="text-emerald-700 hover:text-emerald-900 p-1"
+                                        title="Credit & payments — record cash received"
+                                    >
+                                        <Wallet className="w-4 h-4" />
+                                    </button>
                                     <button onClick={() => handleManagePrices(account)} className="text-purple-600 hover:text-purple-900 p-1" title="Manage Prices">
                                         <DollarSign className="w-4 h-4" />
                                     </button>
@@ -1208,6 +1264,30 @@ const AccountMaster: React.FC = () => {
                         </div>
                     </div>
                 </div>
+            )}
+
+            {/* Credit position + record cash/cheque received from this account */}
+            {creditModalAccount && (
+                <AccountCreditModal
+                    account={{ id: creditModalAccount.id, name: creditModalAccount.name }}
+                    onClose={() => setCreditModalAccount(null)}
+                    onCreditChanged={() => loadAccounts()}
+                />
+            )}
+
+            {/* Partner desk: two-way chat + material requests for one account */}
+            {partnerDesk && (labId || partnerDesk.account.lab_id) && (
+                <PartnerDeskModal
+                    accountId={partnerDesk.account.id}
+                    accountName={partnerDesk.account.name}
+                    labId={(labId || partnerDesk.account.lab_id) as string}
+                    initialTab={partnerDesk.tab}
+                    openRequestCount={openRequestCounts[partnerDesk.account.id] || 0}
+                    onClose={() => {
+                        setPartnerDesk(null);
+                        loadPartnerCounts();
+                    }}
+                />
             )}
         </div >
     );

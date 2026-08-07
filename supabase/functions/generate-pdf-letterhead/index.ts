@@ -2813,6 +2813,11 @@ function renderSectionContentForTemplate(
 const DEFAULT_BASIC_REPORT_DISCLAIMER =
   "This report is electronically generated and authenticated. Results relate only to the specimen received and should be correlated clinically. This report is not valid for medico-legal purposes.";
 
+// A basic-template group whose values are all shorter than this keeps them right-aligned
+// in the VALUE column. Only groups with sentence-length findings get the wide,
+// left-aligned value cell that spans VALUE + UNITS + Bio. Ref. Interval.
+const LONG_QUALITATIVE_VALUE_CHARS = 24;
+
 function generateBasicDefaultTemplateHtml(
   _context: unknown,
   testGroupNames: Map<string, string>,
@@ -2843,11 +2848,22 @@ function generateBasicDefaultTemplateHtml(
   const calcMarker = (printOptions?.calcMarker as string) ?? "cal";
   const boldAllValues = (printOptions?.boldAllValues as boolean) ?? false;
   const boldAbnormal = (printOptions?.boldAbnormalValues as boolean) ?? true;
+  // Bolds the patient information block values (labels stay bold either way).
+  // Applied in the shared template CSS so e-copy and print stay in step.
+  const patientInfoBold = (printOptions?.patientInfoBold as boolean) ?? false;
+  // Vertical rule between the two patient-info column pairs (off by default).
+  const patientInfoColumnDivider = (printOptions?.patientInfoColumnDivider as boolean) ?? false;
+  const underlineAbnormal = (printOptions?.underlineAbnormalValues as boolean) ?? false;
+  const abnormalDecoration = underlineAbnormal
+    ? "text-decoration: underline !important; text-underline-offset: 2px !important;"
+    : "";
   const sectionHeaderInline = (printOptions?.sectionHeaderInline as boolean) ?? true;
   const resultTableBackground = printOptions?.resultTableBackground === "transparent" ? "transparent" : "#fff";
   const sectionRowBackground = printOptions?.resultTableBackground === "transparent" ? "transparent" : "#f5f5f5";
   const flagSymbol = (printOptions?.flagSymbol as string) ?? "none";
   const showFlagLegend = (printOptions?.showFlagLegend as boolean) ?? false;
+  // Exact gap in px between the H/L symbol and the value (0-12, default 4)
+  const flagGapPx = Math.max(0, Math.min(12, Number(printOptions?.flagGapPx ?? 4)));
   const testGroupTitlePosition = (printOptions?.testGroupTitlePosition as string) ?? "above_headers_center";
   const requestedQrPosition = String(printOptions?.qrPosition || "");
   const qrPosition = requestedQrPosition === "top_left" || requestedQrPosition === "top_right"
@@ -3074,11 +3090,24 @@ function generateBasicDefaultTemplateHtml(
   color: #111 !important;
   word-break: break-word !important;
   font-size: ${basePx}px !important;
+  font-weight: ${patientInfoBold ? "700" : "normal"} !important;
 }
 
 .basic-report-template .patient-header-table th {
   font-size: ${basePx}px !important;
 }
+${patientInfoColumnDivider ? `
+/* Vertical rule between the left and right patient info columns.
+   Cell 2 of every row is the last cell of the left column pair. */
+.basic-report-template .patient-header-table tr > *:nth-child(2) {
+  border-right: 1px solid #000 !important;
+  padding-right: 8px !important;
+}
+
+.basic-report-template .patient-header-table tr > *:nth-child(3) {
+  padding-left: 8px !important;
+}
+` : ""}
 
 .basic-report-template .patient-test-separator {
   border-top: 1.5px solid #000 !important;
@@ -3199,9 +3228,27 @@ function generateBasicDefaultTemplateHtml(
   white-space: nowrap !important;
 }
 
-.basic-report-template .tbl-results .qualitative-wide-value {
+/* Must out-specify the "td:nth-child(2)" column rules above, otherwise the
+   colspan'd qualitative value inherits their right-align/nowrap and the text
+   drifts to the far edge of the merged cell. */
+.basic-report-template .tbl-results tbody tr td.qualitative-wide-value,
+.basic-report-template .tbl-results.has-sibling tbody tr.wide-section-row td.qualitative-wide-value,
+.basic-report-template .tbl-results.has-sibling tbody tr.sibling-section-row td.qualitative-wide-value {
   width: ${formatBasicWidth(standardColumnWidths.slice(1).reduce((sum, width) => sum + width, 0))} !important;
   text-align: left !important;
+  white-space: normal !important;
+  overflow: visible !important;
+  overflow-wrap: anywhere !important;
+  word-break: break-word !important;
+}
+
+/* Qualitative value inside a group that also has numeric rows: stays in the VALUE
+   column (so the column does not stagger) but is allowed to wrap, since the nowrap
+   from ".val" / "td:nth-child(2)" would otherwise clip long text like "Non Reactive". */
+.basic-report-template .tbl-results tbody tr td.qualitative-inline-value,
+.basic-report-template .tbl-results.has-sibling tbody tr.wide-section-row td.qualitative-inline-value,
+.basic-report-template .tbl-results.has-sibling tbody tr.sibling-section-row td.qualitative-inline-value {
+  text-align: right !important;
   white-space: normal !important;
   overflow: visible !important;
   overflow-wrap: anywhere !important;
@@ -3215,6 +3262,7 @@ function generateBasicDefaultTemplateHtml(
 .basic-report-template .val.High {
   color: ${highColor} !important;
   ${boldAbnormal ? "font-weight: 700 !important;" : ""}
+  ${abnormalDecoration}
 }
 
 .basic-report-template .val.low,
@@ -3225,6 +3273,7 @@ function generateBasicDefaultTemplateHtml(
 .basic-report-template .val.Low {
   color: ${lowColor} !important;
   ${boldAbnormal ? "font-weight: 700 !important;" : ""}
+  ${abnormalDecoration}
 }
 
 .basic-report-template .main-group-row td {
@@ -3539,7 +3588,20 @@ function generateBasicDefaultTemplateHtml(
     flush();
     return parts.join("");
   };
+  // Per-group layout override, set via test_groups.print_options.forceTableLayout
+  // (lab-level printOptions can set a default; the group value wins after merge):
+  //   true  â†’ always render the TEST NAME / VALUE / UNITS / Bio. Ref. Interval table
+  //   false â†’ always render the narrative key/value panel
+  //   unset â†’ fall back to the auto-detect heuristic below
+  const forceTableLayout = typeof printOptions?.forceTableLayout === "boolean"
+    ? printOptions.forceTableLayout as boolean
+    : null;
+
   const _isNarrativeGroup = (analytes: any[]): boolean => {
+    if (forceTableLayout !== null) {
+      console.log(`[basic-template] layout override: forceTableLayout=${forceTableLayout} -> ${forceTableLayout ? "table" : "narrative"} layout, heuristic skipped`);
+      return !forceTableLayout;
+    }
     if (!analytes.length) return false;
     const n = analytes.filter((a: any) => {
       const unit = String(a.unit || "").trim().toLowerCase();
@@ -3650,6 +3712,26 @@ function generateBasicDefaultTemplateHtml(
       `;
       continue;
     }
+
+	    // Zig-zag guard for the VALUE column.
+	    //
+	    // A qualitative row with no unit and no reference range can be rendered as one
+	    // colspan="3" cell that is LEFT-aligned, while every other row puts its value in
+	    // the narrow VALUE column RIGHT-aligned. Deciding that per row makes the column
+	    // stagger whenever a group mixes the two (e.g. Urine Routine, where only some
+	    // analytes are tagged value_type='qualitative' but none carry units or ranges).
+	    // Decide once per group instead, so every value lands on the same vertical line.
+	    //
+	    // The wide cell exists so sentence-length findings are not squeezed into the
+	    // narrow VALUE column, so it is reserved for groups that actually have long
+	    // values. Short qualitative results (Absent, Pale Yellow, Non Reactive) stay
+	    // right-aligned in the VALUE column, lining up with the numeric groups.
+	    const groupHasNoUnitsOrRefs = analytes.every((a: any) =>
+	      !String(a.unit || "").trim() && !String(a.reference_range || "").trim()
+	    );
+	    const groupUsesWideQualitativeValues = groupHasNoUnitsOrRefs &&
+	      analytes.some((a: any) => String(a.value ?? "").trim().length > LONG_QUALITATIVE_VALUE_CHARS);
+	    console.log(`[basic-template] ${groupName}: VALUE column = ${groupUsesWideQualitativeValues ? "wide left-aligned (long text group)" : "right-aligned in VALUE column"}`);
 
 	    const groupColumnHeaderHtml = `
 	      <table class="tbl-results" style="width:100%; table-layout:fixed; border-collapse:collapse; margin-top:4px;">
@@ -3779,8 +3861,16 @@ function generateBasicDefaultTemplateHtml(
         const refText = String(refRange || "").trim();
         const hasNumericRef = /\d/.test(refText);
         const valueTypeRaw = String(analyte.value_type || "").toLowerCase();
-        const isQualitativeWithoutMetadata =
-          valueTypeRaw === "qualitative" && !unitText && !refText;
+        const isQualitativeRow = valueTypeRaw === "qualitative" && !unitText && !refText;
+        // Wide cells are left-aligned, normal value cells are right-aligned, so the
+        // choice is all-or-nothing per group (see groupUsesWideQualitativeValues above).
+        const isQualitativeWithoutMetadata = groupUsesWideQualitativeValues;
+        // Text value staying in the VALUE column: keep it right-aligned with the numeric
+        // rows, but let it wrap rather than be clipped by the column's nowrap.
+        const inlineQualitativeClass =
+          !groupUsesWideQualitativeValues && (isQualitativeRow || groupHasNoUnitsOrRefs)
+            ? " qualitative-inline-value"
+            : "";
         const isDescriptive =
           valueTypeRaw !== "qualitative" &&
           (unitText === "n/a" || unitText === "na" || unitText === "-" ||
@@ -3810,13 +3900,12 @@ function generateBasicDefaultTemplateHtml(
           return "";
         })();
 
-        // Use a flex container to keep flag and value properly aligned in one line
-        // Flag gets fixed width on left, value fills remaining space and aligns right
-        const flagWidth = basePx * 1.5;
+        // Flag sits directly beside the value (the whole pair right-aligns in the result
+        // column), so the visible gap is exactly flagGapPx — not the leftover column width.
         const displayValue = flagSymbol === "before" && flagSymbolText
-          ? `<span style="display:inline-flex;align-items:baseline;width:100%;"><span style="flex:0 0 ${flagWidth}px;text-align:left;font-weight:700;">${flagSymbolText}</span><span style="flex:1;text-align:right;">${value + asteriskSuffix}</span></span>`
+          ? `<span style="display:inline-block;font-weight:700;margin-right:${flagGapPx}px;">${flagSymbolText}</span>${value + asteriskSuffix}`
           : flagSymbol === "after" && flagSymbolText
-          ? `<span style="display:inline-flex;align-items:baseline;width:100%;justify-content:flex-end;"><span style="text-align:right;">${value + asteriskSuffix}</span><span style="flex:0 0 ${flagWidth}px;text-align:right;font-weight:700;margin-left:4px;">${flagSymbolText}</span></span>`
+          ? `${value + asteriskSuffix}<span style="display:inline-block;font-weight:700;margin-left:${flagGapPx}px;">${flagSymbolText}</span>`
           : value + asteriskSuffix;
 
         if (isDescriptive) {
@@ -3916,7 +4005,7 @@ function generateBasicDefaultTemplateHtml(
 	                </td>
 	                ${isQualitativeWithoutMetadata
 	                  ? `<td class="${valClass} qualitative-wide-value" colspan="3">${displayValue}</td>`
-	                  : `<td class="${valClass}" style="text-align:right;">${displayValue}</td>
+	                  : `<td class="${valClass}${inlineQualitativeClass}" style="text-align:right;">${displayValue}</td>
 		                <td style="text-align:left; vertical-align:top; font-size:${basePx}px; color:#444;">${unit}</td>
 		                <td style="text-align:left; vertical-align:top; font-size:${smallPx + 1}px; color:#666;">${refRange}</td>`}
 		              </tr>
@@ -8869,6 +8958,32 @@ serve(async (req) => {
       console.log("âœ… Attachments found:", attachments?.length || 0);
 
       // ========================================
+      // Step 7b: Name case format (Settings â†’ Notifications â†’ Name Display Format)
+      // ========================================
+      let nameCaseFormat: "proper" | "upper" = "proper";
+      try {
+        const { data: nameCaseSettings } = await supabaseClient
+          .from("lab_notification_settings")
+          .select("name_case_format")
+          .eq("lab_id", job.lab_id)
+          .maybeSingle();
+        if (nameCaseSettings?.name_case_format === "upper") {
+          nameCaseFormat = "upper";
+        }
+      } catch (e) {
+        console.warn("âš ï¸ Could not read name_case_format, defaulting to proper:", e);
+      }
+      console.log("ðŸ” Name case format:", nameCaseFormat);
+
+      /** Apply the lab's name_case_format to a rendered name. */
+      const applyNameCase = (value: unknown): string => {
+        const name = String(value ?? "");
+        if (!name) return name;
+        if (nameCaseFormat === "upper") return name.toUpperCase();
+        return name;
+      };
+
+      // ========================================
       // Step 7c: Get Branding Pages (Front/Back)
       // ========================================
       console.log("\nðŸŽ¨ Step 7c: Fetching front/back pages...");
@@ -9351,7 +9466,7 @@ serve(async (req) => {
 
         const flatAliases = {
           // Patient aliases
-          patientName: baseContext.patient?.name || "",
+          patientName: applyNameCase(baseContext.patient?.name),
           patientId: baseContext.patient?.displayId ||
             baseContext.patient?.id || "",
           patientAge: baseContext.patient?.age || "",
@@ -9380,7 +9495,7 @@ serve(async (req) => {
           sampleCollectedBy: baseContext.order?.sampleCollectedBy || "",
           b2bAccountName: baseContext.order?.b2bAccountName ||
             baseContext.placeholderValues?.b2bAccountName || "",
-          referringDoctorName: baseContext.order?.referringDoctorName || "",
+          referringDoctorName: applyNameCase(baseContext.order?.referringDoctorName),
           approvedAt: baseContext.order?.approvedAtFormatted ||
             baseContext.order?.approved_at || baseContext.meta?.approvedAt ||
             "",
@@ -9432,6 +9547,17 @@ serve(async (req) => {
           ...baseContext.placeholderValues, // âœ… CRITICAL: Spread RPC-provided placeholders to root
           ...analytePlaceholders, // Add locally generated placeholders (fallbacks)
           ...flatAliases, // Add flat aliases
+          // Keep nested {{patient.name}} / {{order.referringDoctorName}} in step with
+          // the flat aliases above so name casing is consistent whichever form a template uses
+          patient: baseContext.patient
+            ? { ...baseContext.patient, name: applyNameCase(baseContext.patient.name) }
+            : baseContext.patient,
+          order: baseContext.order
+            ? {
+              ...baseContext.order,
+              referringDoctorName: applyNameCase(baseContext.order.referringDoctorName),
+            }
+            : baseContext.order,
           verifyUrl: verifyUrl, // QR code URL
           qr_code: `<img src="https://api.qrserver.com/v1/create-qr-code/?size=100x100&data=${encodeURIComponent(verifyUrl)}" alt="Verify Report" style="width:80px;height:80px;" />`,
           watermark: watermarkSettings.enabled
@@ -10531,6 +10657,20 @@ serve(async (req) => {
 
         // Inject print-optimized CSS (grayscale, simplified colors)
         // REFINED: Don't nuke ALL backgrounds (protects table headers)
+        // Font weights in the print copy must mirror the basic-template CSS
+        // (generateBasicDefaultTemplateHtml) so print and e-copy look identical.
+        // Previously these were hardcoded to 600/700/900, which silently
+        // out-specified the template rules and bolded the whole result table.
+        const pcOpts = effectivePrintOptionsForCss || mergedPrintOptions || {};
+        const pcBoldAllValues = (pcOpts.boldAllValues as boolean) ?? false;
+        const pcTestNameBold = (pcOpts.testNameBold as boolean) ?? false;
+        const pcBoldAbnormal = (pcOpts.boldAbnormalValues as boolean) ?? true;
+        const pcUnderlineAbnormal =
+          (pcOpts.underlineAbnormalValues as boolean) ?? false;
+        const pcPatientInfoBold = (pcOpts.patientInfoBold as boolean) ?? false;
+        const pcPatientInfoColumnDivider =
+          (pcOpts.patientInfoColumnDivider as boolean) ?? false;
+
         const printCss = `
         <style id="lims-print-css">
           /* FORCE BLACK & WHITE / GRAYSCALE */
@@ -10603,11 +10743,12 @@ serve(async (req) => {
             -webkit-text-fill-color: #000000 !important;
           }
 
+          /* Darken only — weight is left to the template CSS so the print copy
+             honours boldAllValues / testNameBold like the e-copy does. */
           .tbl-results td,
           .tbl-results th,
           .basic-report-template .tbl-results td,
           .basic-report-template .tbl-results th {
-            font-weight: 600 !important;
             text-shadow: 0 0 0 #000000 !important;
           }
 
@@ -10616,29 +10757,62 @@ serve(async (req) => {
           .main-group-row td,
           .sub-section-header td,
           .center-title {
-            font-weight: 800 !important;
+            font-weight: 700 !important;
             color: #000000 !important;
           }
 
           .test-name,
+          .basic-report-template .test-name {
+            color: #000000 !important;
+            font-weight: ${pcTestNameBold ? "600" : "normal"} !important;
+            opacity: 1 !important;
+          }
+
           .val,
           .same-row-sibling,
+          .basic-report-template .val,
+          .basic-report-template .same-row-sibling {
+            color: #000000 !important;
+            font-weight: ${pcBoldAllValues ? "600" : "normal"} !important;
+            opacity: 1 !important;
+          }
+
           .same-row-sibling-unit,
           .same-row-sibling-ref,
-          .basic-report-template .test-name,
-          .basic-report-template .val,
-          .basic-report-template .same-row-sibling,
           .basic-report-template .same-row-sibling-unit,
           .basic-report-template .same-row-sibling-ref {
             color: #000000 !important;
-            font-weight: 700 !important;
+            font-weight: normal !important;
             opacity: 1 !important;
           }
+
+          .basic-report-template .patient-header-table td {
+            font-weight: ${pcPatientInfoBold ? "700" : "normal"} !important;
+          }
+
+          ${pcPatientInfoColumnDivider ? `
+          /* Patient info column divider. The generic print border rules above
+             would otherwise box every cell, so clear them first and draw only
+             the single vertical rule between the two column pairs. */
+          .basic-report-template .patient-header-table tr > *,
+          .basic-report-template .patient-header-table td,
+          .basic-report-template .patient-header-table th {
+            border: none !important;
+          }
+          .basic-report-template .patient-header-table tr > *:nth-child(2) {
+            border-right: 1px solid #000 !important;
+            padding-right: 8px !important;
+          }
+          .basic-report-template .patient-header-table tr > *:nth-child(3) {
+            padding-left: 8px !important;
+          }
+          ` : ""}
 
           /* Hide non-print elements */
           .watermark, .draft-watermark { display: none !important; }
 
-          /* BOLD overrides for Result/Flag classes in Print Mode */
+          /* Abnormal emphasis in Print Mode — follows boldAbnormalValues /
+             underlineAbnormalValues so it matches the e-copy. */
           .value-low, .flag-low,
           .value-high, .flag-high,
           .value-critical, .flag-critical,
@@ -10647,7 +10821,7 @@ serve(async (req) => {
           .value-critical_h, .flag-critical_h,
           .value-critical_l, .flag-critical_l {
             color: #000000 !important;
-            font-weight: 900 !important;
+            ${pcBoldAbnormal ? "font-weight: 700 !important;" : ""}
           }
 
           tr.has-visible-flag > td.val,
@@ -10655,10 +10829,14 @@ serve(async (req) => {
           .basic-report-template tr.has-visible-flag > td.val,
           .basic-report-template tr.has-visible-flag > td .val {
             color: #000000 !important;
-            font-weight: 900 !important;
-            text-decoration-line: underline !important;
+            ${pcBoldAbnormal ? "font-weight: 700 !important;" : ""}
+            ${
+          pcUnderlineAbnormal
+            ? `text-decoration-line: underline !important;
             text-decoration-thickness: 1.2px !important;
-            text-underline-offset: 2px !important;
+            text-underline-offset: 2px !important;`
+            : ""
+        }
           }
         </style>
       `;

@@ -30,6 +30,7 @@ import { notificationTriggerService, formatName } from '../../utils/notification
 import { useQZTray } from '../../contexts/QZTrayContext';
 import { SampleTypeIndicator } from '../Common/SampleTypeIndicator';
 import { getLabCurrency } from '../../utils/currency';
+import OnlinePaymentQR from '../Billing/OnlinePaymentQR';
 import {
   processTRFImage,
   trfToOrderFormData,
@@ -268,6 +269,20 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
   const [paymentMethod, setPaymentMethod] = useState<'cash' | 'card' | 'upi' | 'online'>('cash');
   const [amountPaid, setAmountPaid] = useState<number>(0);
   const [takeFullPayment, setTakeFullPayment] = useState<boolean>(false);
+
+  // 'online' is collected through the payment gateway after the invoice exists,
+  // so it can't be recorded as a settled payment at submit time.
+  const isOnlineCollection = paymentMethod === 'online' && amountPaid > 0;
+
+  const [onlineCollection, setOnlineCollection] = useState<{
+    invoiceId: string;
+    invoiceNumber: string | null;
+    labId: string;
+    patientId: string;
+    patientName: string;
+    patientPhone?: string;
+    amount: number;
+  } | null>(null);
 
   // Quick-Add Doctor modal
   const [showAddDoctorModal, setShowAddDoctorModal] = useState<boolean>(false);
@@ -569,6 +584,8 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
     currentBalance: number;
     creditLimit: number;
     availableCredit: number;
+    /** Cash/cheque receipted against the account from Account Master */
+    manualPaymentCredit?: number;
     name: string;
   } | null>(null);
 
@@ -579,6 +596,7 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
   const [showNewPatientModal, setShowNewPatientModal] = useState<boolean>(false);
   const [creatingPatient, setCreatingPatient] = useState<boolean>(false);
   const [nameCaseFormat, setNameCaseFormat] = useState<'proper' | 'upper'>('proper');
+  const npNameInputStyle = nameCaseFormat === 'upper' ? { textTransform: 'uppercase' as const } : undefined;
   const [autoCollectOnRegistration, setAutoCollectOnRegistration] = useState(false);
   const [newPatient, setNewPatient] = useState<{
     name: string;
@@ -908,6 +926,7 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
               currentBalance: Number(res.currentBalance ?? 0),
               creditLimit: Number(res.creditLimit ?? 0),
               availableCredit: Number(res.availableCredit ?? 0),
+              manualPaymentCredit: Number(res.manualPaymentCredit ?? 0),
               name:
                 res.name ||
                 (accounts.find((a) => a.id === selectedAccount)?.name ?? 'Account')
@@ -1716,10 +1735,14 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
             total_discount: discountAmount,
             total_after_discount: finalAmount,
             total: finalAmount,
-            amount_paid: amountPaid,
+            // Online collection hasn't happened yet — the gateway webhook writes
+            // the payments row and flips the invoice once the patient actually pays.
+            amount_paid: isOnlineCollection ? 0 : amountPaid,
             tax: 0,
             due_date: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
-            status: amountPaid >= finalAmount ? 'Paid' : (amountPaid > 0 ? 'Partial' : 'Draft'),
+            status: isOnlineCollection
+              ? 'Draft'
+              : (amountPaid >= finalAmount ? 'Paid' : (amountPaid > 0 ? 'Partial' : 'Draft')),
             ...(discountAmount > 0 ? { discount_source: discountBy } : {}),
           };
 
@@ -1905,7 +1928,7 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
             }
           }
 
-          if (amountPaid > 0 && invoice) {
+          if (amountPaid > 0 && invoice && !isOnlineCollection) {
             const paymentData = {
               invoice_id: invoice.id,
               amount: amountPaid,
@@ -1955,7 +1978,22 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
             }
           }
 
-          finishSuccessfulSubmit('Order, invoice, and payment created successfully!');
+          if (isOnlineCollection) {
+            // Hold the form open on a QR panel so the counter can collect now.
+            setSubmissionProgress('');
+            setIsSubmitting(false);
+            setOnlineCollection({
+              invoiceId: invoice.id,
+              invoiceNumber: invoice.invoice_number || null,
+              labId: labId as string,
+              patientId: patientForOrder!.id,
+              patientName: patientForOrder!.name,
+              patientPhone: (patientForOrder as any)?.phone || undefined,
+              amount: amountPaid,
+            });
+          } else {
+            finishSuccessfulSubmit('Order, invoice, and payment created successfully!');
+          }
         } catch (err: any) {
           console.error('Post-order creation error:', err);
           alert(`Order created but failed to create invoice/payment: ${err.message}`);
@@ -3247,7 +3285,7 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
                     <div className="font-medium">₹{creditInfo.creditLimit.toLocaleString()}</div>
                   </div>
                   <div>
-                    <span className="text-gray-600">Current Balance:</span>
+                    <span className="text-gray-600">Credit Used:</span>
                     <div className="font-medium">
                       ₹{creditInfo.currentBalance.toLocaleString()}
                     </div>
@@ -3260,6 +3298,11 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
                     >
                       ₹{creditInfo.availableCredit.toLocaleString()}
                     </span>
+                    {!!creditInfo.manualPaymentCredit && creditInfo.manualPaymentCredit > 0 && (
+                      <span className="text-gray-500">
+                        {' '}(includes ₹{creditInfo.manualPaymentCredit.toLocaleString()} cash/cheque received)
+                      </span>
+                    )}
                   </div>
                 </div>
               </div>
@@ -3688,9 +3731,16 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
                   </div>
                 )}
 
-                <p className="text-xs text-gray-500 mt-2">
-                  💡 Leave empty to collect payment later via invoice
-                </p>
+                {isOnlineCollection ? (
+                  <p className="text-xs text-blue-600 mt-2">
+                    💳 A payment QR / link will be shown after the order is registered. The invoice is
+                    marked paid automatically once the gateway confirms.
+                  </p>
+                ) : (
+                  <p className="text-xs text-gray-500 mt-2">
+                    💡 Leave empty to collect payment later via invoice
+                  </p>
+                )}
               </div>}
             </section>
           )}
@@ -3948,6 +3998,7 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
                       placeholder="First Name *"
                       value={npFirstName}
                       onChange={e => setNpFirstName(e.target.value)}
+                      style={npNameInputStyle}
                       className="flex-1 px-3 py-2 text-sm border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
                     />
                   </div>
@@ -3961,6 +4012,7 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
                         placeholder="Middle Name"
                         value={npMiddleName}
                         onChange={e => setNpMiddleName(e.target.value)}
+                        style={npNameInputStyle}
                         className="flex-1 px-3 py-2 text-sm border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
                       />
                     )}
@@ -3970,6 +4022,7 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
                       placeholder="Last Name"
                       value={npLastName}
                       onChange={e => setNpLastName(e.target.value)}
+                      style={npNameInputStyle}
                       className="flex-1 px-3 py-2 text-sm border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
                     />
                   </div>
@@ -4681,6 +4734,53 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
                 Continue with Order
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Online collection at booking time: the order and invoice already exist,
+          the gateway settles the invoice once the patient pays. */}
+      {onlineCollection && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[60] p-4">
+          <div className="bg-white rounded-lg p-6 w-full max-w-lg max-h-[90vh] overflow-y-auto">
+            <div className="flex justify-between items-start mb-4">
+              <div>
+                <h2 className="text-xl font-bold text-gray-900">Collect Payment Online</h2>
+                <p className="text-sm text-gray-500 mt-0.5">
+                  Order registered for {onlineCollection.patientName}
+                  {onlineCollection.invoiceNumber ? ` · Invoice ${onlineCollection.invoiceNumber}` : ''}
+                </p>
+              </div>
+              <button
+                onClick={() => {
+                  setOnlineCollection(null);
+                  finishSuccessfulSubmit('Order and invoice created. Payment pending.');
+                }}
+                className="text-gray-400 hover:text-gray-600"
+              >
+                <X className="w-6 h-6" />
+              </button>
+            </div>
+
+            <OnlinePaymentQR
+              labId={onlineCollection.labId}
+              invoiceId={onlineCollection.invoiceId}
+              invoiceNumber={onlineCollection.invoiceNumber || undefined}
+              patientId={onlineCollection.patientId}
+              payerName={onlineCollection.patientName}
+              payerPhone={onlineCollection.patientPhone}
+              amount={onlineCollection.amount}
+              onPaid={() => {
+                setTimeout(() => {
+                  setOnlineCollection(null);
+                  finishSuccessfulSubmit('Payment received. Order created successfully!');
+                }, 1500);
+              }}
+              onCancel={() => {
+                setOnlineCollection(null);
+                finishSuccessfulSubmit('Order and invoice created. Collect payment later.');
+              }}
+            />
           </div>
         </div>
       )}

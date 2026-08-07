@@ -128,7 +128,7 @@ Deno.serve(async (req) => {
 
     const { data: outstandingInvoices, error: outstandingInvoicesError } = await supabase
       .from('consolidated_invoices')
-      .select('total_amount, status')
+      .select('id, total_amount, status')
       .eq('account_id', account_id)
       .eq('lab_id', lab_id);
 
@@ -136,15 +136,17 @@ Deno.serve(async (req) => {
       console.warn('[CHECK-B2B-CREDIT] Outstanding invoice lookup failed:', outstandingInvoicesError);
     }
 
-    const outstandingInvoiceAmount = (outstandingInvoices || [])
-      .filter((invoice: Record<string, unknown>) => {
-        const status = String(invoice.status || '').toLowerCase();
-        return status !== 'paid' && status !== 'cancelled';
-      })
-      .reduce((sum: number, invoice: Record<string, unknown>) => {
-        const amount = Number(invoice.total_amount);
-        return sum + (Number.isFinite(amount) ? amount : 0);
-      }, 0);
+    const openInvoices = (outstandingInvoices || []).filter((invoice: Record<string, unknown>) => {
+      const status = String(invoice.status || '').toLowerCase();
+      return status !== 'paid' && status !== 'cancelled';
+    });
+
+    const openInvoiceIds = new Set(openInvoices.map((invoice: Record<string, unknown>) => String(invoice.id)));
+
+    const outstandingInvoiceAmount = openInvoices.reduce((sum: number, invoice: Record<string, unknown>) => {
+      const amount = Number(invoice.total_amount);
+      return sum + (Number.isFinite(amount) ? amount : 0);
+    }, 0);
 
     const { data: pendingBookings, error: pendingBookingsError } = await supabase
       .from('bookings')
@@ -186,7 +188,39 @@ Deno.serve(async (req) => {
       return sum + (Number.isFinite(amount) ? amount : 0);
     }, 0);
 
-    const liveCreditUsed = Math.max(0, outstandingInvoiceAmount + openOrderAmount + pendingBookingAmount - paymentCreditAmount);
+    // Cash / cheque / bank money the lab recorded against this account, from
+    // either Account Master or Billing. Kept separate from the gateway payments
+    // summed above by reference_type ('payment_attempt' vs 'manual'/'invoice').
+    //
+    // 'manual'  = advance, not tied to a bill -> always frees credit.
+    // 'invoice' = paid against a consolidated invoice -> frees credit only while
+    //             that invoice is still outstanding. Once it is marked paid it
+    //             drops out of outstandingInvoiceAmount entirely, so continuing
+    //             to subtract its payments would return the same money twice.
+    const { data: manualCredits, error: manualCreditsError } = await supabase
+      .from('b2b_credit_ledger')
+      .select('amount, entry_type, reference_type, reference_id')
+      .eq('account_id', account_id)
+      .eq('lab_id', lab_id)
+      .in('reference_type', ['manual', 'invoice'])
+      .eq('is_reversed', false);
+
+    if (manualCreditsError) {
+      console.warn('[CHECK-B2B-CREDIT] Manual credit lookup failed:', manualCreditsError);
+    }
+
+    const manualCreditAmount = (manualCredits || [])
+      .filter((entry: Record<string, unknown>) => {
+        if (!['PAYMENT_CREDIT', 'MANUAL_CREDIT'].includes(String(entry.entry_type))) return false;
+        if (entry.reference_type === 'manual') return true;
+        return !!entry.reference_id && openInvoiceIds.has(String(entry.reference_id));
+      })
+      .reduce((sum: number, entry: Record<string, unknown>) => {
+        const amount = Number(entry.amount);
+        return sum + (Number.isFinite(amount) ? amount : 0);
+      }, 0);
+
+    const liveCreditUsed = Math.max(0, outstandingInvoiceAmount + openOrderAmount + pendingBookingAmount - paymentCreditAmount - manualCreditAmount);
     const effectiveCreditUsed = Math.max(storedCreditUsed, liveCreditUsed);
     const availableCredit = creditLimit - effectiveCreditUsed;
     const shortfall = Math.max(0, order_amount - availableCredit);
@@ -243,6 +277,7 @@ Deno.serve(async (req) => {
       open_order_amount: openOrderAmount,
       pending_booking_amount: pendingBookingAmount,
       payment_credit_amount: paymentCreditAmount,
+      manual_credit_amount: manualCreditAmount,
       effective_credit_used: effectiveCreditUsed,
       available_credit: availableCredit,
       order_amount: order_amount,
@@ -261,6 +296,7 @@ Deno.serve(async (req) => {
       open_order_amount: openOrderAmount,
       pending_booking_amount: pendingBookingAmount,
       payment_credit_amount: paymentCreditAmount,
+      manual_credit_amount: manualCreditAmount,
       shortfall
     });
 

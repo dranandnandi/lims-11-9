@@ -238,6 +238,20 @@ async function handleCCAvenueCallback(req: Request, supabase: ReturnType<typeof 
     );
   }
 
+  // The key-matching loop above walks every lab's CCAvenue gateway, so confirm
+  // the key that decrypted this response actually belongs to the paying lab.
+  if (matchedGateway.lab_id !== paymentAttempt.lab_id) {
+    console.error('[PAYMENT-CALLBACK] Gateway/lab mismatch', {
+      gateway_lab: matchedGateway.lab_id,
+      attempt_lab: paymentAttempt.lab_id,
+      order_id: gatewayOrderId
+    });
+    return new Response(
+      JSON.stringify({ error: 'Gateway does not belong to this payment' }),
+      { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
+  }
+
   // Determine status
   let status: string;
   let failureReason: string | null = null;
@@ -275,15 +289,34 @@ async function handleCCAvenueCallback(req: Request, supabase: ReturnType<typeof 
     console.error('[PAYMENT-CALLBACK] Failed to update payment attempt:', updateError);
   }
 
-  // If successful, apply credit
+  // If successful, settle it (credit ledger for B2B, payments row for patients)
   if (status === 'success') {
-    await applyPaymentCredit(supabase, paymentAttempt, amount, 'ccavenue', trackingId);
+    await settleSuccessfulPayment(supabase, paymentAttempt, amount, 'ccavenue', trackingId);
+  }
+
+  // Patient payments came from a /pay/:token link; send the browser back there.
+  const linkToken = decryptedResponse.merchant_param4 || '';
+  const isPatientPayment = paymentAttempt.payer_type === 'patient';
+
+  if (isPatientPayment && status !== 'success' && linkToken) {
+    await supabase
+      .from('payment_links')
+      .update({ status: status === 'cancelled' ? 'active' : 'failed' })
+      .eq('token', linkToken)
+      .neq('status', 'paid');
   }
 
   // Return redirect URL or JSON response
+  const successBase = isPatientPayment && linkToken
+    ? `${appBaseUrl}/pay/${linkToken}/success`
+    : `${appBaseUrl}/b2b/payment/success`;
+  const failureBase = isPatientPayment && linkToken
+    ? `${appBaseUrl}/pay/${linkToken}/failed`
+    : `${appBaseUrl}/b2b/payment/failed`;
+
   const redirectUrl = status === 'success'
-    ? `${appBaseUrl}/b2b/payment/success?payment_id=${paymentAttempt.id}`
-    : `${appBaseUrl}/b2b/payment/failed?payment_id=${paymentAttempt.id}&reason=${encodeURIComponent(failureReason || 'Payment failed')}`;
+    ? `${successBase}?payment_id=${paymentAttempt.id}`
+    : `${failureBase}?payment_id=${paymentAttempt.id}&reason=${encodeURIComponent(failureReason || 'Payment failed')}`;
 
   // For browser redirect, return HTML
   return new Response(
@@ -386,9 +419,9 @@ async function handleRazorpayWebhook(req: Request, supabase: ReturnType<typeof c
     })
     .eq('id', paymentAttempt.id);
 
-  // Apply credit if successful
+  // Settle if successful
   if (status === 'success') {
-    await applyPaymentCredit(supabase, paymentAttempt, amount, 'razorpay', paymentId);
+    await settleSuccessfulPayment(supabase, paymentAttempt, amount, 'razorpay', paymentId);
   }
 
   return new Response(
@@ -470,12 +503,57 @@ async function handleRazorpayVerify(req: Request, supabase: ReturnType<typeof cr
     })
     .eq('id', payment_id);
 
-  await applyPaymentCredit(supabase, paymentAttempt, amount, 'razorpay', razorpay_payment_id);
+  // Re-read so the settlement sees the freshly written success status.
+  const { data: settledAttempt } = await supabase
+    .from('b2b_payment_attempts')
+    .select('*')
+    .eq('id', payment_id)
+    .single();
+
+  await settleSuccessfulPayment(
+    supabase,
+    settledAttempt ?? paymentAttempt,
+    amount,
+    'razorpay',
+    razorpay_payment_id
+  );
 
   return new Response(
     JSON.stringify({ success: true, payment_id }),
     { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
   );
+}
+
+// Route a successful payment to the right settlement path.
+// B2B account payments become credit-ledger entries; patient payments become a
+// real `payments` row against the invoice (see settle_patient_payment()).
+async function settleSuccessfulPayment(
+  supabase: ReturnType<typeof createClient>,
+  paymentAttempt: Record<string, unknown>,
+  amount: number,
+  provider: string,
+  transactionId: string
+) {
+  if (paymentAttempt.payer_type === 'patient') {
+    const { data, error } = await supabase.rpc('settle_patient_payment', {
+      p_attempt_id: paymentAttempt.id
+    });
+
+    if (error) {
+      console.error('[PAYMENT-CALLBACK] Failed to settle patient payment:', error);
+      return;
+    }
+
+    console.log('[PAYMENT-CALLBACK] Patient payment settled:', {
+      payment_attempt_id: paymentAttempt.id,
+      payments_row: data,
+      provider,
+      transactionId
+    });
+    return;
+  }
+
+  await applyPaymentCredit(supabase, paymentAttempt, amount, provider, transactionId);
 }
 
 // Apply payment credit to account

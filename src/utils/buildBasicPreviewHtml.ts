@@ -36,11 +36,20 @@ export interface PreviewAnalyte {
   } | null;
 }
 
+/**
+ * A basic-template group whose values are all shorter than this keeps them right-aligned
+ * in the VALUE column. Only groups with sentence-length findings get the wide,
+ * left-aligned value cell. Kept in sync with generate-pdf-letterhead.
+ */
+const LONG_QUALITATIVE_VALUE_CHARS = 24;
+
 export interface PreviewTestGroup {
   testGroupId?: string | null;
   testGroupName: string;
   analytes: PreviewAnalyte[];
   groupInterpretation?: string | null;
+  /** Per-group print_options overrides (test_groups.print_options); wins over the top-level printOptions. */
+  printOptions?: Record<string, unknown> | null;
 }
 
 export interface PreviewSection {
@@ -264,7 +273,32 @@ function formatNarrativeHtml(rawContent: string): string {
   return parts.join("");
 }
 
-function isNarrativeGroup(analytes: PreviewAnalyte[]): boolean {
+/** Group-level forceTableLayout wins over the lab-level value; null means auto-detect. */
+function resolveForceTableLayout(
+  groupOptions: Record<string, unknown> | null | undefined,
+  labOptions: Record<string, unknown> | null | undefined,
+): boolean | null {
+  for (const opts of [groupOptions, labOptions]) {
+    if (opts && typeof opts.forceTableLayout === "boolean") return opts.forceTableLayout;
+  }
+  return null;
+}
+
+/**
+ * Decide whether a group renders as the narrative key/value panel instead of the
+ * standard results table.
+ *
+ * `forceTableLayout` (test_groups.print_options, merged over lab printOptions) is an
+ * explicit escape hatch and wins over the heuristic:
+ *   true  → always the results table
+ *   false → always the narrative panel
+ *   null  → auto-detect (mirrors _isNarrativeGroup in generate-pdf-letterhead)
+ */
+function isNarrativeGroup(
+  analytes: PreviewAnalyte[],
+  forceTableLayout: boolean | null = null,
+): boolean {
+  if (forceTableLayout !== null) return !forceTableLayout;
   if (!analytes.length) return false;
   const narrativeRows = analytes.filter((analyte) => {
     const unit = String(analyte.unit || "").trim().toLowerCase();
@@ -344,9 +378,19 @@ export function buildBasicPreviewHtml(params: BuildBasicPreviewParams): string {
   const testNameWeight = (printOptions.testNameBold ?? false) ? "600" : "normal";
   const boldAllValues = (printOptions.boldAllValues as boolean) ?? false;
   const boldAbnormal = (printOptions.boldAbnormalValues as boolean) ?? true;
+  // Bolds the patient information block values (labels stay bold either way).
+  const patientInfoBold = (printOptions.patientInfoBold as boolean) ?? false;
+  // Draws a vertical rule between the two patient-info column pairs.
+  const patientInfoColumnDivider = (printOptions.patientInfoColumnDivider as boolean) ?? false;
+  const underlineAbnormal = (printOptions.underlineAbnormalValues as boolean) ?? false;
+  const abnormalDecoration = underlineAbnormal
+    ? "text-decoration: underline !important; text-underline-offset: 2px !important;"
+    : "";
   const sectionHeaderInline = (printOptions.sectionHeaderInline as boolean) ?? true;
   const flagSymbol = (printOptions.flagSymbol as string) ?? "none";
   const showFlagLegend = (printOptions.showFlagLegend as boolean) ?? false;
+  // Exact gap in px between the H/L symbol and the value (0-12, default 4)
+  const flagGapPx = Math.max(0, Math.min(12, Number(printOptions.flagGapPx ?? 4)));
   const calcMarker = (printOptions.calcMarker as string) ?? "cal";
   const flagAsterisk = (printOptions.flagAsterisk as boolean) ?? false;
   const flagAsteriskCritical = (printOptions.flagAsteriskCritical as boolean) ?? false;
@@ -445,7 +489,19 @@ th { padding: 3px 4px !important; }
 .patient-header-table td {
   width: 35%; padding: 2px 3px !important; border: none !important;
   color: #111 !important; word-break: break-word; font-size: ${basePx}px;
+  font-weight: ${patientInfoBold ? "700" : "normal"};
 }
+${patientInfoColumnDivider ? `
+/* Vertical rule between the left and right patient info columns.
+   Cell 2 of every row is the last cell of the left column pair. */
+.patient-header-table tr > *:nth-child(2) {
+  border-right: 1px solid #000 !important;
+  padding-right: 8px !important;
+}
+.patient-header-table tr > *:nth-child(3) {
+  padding-left: 8px !important;
+}
+` : ""}
 .patient-test-separator {
   border-top: 1.5px solid #000;
   height: 0;
@@ -495,9 +551,9 @@ th { padding: 3px 4px !important; }
 }
 .test-name { font-size: ${basePx}px; font-weight: ${testNameWeight}; color: #111; line-height: 1.22; }
 .val { text-align: right; vertical-align: top; font-size: ${basePx}px; font-weight: ${boldAllValues ? "600" : "normal"}; white-space: nowrap; }
-.val.high, .val.critical_high { color: ${highColor} !important; ${boldAbnormal ? "font-weight: 700 !important;" : ""} }
-.val.low, .val.critical_low   { color: ${lowColor} !important;  ${boldAbnormal ? "font-weight: 700 !important;" : ""} }
-.val.abnormal { color: ${highColor} !important; ${boldAbnormal ? "font-weight: 700 !important;" : ""} }
+.val.high, .val.critical_high { color: ${highColor} !important; ${boldAbnormal ? "font-weight: 700 !important;" : ""} ${abnormalDecoration} }
+.val.low, .val.critical_low   { color: ${lowColor} !important;  ${boldAbnormal ? "font-weight: 700 !important;" : ""} ${abnormalDecoration} }
+.val.abnormal { color: ${highColor} !important; ${boldAbnormal ? "font-weight: 700 !important;" : ""} ${abnormalDecoration} }
 .main-group-row td { padding: 8px 0 5px 0 !important; border: none !important; }
 .center-title {
   text-align: center; font-weight: 700; text-decoration: underline;
@@ -532,6 +588,15 @@ th { padding: 3px 4px !important; }
 .tbl-results .qualitative-wide-value {
   width: ${formatBasicWidth(standardColumnWidths.slice(1).reduce((sum, width) => sum + width, 0))} !important;
   text-align: left !important;
+  white-space: normal !important;
+  overflow: visible !important;
+  overflow-wrap: anywhere !important;
+  word-break: break-word !important;
+}
+/* Qualitative value inside a group that also has numeric rows: stays in the VALUE
+   column so the column does not stagger, but may wrap instead of being clipped. */
+.tbl-results .qualitative-inline-value {
+  text-align: right !important;
   white-space: normal !important;
   overflow: visible !important;
   overflow-wrap: anywhere !important;
@@ -841,7 +906,9 @@ th { padding: 3px 4px !important; }
 	      testResultsHtml += `<div class="preview-page standard-page">${patientHtmlWithQr}<div class="test-results">`;
 	    }
 
-    if (isNarrativeGroup(group.analytes)) {
+    const groupForceTableLayout = resolveForceTableLayout(group.printOptions, printOptions);
+
+    if (isNarrativeGroup(group.analytes, groupForceTableLayout)) {
       const titleClass = testGroupTitlePosition === "above_headers_left" ? "center-title left" : "center-title";
       const rowsHtml = group.analytes.map((analyte) => {
         const rawParam = (analyte.parameter || "").trim();
@@ -963,6 +1030,18 @@ th { padding: 3px 4px !important; }
 
     const groupLegendParts: string[] = [];
 
+    // Wide colspan'd value cells are left-aligned while normal value cells are
+    // right-aligned, so mixing the two inside one group staggers the VALUE column.
+    // Decide once per group, off the printed data (unit / reference range) rather than
+    // the value_type tag, and reserve the wide cell for groups that actually have
+    // sentence-length values — short results stay right-aligned in the VALUE column.
+    // Mirrors generateBasicDefaultTemplateHtml in the PDF function.
+    const groupHasNoUnitsOrRefs = group.analytes.every(
+      (a) => !String(a.unit || "").trim() && !String(a.reference_range || "").trim(),
+    );
+    const groupUsesWideQualitativeValues = groupHasNoUnitsOrRefs &&
+      group.analytes.some((a) => String(a.value ?? "").trim().length > LONG_QUALITATIVE_VALUE_CHARS);
+
 	    for (const block of sectionBlocks) {
 	      const sectionHasSiblings = sectionsWithSiblings.has(block.heading);
 	      if (block.heading) {
@@ -1002,8 +1081,14 @@ th { padding: 3px 4px !important; }
         const refText = refRange.trim();
         const hasNumericRef = /\d/.test(refText);
         const valueTypeRaw = String(analyte.value_type || "").toLowerCase();
-        const isQualitativeWithoutMetadata =
-          valueTypeRaw === "qualitative" && !unitText && !refText;
+        const isQualitativeRow = valueTypeRaw === "qualitative" && !unitText && !refText;
+        const isQualitativeWithoutMetadata = groupUsesWideQualitativeValues;
+        // Text value staying in the VALUE column: keep it right-aligned with the numeric
+        // rows, but let it wrap rather than be clipped by the column's nowrap.
+        const inlineQualitativeClass =
+          !groupUsesWideQualitativeValues && (isQualitativeRow || groupHasNoUnitsOrRefs)
+            ? " qualitative-inline-value"
+            : "";
         const isDescriptive =
           valueTypeRaw !== "qualitative" &&
           (unitText === "n/a" ||
@@ -1049,9 +1134,9 @@ th { padding: 3px 4px !important; }
         );
 	        const displayValue =
 	          flagSymbol === "before" && sym
-	            ? `<span style="display:inline-block;min-width:${basePx * 1.15}px;text-align:center;font-weight:700;margin-right:4px;">${sym}</span>${formattedValue + asteriskSuffix}`
+	            ? `<span style="display:inline-block;font-weight:700;margin-right:${flagGapPx}px;">${sym}</span>${formattedValue + asteriskSuffix}`
 	            : flagSymbol === "after" && sym
-	            ? `${formattedValue + asteriskSuffix} <span style="font-weight:700;">${sym}</span>`
+	            ? `${formattedValue + asteriskSuffix}<span style="display:inline-block;font-weight:700;margin-left:${flagGapPx}px;">${sym}</span>`
 	            : formattedValue + asteriskSuffix;
 
 	        const valClass = canonical ? `val ${canonical}` : "val";
@@ -1106,7 +1191,7 @@ th { padding: 3px 4px !important; }
 	            </td>
 	            ${isQualitativeWithoutMetadata
 	              ? `<td class="${valClass} qualitative-wide-value" colspan="5">${displayValue}</td>`
-	              : `<td class="${valClass}" style="width:${formatBasicWidth(standardColumnWidths[1])}; text-align:right;">${displayValue}</td>
+	              : `<td class="${valClass}${inlineQualitativeClass}" style="width:${formatBasicWidth(standardColumnWidths[1])}; text-align:right;">${displayValue}</td>
 	            <td style="width:${formatBasicWidth(standardColumnWidths[2])}; text-align:left; vertical-align:top; font-size:${basePx}px; color:#444;">${unit}</td>
 	            <td style="width:${formatBasicWidth(standardColumnWidths[3])}; text-align:left; vertical-align:top; font-size:${smallPx + 1}px; color:#666;" colspan="3">${refRange}</td>`}
 	          </tr>`;
@@ -1119,7 +1204,7 @@ th { padding: 3px 4px !important; }
             </td>
             ${isQualitativeWithoutMetadata
               ? `<td class="${valClass} qualitative-wide-value" colspan="3">${displayValue}</td>`
-              : `<td class="${valClass}">${displayValue}</td>
+              : `<td class="${valClass}${inlineQualitativeClass}">${displayValue}</td>
             <td style="text-align:left; vertical-align:top; font-size:${basePx}px; color:#444;">${unit}</td>
             <td style="text-align:left; vertical-align:top; font-size:${smallPx + 1}px; color:#666;">${refRange}</td>`}
           </tr>`;

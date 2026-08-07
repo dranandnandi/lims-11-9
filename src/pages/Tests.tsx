@@ -143,6 +143,10 @@ interface TestGroup {
   analytes?: string[];
   analyteDisplay?: Array<{
     analyte_id: string;
+    // The specific lab_analytes row this group links to — the same global
+    // analyte can have several rows with different units/ranges.
+    lab_analyte_id?: string | null;
+    lab_analytes?: any;
     sort_order?: number | null;
     display_order?: number | null;
     section_heading?: string | null;
@@ -1011,7 +1015,8 @@ const Tests: React.FC = () => {
           category: pkg.category || 'General',
           validityDays: pkg.validity_days || 30,
           isActive: pkg.is_active ?? true,
-          testGroups: pkg.package_test_groups?.map((ptg: any) => ptg.test_group_id) || []
+          testGroupIds: pkg.package_test_groups?.map((ptg: any) => ptg.test_group_id) || [],
+          createdDate: pkg.created_at
         }));
         setPackages(transformedPackages);
       }

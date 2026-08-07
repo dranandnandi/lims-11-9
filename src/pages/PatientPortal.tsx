@@ -4,7 +4,7 @@ import {
   LogOut, Download, Search, RefreshCw, FileText, Printer,
   User, Phone, Droplets, Calendar, ChevronDown, ChevronUp,
   Clock, CheckCircle, Loader, AlertCircle, KeyRound, Eye, EyeOff,
-  Home, MapPin, Truck, Navigation
+  Home, MapPin, Truck, Navigation, CreditCard
 } from 'lucide-react';
 import { supabase } from '../utils/supabase';
 import { getCurrentPatientMeta, patientSignOut, forgetLabRecordedPin } from '../utils/patientAuth';
@@ -62,6 +62,17 @@ interface HomeCollectionBooking {
   phlebo_last_lng: number | null;
   phlebo_location_updated_at: string | null;
   created_at: string;
+}
+
+interface OutstandingInvoice {
+  invoice_id: string;
+  invoice_number: string | null;
+  invoice_date: string;
+  lab_id: string;
+  order_id: string | null;
+  total: number;
+  paid: number;
+  balance: number;
 }
 
 // How often the patient portal re-fetches the phlebo's position while en route
@@ -132,6 +143,11 @@ const PatientPortal: React.FC = () => {
   const [bookingLoading, setBookingLoading] = useState(false);
   const [bookingMessage, setBookingMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [trackingOpenId, setTrackingOpenId] = useState<string | null>(null);
+
+  // Self-service payments
+  const [outstandingInvoices, setOutstandingInvoices] = useState<OutstandingInvoice[]>([]);
+  const [payingInvoiceId, setPayingInvoiceId] = useState<string | null>(null);
+  const [payError, setPayError] = useState<string | null>(null);
 
   useEffect(() => {
     loadData();
@@ -226,10 +242,53 @@ const PatientPortal: React.FC = () => {
         .order('created_at', { ascending: false });
 
       setBookings(bookingsData || []);
+
+      // Outstanding balances (SECURITY DEFINER: scoped to this patient by JWT)
+      const { data: dueData, error: dueError } = await supabase.rpc('patient_portal_outstanding_invoices');
+      if (dueError) {
+        console.warn('PatientPortal outstanding invoices unavailable:', dueError.message);
+        setOutstandingInvoices([]);
+      } else {
+        setOutstandingInvoices((dueData as OutstandingInvoice[]) || []);
+      }
     } catch (err) {
       console.error('PatientPortal load error:', err);
     } finally {
       setLoading(false);
+    }
+  };
+
+  /**
+   * Ask the lab's gateway for a pay link for this invoice and open it.
+   * create-payment-link authorises the patient JWT against the invoice owner,
+   * so this cannot be pointed at someone else's bill.
+   */
+  const handlePayInvoice = async (invoice: OutstandingInvoice) => {
+    setPayingInvoiceId(invoice.invoice_id);
+    setPayError(null);
+
+    try {
+      const { data, error } = await supabase.functions.invoke('create-payment-link', {
+        body: {
+          lab_id: invoice.lab_id,
+          invoice_id: invoice.invoice_id,
+          order_id: invoice.order_id,
+          patient_id: patient?.id,
+          amount: Number(invoice.balance),
+          payer_name: patient?.name,
+          payer_phone: patient?.phone,
+        },
+      });
+
+      if (error) throw error;
+      if (!data?.token) throw new Error(data?.error || 'Could not start the payment');
+
+      navigate(`/pay/${data.token}`);
+    } catch (err: any) {
+      console.error('PatientPortal payment error:', err);
+      setPayError(err?.message || 'Could not start the payment. Please contact the lab.');
+    } finally {
+      setPayingInvoiceId(null);
     }
   };
 
@@ -432,6 +491,46 @@ const PatientPortal: React.FC = () => {
                 </div>
               ))}
             </div>
+          </div>
+        )}
+
+        {/* Outstanding payments — self-service via the lab's payment gateway */}
+        {outstandingInvoices.length > 0 && (
+          <div className="bg-white rounded-xl shadow-sm border border-amber-200">
+            <div className="px-4 py-3 border-b border-amber-100 flex items-center gap-2">
+              <CreditCard className="h-4 w-4 text-amber-600" />
+              <h3 className="font-semibold text-gray-900">Pending Payments</h3>
+            </div>
+            <div className="divide-y divide-gray-100">
+              {outstandingInvoices.map((inv) => (
+                <div key={inv.invoice_id} className="px-4 py-3 flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="font-medium text-gray-900 truncate">
+                      {inv.invoice_number || `Invoice ${inv.invoice_id.slice(0, 8)}`}
+                    </p>
+                    <p className="text-xs text-gray-500">{formatDate(inv.invoice_date)}</p>
+                  </div>
+                  <div className="text-right shrink-0">
+                    <p className="font-bold text-gray-900">₹{Number(inv.balance).toFixed(2)}</p>
+                    <button
+                      onClick={() => handlePayInvoice(inv)}
+                      disabled={payingInvoiceId === inv.invoice_id}
+                      className="mt-1 inline-flex items-center gap-1.5 px-3 py-1.5 text-sm bg-teal-600 text-white rounded-lg hover:bg-teal-700 disabled:opacity-50"
+                    >
+                      {payingInvoiceId === inv.invoice_id ? (
+                        <Loader className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <CreditCard className="h-3.5 w-3.5" />
+                      )}
+                      Pay Now
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+            {payError && (
+              <p className="px-4 py-3 text-sm text-red-600 border-t border-red-100">{payError}</p>
+            )}
           </div>
         )}
 

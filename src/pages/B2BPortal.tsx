@@ -1,11 +1,15 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { LogOut, Download, Filter, Search, Calendar, RefreshCw, PlusCircle, X, Clock, User, Phone, Trash2, Printer, FileText, Wallet, CreditCard, Receipt, Loader2, CheckCircle, AlertCircle, BarChart3, Building2, ChevronLeft, ChevronRight, Megaphone, Image as ImageIcon } from 'lucide-react';
+import { LogOut, Download, Filter, Search, Calendar, RefreshCw, PlusCircle, X, Clock, User, Phone, Trash2, Printer, FileText, Wallet, CreditCard, Receipt, Loader2, CheckCircle, AlertCircle, BarChart3, Building2, ChevronLeft, ChevronRight, ChevronDown, Megaphone, MessageSquare, Package, Image as ImageIcon } from 'lucide-react';
 import { supabase } from '../utils/supabase';
 import { getCurrentB2BAccount } from '../utils/b2bAuth';
 import B2BBookingModal from '../components/B2B/B2BBookingModal';
 import B2BResultAnalysisModal from '../components/B2B/B2BResultAnalysisModal';
 import AccountInfoCard from '../components/B2B/AccountInfoCard';
+import PartnerChatPanel from '../components/B2B/PartnerChatPanel';
+import MaterialRequestPanel from '../components/B2B/MaterialRequestPanel';
+import { fetchAccountUnreadCount } from '../utils/partnerCommsService';
+import { computeAvailableCredit, fetchReceiptCreditTotal } from '../utils/accountCredit';
 import { format } from 'date-fns';
 import type { InitiatePaymentResponse } from '../types/payment';
 
@@ -170,6 +174,8 @@ const B2BPortal: React.FC = () => {
     const [cancellingBooking, setCancellingBooking] = useState<string | null>(null);
     const [payments, setPayments] = useState<PaymentAttempt[]>([]);
     const [paymentCreditTotal, setPaymentCreditTotal] = useState(0);
+    // Cash / cheque / bank payments recorded by the lab from Account Master
+    const [manualCreditTotal, setManualCreditTotal] = useState(0);
     const [invoices, setInvoices] = useState<ConsolidatedInvoice[]>([]);
     const [outstandingInvoiceAmount, setOutstandingInvoiceAmount] = useState(0);
     const [topUpAmount, setTopUpAmount] = useState('');
@@ -184,6 +190,10 @@ const B2BPortal: React.FC = () => {
     const [labInfo, setLabInfo] = useState<{ name: string; logo: string | null; portalSettings: PortalSettings } | null>(null);
     const [activeUpdateIndex, setActiveUpdateIndex] = useState(0);
     const [activeAnnouncementIndex, setActiveAnnouncementIndex] = useState(0);
+    // Support sections stay collapsed so reports and billing keep the top of the page
+    const [showChatSection, setShowChatSection] = useState(false);
+    const [showMaterialSection, setShowMaterialSection] = useState(false);
+    const [chatUnreadCount, setChatUnreadCount] = useState(0);
 
     // Load account and orders
     useEffect(() => {
@@ -328,6 +338,8 @@ const B2BPortal: React.FC = () => {
                 setPaymentCreditTotal(totalCredit);
             }
 
+            setManualCreditTotal(await fetchReceiptCreditTotal(accountData.id));
+
             const { data: invoicesData, error: invoicesError } = await supabase
                 .from('consolidated_invoices')
                 .select('id, invoice_number, billing_period_start, billing_period_end, total_amount, status, due_date, pdf_url, paid_at, created_at')
@@ -361,6 +373,8 @@ const B2BPortal: React.FC = () => {
                     }, 0);
                 setOutstandingInvoiceAmount(totalOutstanding);
             }
+
+            setChatUnreadCount(await fetchAccountUnreadCount(accountData.id));
         } catch (error) {
             console.error('Error loading data:', error);
             alert('An error occurred while loading data');
@@ -675,9 +689,15 @@ const B2BPortal: React.FC = () => {
     const pendingBookingAmount = pendingBookings.reduce((sum, booking) => sum + getBookingAmount(booking), 0);
     const creditLimit = Number(account?.credit_limit || 0);
     const storedCreditUsed = Number(account?.credit_used || 0);
-    const liveCreditUsed = Math.max(0, outstandingInvoiceAmount + openOrderAmount + pendingBookingAmount - paymentCreditTotal);
-    const effectiveCreditUsed = Math.max(storedCreditUsed, liveCreditUsed);
-    const availableCredit = creditLimit - effectiveCreditUsed;
+    const { effectiveCreditUsed, availableCredit } = computeAvailableCredit({
+        creditLimit,
+        storedCreditUsed,
+        openOrderAmount,
+        outstandingInvoiceAmount,
+        pendingBookingAmount,
+        gatewayPaymentCredit: paymentCreditTotal,
+        manualPaymentCredit: manualCreditTotal,
+    });
     const isCreditBlocked = availableCredit < 0;
     const suggestedTopUpAmount = Math.max(1, Math.ceil(creditLimit > 0 ? creditLimit * 2 : effectiveCreditUsed));
 
@@ -702,7 +722,7 @@ const B2BPortal: React.FC = () => {
         <div className="min-h-screen bg-gray-50">
             {/* Header */}
             <header className="bg-white shadow-sm border-b border-gray-200">
-                <div className="px-4 sm:px-6 lg:px-8 py-3">
+                <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3">
                     <div className="flex items-center justify-between">
                         {/* Lab Info Section - Centered */}
                         <div className="flex items-center gap-3">
@@ -812,7 +832,10 @@ const B2BPortal: React.FC = () => {
                                 Account credit is overdue. New bookings and report downloads are disabled until payment is received.
                             </div>
                         )}
+                    </div>
 
+                    {/* Full-width row: bookings + orders table */}
+                    <div className="space-y-6 min-w-0 lg:col-span-2 lg:row-start-2">
                         {/* Pending Bookings Section */}
                 {pendingBookings.length > 0 && (
                     <div className="bg-yellow-50 rounded-lg shadow-md border border-yellow-200">
@@ -1128,7 +1151,7 @@ const B2BPortal: React.FC = () => {
                 </div>
                     </div>
 
-                    <div className="space-y-6">
+                    <div className="space-y-6 min-w-0 lg:col-start-2 lg:row-start-1">
                         <div className="bg-white rounded-lg shadow-md border border-gray-200 p-6">
                             <h2 className="text-lg font-bold text-gray-900">Create Booking</h2>
                             <p className="mt-1 text-sm text-gray-500">Start a new sample booking for your patients.</p>
@@ -1295,6 +1318,12 @@ const B2BPortal: React.FC = () => {
                                         <span className="text-sm text-gray-500">Payments Applied</span>
                                         <span className="font-semibold text-green-600">-{formatCurrency(paymentCreditTotal)}</span>
                                     </div>
+                                    {manualCreditTotal > 0 && (
+                                        <div className="flex items-center justify-between">
+                                            <span className="text-sm text-gray-500">Payments Received at Lab</span>
+                                            <span className="font-semibold text-green-600">-{formatCurrency(manualCreditTotal)}</span>
+                                        </div>
+                                    )}
                                     <div className="pt-3 border-t border-gray-200 flex items-center justify-between">
                                         <span className="text-sm font-medium text-gray-700">Available Credit</span>
                                         <span className={`text-xl font-bold ${availableCredit >= 0 ? 'text-green-600' : 'text-red-600'}`}>
@@ -1415,6 +1444,87 @@ const B2BPortal: React.FC = () => {
                                     </tbody>
                                 </table>
                             </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* Support sections - collapsed by default, below reports and billing */}
+                {account && (
+                    <div className="mt-6 space-y-4">
+                        <div className="bg-white rounded-lg shadow-md border border-gray-200 overflow-hidden">
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    setShowChatSection((current) => {
+                                        if (!current) setChatUnreadCount(0);
+                                        return !current;
+                                    });
+                                }}
+                                className="flex w-full items-center justify-between px-6 py-4 text-left hover:bg-gray-50"
+                            >
+                                <div className="flex items-center gap-3">
+                                    <div className="h-10 w-10 rounded-lg bg-blue-50 flex items-center justify-center">
+                                        <MessageSquare className="h-5 w-5 text-blue-600" />
+                                    </div>
+                                    <div>
+                                        <h2 className="text-lg font-bold text-gray-900 flex items-center gap-2">
+                                            Chat with the Lab
+                                            {chatUnreadCount > 0 && (
+                                                <span className="rounded-full bg-red-500 px-2 py-0.5 text-xs font-semibold text-white">
+                                                    {chatUnreadCount} new
+                                                </span>
+                                            )}
+                                        </h2>
+                                        <p className="text-sm text-gray-500">
+                                            Ask questions and share clinical history or documents
+                                        </p>
+                                    </div>
+                                </div>
+                                <ChevronDown
+                                    className={`h-5 w-5 text-gray-400 transition-transform ${showChatSection ? 'rotate-180' : ''}`}
+                                />
+                            </button>
+                            {showChatSection && (
+                                <div className="border-t border-gray-100 bg-gray-50 p-4">
+                                    <PartnerChatPanel
+                                        accountId={account.id}
+                                        labId={account.lab_id}
+                                        counterpartyName={labInfo?.name || 'the lab'}
+                                    />
+                                </div>
+                            )}
+                        </div>
+
+                        <div className="bg-white rounded-lg shadow-md border border-gray-200 overflow-hidden">
+                            <button
+                                type="button"
+                                onClick={() => setShowMaterialSection((current) => !current)}
+                                className="flex w-full items-center justify-between px-6 py-4 text-left hover:bg-gray-50"
+                            >
+                                <div className="flex items-center gap-3">
+                                    <div className="h-10 w-10 rounded-lg bg-emerald-50 flex items-center justify-center">
+                                        <Package className="h-5 w-5 text-emerald-600" />
+                                    </div>
+                                    <div>
+                                        <h2 className="text-lg font-bold text-gray-900">Material Requests</h2>
+                                        <p className="text-sm text-gray-500">
+                                            Request vacutainers, containers, and other supplies from the lab
+                                        </p>
+                                    </div>
+                                </div>
+                                <ChevronDown
+                                    className={`h-5 w-5 text-gray-400 transition-transform ${showMaterialSection ? 'rotate-180' : ''}`}
+                                />
+                            </button>
+                            {showMaterialSection && (
+                                <div className="border-t border-gray-100 bg-gray-50 p-4">
+                                    <MaterialRequestPanel
+                                        accountId={account.id}
+                                        labId={account.lab_id}
+                                        mode="account"
+                                    />
+                                </div>
+                            )}
                         </div>
                     </div>
                 )}

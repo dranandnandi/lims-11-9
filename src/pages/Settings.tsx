@@ -164,10 +164,14 @@ interface LabSettings {
 	    testNameAlignment?: 'left' | 'center' | 'right';
 	    boldAllValues?: boolean;
 	    boldAbnormalValues?: boolean;
+	    patientInfoBold?: boolean;
+	    patientInfoColumnDivider?: boolean;
+	    underlineAbnormalValues?: boolean;
 	    calcMarker?: 'asterisk' | 'cal' | 'none';
 	    sectionHeaderInline?: boolean;
 	    flagSymbol?: 'none' | 'before' | 'after';
 	    showFlagLegend?: boolean;
+	    flagGapPx?: number;
 	    testGroupTitlePosition?: 'below_headers' | 'above_headers_center' | 'above_headers_left';
 	    qrHorizontalOffset?: number;
 	    qrPosition?: 'bottom_left' | 'top_left' | 'top_right' | 'header_right';
@@ -2303,7 +2307,7 @@ const Settings: React.FC = () => {
                         <label className="flex items-center gap-2 cursor-pointer">
                           <input
                             type="checkbox"
-                            checked={labSettings.print_options?.boldAllValues !== false}
+                            checked={labSettings.print_options?.boldAllValues === true}
                             onChange={(e) => setLabSettings(prev => prev ? { ...prev, print_options: { ...(prev.print_options || {}), boldAllValues: e.target.checked } } : prev)}
                             className="h-4 w-4 text-indigo-600 border-gray-300 rounded"
                           />
@@ -2323,6 +2327,19 @@ const Settings: React.FC = () => {
                           <div>
                             <span className="text-sm font-medium text-gray-700">Bold Abnormal Values</span>
                             <p className="text-xs text-gray-400">Extra bold for high/low values in result table.</p>
+                          </div>
+                        </label>
+                        {/* Underline Abnormal Values */}
+                        <label className="flex items-center gap-2 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={labSettings.print_options?.underlineAbnormalValues === true}
+                            onChange={(e) => setLabSettings(prev => prev ? { ...prev, print_options: { ...(prev.print_options || {}), underlineAbnormalValues: e.target.checked } } : prev)}
+                            className="h-4 w-4 text-indigo-600 border-gray-300 rounded"
+                          />
+                          <div>
+                            <span className="text-sm font-medium text-gray-700">Underline Abnormal Values</span>
+                            <p className="text-xs text-gray-400">Underline high/low/critical values in result table.</p>
                           </div>
                         </label>
                         {/* Alternate Row Shading */}
@@ -2436,6 +2453,34 @@ const Settings: React.FC = () => {
                           </button>
                         )}
                       </div>
+
+                      {/* Bold patient values — stored in print_options so print and e-copy share it */}
+                      <label className="flex items-center gap-2 cursor-pointer mb-4">
+                        <input
+                          type="checkbox"
+                          checked={labSettings.print_options?.patientInfoBold === true}
+                          onChange={(e) => setLabSettings(prev => prev ? { ...prev, print_options: { ...(prev.print_options || {}), patientInfoBold: e.target.checked } } : prev)}
+                          className="h-4 w-4 text-indigo-600 border-gray-300 rounded"
+                        />
+                        <div>
+                          <span className="text-sm font-medium text-gray-700">Bold Patient Info Values</span>
+                          <p className="text-xs text-gray-400">Bold the values (name, age/sex, ref. doctor). Field labels are always bold. Applies to both print and e-copy.</p>
+                        </div>
+                      </label>
+
+                      {/* Vertical rule between the two patient info columns */}
+                      <label className="flex items-center gap-2 cursor-pointer mb-4">
+                        <input
+                          type="checkbox"
+                          checked={labSettings.print_options?.patientInfoColumnDivider === true}
+                          onChange={(e) => setLabSettings(prev => prev ? { ...prev, print_options: { ...(prev.print_options || {}), patientInfoColumnDivider: e.target.checked } } : prev)}
+                          className="h-4 w-4 text-indigo-600 border-gray-300 rounded"
+                        />
+                        <div>
+                          <span className="text-sm font-medium text-gray-700">Line Between Patient Info Columns</span>
+                          <p className="text-xs text-gray-400">Draws a vertical line separating the left and right patient info columns. Off by default. Applies to both print and e-copy.</p>
+                        </div>
+                      </label>
 
                       {/* Field selection */}
                       <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">

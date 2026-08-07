@@ -7,8 +7,11 @@ export interface BasicPrintOptions {
   flagAsteriskCritical?: boolean;
   testNameBold?: boolean;          // default false
   testNameAlignment?: 'left' | 'center' | 'right'; // default 'left'
-  boldAllValues?: boolean;         // default true — all values font-weight 600; false = normal weight
+  boldAllValues?: boolean;         // default false — all values font-weight 600; false = normal weight
   boldAbnormalValues?: boolean;    // default true — extra bold (700) for high/low; false = no extra bold
+  patientInfoBold?: boolean;       // default false — bold the patient info block values (labels are always bold)
+  patientInfoColumnDivider?: boolean; // default false — vertical rule between the left and right patient info columns
+  underlineAbnormalValues?: boolean; // default false — underline high/low/critical/abnormal values
   calcMarker?: 'asterisk' | 'cal' | 'none'; // default 'cal'
   defaultDecimalPlaces?: number | null; // lab-wide result precision (0-4); undefined = as entered, per-analyte setting overrides
   padDecimals?: boolean;           // default false — true keeps trailing zeros (12.3 prints as 12.30)
@@ -16,6 +19,7 @@ export interface BasicPrintOptions {
   sectionHeaderInline?: boolean;   // default true = inline shaded row; false = small-caps label
   flagSymbol?: 'none' | 'before' | 'after'; // default 'none'; 'before' = flag prefix inside result; 'after' = inline flag suffix
   showFlagLegend?: boolean;        // show H=High, L=Low legend below each group table
+  flagGapPx?: number;              // gap in px between H/L symbol and the value (0-12, default 4)
   resultColors?: { high?: string; low?: string; enabled?: boolean }; // custom flag colors (matches edge fn)
   testGroupTitlePosition?: 'below_headers' | 'above_headers_center' | 'above_headers_left';
   qrPosition?: 'bottom_left' | 'top_left' | 'top_right' | 'header_right';
@@ -158,9 +162,13 @@ function buildBasicHtml(
   const calcMarker = printOptions.calcMarker ?? 'cal';
   const boldAllValues = printOptions.boldAllValues ?? false;
   const boldAbnormal = printOptions.boldAbnormalValues ?? true;
+  const patientInfoBold = printOptions.patientInfoBold ?? false;
+  const patientInfoColumnDivider = printOptions.patientInfoColumnDivider ?? false;
+  const underlineAbnormal = printOptions.underlineAbnormalValues ?? false;
   const sectionHeaderInline = printOptions.sectionHeaderInline ?? true;
   const flagSymbol = printOptions.flagSymbol ?? 'none';
   const showFlagLegend = printOptions.showFlagLegend ?? false;
+  const flagGapPx = Math.max(0, Math.min(12, Number(printOptions.flagGapPx ?? 4)));
   const testGroupTitlePosition = printOptions.testGroupTitlePosition ?? 'above_headers_center';
   const qrPosition = printOptions.qrPosition ?? 'bottom_left';
   const qrHorizontalOffset = Math.max(0, Math.min(80, printOptions.qrHorizontalOffset ?? 0));
@@ -278,11 +286,24 @@ function buildBasicHtml(
   color: #111 !important;
   word-break: break-word !important;
   font-size: ${basePx}px !important;
+  font-weight: ${patientInfoBold ? '700' : 'normal'} !important;
 }
 
 .basic-report-template .patient-header-table th {
   font-size: ${basePx}px !important;
 }
+${patientInfoColumnDivider ? `
+/* Vertical rule between the left and right patient info columns.
+   Cell 2 of every row is the last cell of the left column pair. */
+.basic-report-template .patient-header-table tr > *:nth-child(2) {
+  border-right: 1px solid #000 !important;
+  padding-right: 8px !important;
+}
+
+.basic-report-template .patient-header-table tr > *:nth-child(3) {
+  padding-left: 8px !important;
+}
+` : ''}
 
 .basic-report-template .tbl-results {
   width: 100% !important;
@@ -368,6 +389,7 @@ function buildBasicHtml(
 .basic-report-template .val.High {
   color: ${highColor} !important;
   ${boldAbnormal ? 'font-weight: 700 !important;' : ''}
+  ${underlineAbnormal ? 'text-decoration: underline !important; text-underline-offset: 2px !important;' : ''}
 }
 
 .basic-report-template .val.low,
@@ -378,6 +400,7 @@ function buildBasicHtml(
 .basic-report-template .val.Low {
   color: ${lowColor} !important;
   ${boldAbnormal ? 'font-weight: 700 !important;' : ''}
+  ${underlineAbnormal ? 'text-decoration: underline !important; text-underline-offset: 2px !important;' : ''}
 }
 
 .basic-report-template .main-group-row td { padding: 0 !important; border: none !important; }
@@ -434,7 +457,11 @@ function buildBasicHtml(
   text-decoration: underline !important;
 }
 
-.basic-report-template .tbl-results .qualitative-wide-value {
+/* Must out-specify the "td:nth-child(2)" column rules above, otherwise the
+   colspan'd qualitative value inherits their right-align and drifts to the
+   far edge of the merged cell. */
+.basic-report-template .tbl-results tbody tr td.qualitative-wide-value,
+.basic-report-template .tbl-results.has-sibling tbody tr.sibling-data-row td.qualitative-wide-value {
   width: ${formatBasicWidth(standardColumnWidths.slice(1).reduce((sum, width) => sum + width, 0))} !important;
   text-align: left !important;
   white-space: normal !important;
@@ -781,9 +808,9 @@ function buildBasicHtml(
         })();
 
         const displayValue = flagSymbol === 'before' && flagSymbolText
-          ? `<span style="display:inline-block;min-width:${basePx * 1.15}px;text-align:center;font-weight:700;margin-right:4px;">${flagSymbolText}</span>${value + asteriskSuffix}`
+          ? `<span style="display:inline-block;font-weight:700;margin-right:${flagGapPx}px;">${flagSymbolText}</span>${value + asteriskSuffix}`
           : flagSymbol === 'after' && flagSymbolText
-          ? `${value + asteriskSuffix} <span style="font-weight:700;">${flagSymbolText}</span>`
+          ? `${value + asteriskSuffix}<span style="display:inline-block;font-weight:700;margin-left:${flagGapPx}px;">${flagSymbolText}</span>`
           : value + asteriskSuffix;
 
         if (isDescriptive) {
@@ -1054,6 +1081,15 @@ export default function BasicTemplateFormatBuilder({ printOptions, showMethodolo
           <Row label="Bold Abnormal Values" hint="Extra bold for high/low values (off = normal weight)">
             <Toggle checked={printOptions.boldAbnormalValues ?? true} onChange={(v) => setPO({ boldAbnormalValues: v })} />
           </Row>
+          <Row label="Underline Abnormal Values" hint="Underline high/low/critical values in the result column">
+            <Toggle checked={printOptions.underlineAbnormalValues ?? false} onChange={(v) => setPO({ underlineAbnormalValues: v })} />
+          </Row>
+          <Row label="Bold Patient Info" hint="Bold the patient information values (name, age/sex, ref. doctor). Applies to both print and e-copy.">
+            <Toggle checked={printOptions.patientInfoBold ?? false} onChange={(v) => setPO({ patientInfoBold: v })} />
+          </Row>
+          <Row label="Patient Info Column Line" hint="Vertical line between the left and right patient info columns. Off by default.">
+            <Toggle checked={printOptions.patientInfoColumnDivider ?? false} onChange={(v) => setPO({ patientInfoColumnDivider: v })} />
+          </Row>
           <Row label="Calculated Marker" hint="How to mark auto-calculated fields">
             <select
               value={printOptions.calcMarker ?? 'cal'}
@@ -1318,6 +1354,20 @@ export default function BasicTemplateFormatBuilder({ printOptions, showMethodolo
               <option value="before">Before value</option>
               <option value="after">After value (inline)</option>
             </select>
+          </Row>
+          <Row label="Flag Spacing" hint="Gap between H/L symbol and value (0-12 px)">
+            <div className="flex items-center gap-2">
+              <input
+                type="range" min={0} max={12} step={1}
+                value={printOptions.flagGapPx ?? 4}
+                disabled={(printOptions.flagSymbol ?? 'none') === 'none'}
+                onChange={(e) => setPO({ flagGapPx: Number(e.target.value) })}
+                className="w-24 accent-indigo-600 disabled:opacity-40"
+              />
+              <span className="w-10 text-sm font-mono font-semibold text-gray-700">
+                {printOptions.flagGapPx ?? 4}
+              </span>
+            </div>
           </Row>
           <Row label="Flag Legend" hint="H=High, L=Low legend below table">
             <Toggle

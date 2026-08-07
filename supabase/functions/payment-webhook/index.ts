@@ -218,6 +218,20 @@ async function handleCCAvenueWebhook(req: Request, supabase: ReturnType<typeof c
     );
   }
 
+  // The key-matching loop above walks every lab's CCAvenue gateway, so confirm
+  // the key that decrypted this payload actually belongs to the paying lab.
+  if (matchedGateway.lab_id !== paymentAttempt.lab_id) {
+    console.error('[PAYMENT-WEBHOOK] Gateway/lab mismatch', {
+      gateway_lab: matchedGateway.lab_id,
+      attempt_lab: paymentAttempt.lab_id,
+      order_id: gatewayOrderId
+    });
+    return new Response(
+      JSON.stringify({ status: 'error', message: 'Gateway does not belong to this payment' }),
+      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
+  }
+
   // Handle different event types
   if (eventType === 'refund') {
     await handleRefund(supabase, paymentAttempt, decryptedResponse);
@@ -294,9 +308,19 @@ async function handlePaymentNotification(
     })
     .eq('id', paymentAttempt.id);
 
-  // If successful and credit not yet applied, apply it
+  // If successful and not yet settled, settle it
   if (status === 'success' && !paymentAttempt.credit_applied) {
-    await applyPaymentCredit(supabase, paymentAttempt, amount, 'ccavenue', trackingId);
+    await settleSuccessfulPayment(supabase, paymentAttempt, amount, 'ccavenue', trackingId);
+  }
+
+  // Mirror a terminal failure onto the patient's pay link so the counter screen
+  // and the /pay page both stop showing "awaiting payment".
+  if (paymentAttempt.payer_type === 'patient' && status !== 'success') {
+    await supabase
+      .from('payment_links')
+      .update({ status: status === 'cancelled' ? 'active' : 'failed' })
+      .eq('payment_attempt_id', paymentAttempt.id as string)
+      .neq('status', 'paid');
   }
 }
 
@@ -486,7 +510,7 @@ async function handleRazorpayWebhook(req: Request, supabase: ReturnType<typeof c
     }).eq('id', paymentAttempt.id);
 
     if (!paymentAttempt.credit_applied) {
-      await applyPaymentCredit(supabase, paymentAttempt, amount, 'razorpay', payment.id);
+      await settleSuccessfulPayment(supabase, paymentAttempt, amount, 'razorpay', payment.id);
     }
   } else if (eventType === 'payment.failed') {
     await supabase.from('b2b_payment_attempts').update({
@@ -524,6 +548,38 @@ async function handleRazorpayWebhook(req: Request, supabase: ReturnType<typeof c
     JSON.stringify({ status: 'ok' }),
     { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
   );
+}
+
+// Route a successful payment to the right settlement path.
+// B2B account payments become credit-ledger entries; patient payments become a
+// real `payments` row against the invoice (see settle_patient_payment()).
+async function settleSuccessfulPayment(
+  supabase: ReturnType<typeof createClient>,
+  paymentAttempt: Record<string, unknown>,
+  amount: number,
+  provider: string,
+  transactionId: string
+) {
+  if (paymentAttempt.payer_type === 'patient') {
+    const { data, error } = await supabase.rpc('settle_patient_payment', {
+      p_attempt_id: paymentAttempt.id
+    });
+
+    if (error) {
+      console.error('[PAYMENT-WEBHOOK] Failed to settle patient payment:', error);
+      return;
+    }
+
+    console.log('[PAYMENT-WEBHOOK] Patient payment settled:', {
+      payment_attempt_id: paymentAttempt.id,
+      payments_row: data,
+      provider,
+      transactionId
+    });
+    return;
+  }
+
+  await applyPaymentCredit(supabase, paymentAttempt, amount, provider, transactionId);
 }
 
 // Apply payment credit to account

@@ -2,6 +2,19 @@ import React from 'react';
 import { X, Layers, TestTube, DollarSign, Clock, Settings, Edit, Beaker } from 'lucide-react';
 import { SampleTypeIndicator } from '../Common/SampleTypeIndicator';
 
+// The lab_analytes row a test group is actually linked to (via
+// test_group_analytes.lab_analyte_id). This is the source of truth for the
+// unit/range shown on the report — the same global analyte can have several
+// lab_analytes rows (one per sample type) with different units and ranges.
+interface LinkedLabAnalyte {
+  id: string;
+  name?: string | null;
+  unit?: string | null;
+  reference_range?: string | null;
+  lab_specific_reference_range?: string | null;
+  sample_type?: string | null;
+}
+
 interface TestGroup {
   id: string;
   name: string;
@@ -12,6 +25,8 @@ interface TestGroup {
   analytes: string[];
   analyteDisplay?: Array<{
     analyte_id: string;
+    lab_analyte_id?: string | null;
+    lab_analytes?: LinkedLabAnalyte | LinkedLabAnalyte[] | null;
     sort_order?: number | null;
     display_order?: number | null;
     section_heading?: string | null;
@@ -26,6 +41,7 @@ interface TestGroup {
 
 interface Analyte {
   id: string;
+  lab_analyte_id?: string;
   name: string;
   unit: string;
   referenceRange: string;
@@ -56,6 +72,16 @@ const TestGroupDetailModal: React.FC<TestGroupDetailModalProps> = ({ testGroup, 
   const displayByAnalyteId = new Map(
     (testGroup.analyteDisplay || []).map((item) => [item.analyte_id, item])
   );
+  // Supabase returns a to-one embed as an object, but older responses use an array.
+  const linkedLabAnalyte = (analyteId: string): LinkedLabAnalyte | null => {
+    const embedded = displayByAnalyteId.get(analyteId)?.lab_analytes;
+    if (Array.isArray(embedded)) return embedded[0] ?? null;
+    return embedded ?? null;
+  };
+  const availableLabAnalyteIds = new Set(
+    analytes.map((analyte) => analyte.lab_analyte_id).filter(Boolean) as string[]
+  );
+
   const seenAnalyteIds = new Set<string>();
   const includedAnalytes = analytes
     .filter(analyte => {
@@ -63,21 +89,38 @@ const TestGroupDetailModal: React.FC<TestGroupDetailModalProps> = ({ testGroup, 
         return false;
       }
       // The master analyte list has one entry per lab_analytes row, so the same
-      // global analyte id can appear multiple times (e.g. multiple sample types).
-      // Keep only the first occurrence to avoid rendering duplicate rows.
+      // global analyte id can appear multiple times (e.g. one row per sample
+      // type) with different units and reference ranges. Keep the row this test
+      // group is actually linked to — matching on the global id alone would pick
+      // an arbitrary sibling row and show a range the group never uses.
+      const linkedId = displayByAnalyteId.get(analyte.id)?.lab_analyte_id;
+      if (linkedId && analyte.lab_analyte_id !== linkedId && availableLabAnalyteIds.has(linkedId)) {
+        return false;
+      }
       if (seenAnalyteIds.has(analyte.id)) return false;
       seenAnalyteIds.add(analyte.id);
       return true;
     })
-    .map((analyte, originalIndex) => ({
-      ...analyte,
-      sectionHeading: displayByAnalyteId.get(analyte.id)?.section_heading || null,
-      displayOrder:
-        displayByAnalyteId.get(analyte.id)?.sort_order ??
-        displayByAnalyteId.get(analyte.id)?.display_order ??
-        Number.MAX_SAFE_INTEGER,
-      originalIndex,
-    }))
+    .map((analyte, originalIndex) => {
+      // Prefer the embedded lab_analytes row: it stays correct even when the
+      // linked row is hidden from the master list (inactive or not visible).
+      const linked = linkedLabAnalyte(analyte.id);
+      return {
+        ...analyte,
+        name: linked?.name || analyte.name,
+        unit: linked?.unit || analyte.unit,
+        referenceRange:
+          linked?.lab_specific_reference_range ??
+          linked?.reference_range ??
+          analyte.referenceRange,
+        sectionHeading: displayByAnalyteId.get(analyte.id)?.section_heading || null,
+        displayOrder:
+          displayByAnalyteId.get(analyte.id)?.sort_order ??
+          displayByAnalyteId.get(analyte.id)?.display_order ??
+          Number.MAX_SAFE_INTEGER,
+        originalIndex,
+      };
+    })
     .sort((a, b) => a.displayOrder - b.displayOrder || a.originalIndex - b.originalIndex);
 
   return (

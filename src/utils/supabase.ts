@@ -70,6 +70,22 @@ const getDailySequenceFromOrder = (order: any): number => {
   return Number.isFinite(parsed) ? parsed : 0;
 };
 
+// Strips package_test_groups rows whose test group has since been deactivated.
+// The package editor only lists active groups, so a deactivated link is
+// invisible there yet would still be re-saved and expanded into new orders.
+const dropInactivePackageLinks = <T,>(pkg: T): T => {
+  const clean = (p: any) => {
+    if (!p || !Array.isArray(p.package_test_groups)) return p;
+    return {
+      ...p,
+      package_test_groups: p.package_test_groups.filter(
+        (ptg: any) => ptg?.test_groups && ptg.test_groups.is_active !== false,
+      ),
+    };
+  };
+  return (Array.isArray(pkg) ? pkg.map(clean) : clean(pkg)) as T;
+};
+
 const normalizeActiveReportPriority = (priority: unknown): number => {
   const numeric = Number(priority);
   return Number.isFinite(numeric) && numeric > 0 ? numeric : Number.MAX_SAFE_INTEGER;
@@ -3623,7 +3639,7 @@ export const database = {
                   name,
                   package_test_groups(
                     test_group_id,
-                    test_groups(id, name)
+                    test_groups(id, name, is_active)
                   )
                 `)
                 .in("id", packageIds);
@@ -3647,7 +3663,8 @@ export const database = {
                 );
                 if (pkgDetails?.package_test_groups) {
                   pkgDetails.package_test_groups.forEach((ptg: any) => {
-                    if (ptg.test_groups) {
+                    // Skip test groups deactivated after they were linked
+                    if (ptg.test_groups && ptg.test_groups.is_active !== false) {
                       orderTestsData.push({
                         order_id: updatedOrder.id,
                         test_name: ptg.test_groups.name,
@@ -5711,7 +5728,7 @@ export const database = {
 
       const { data: ordersData, error: ordersError } = await supabase
         .from('orders')
-        .select('id, order_date, order_number, patient_name, doctor, total_amount, final_amount, created_by')
+        .select('id, order_date, order_number, patient_name, doctor, total_amount, final_amount, created_by, patient_id, patients:patient_id(phone)')
         .eq('lab_id', lab_id)
         .gte('order_date', fromDate)
         .lte('order_date', `${toDate}T23:59:59.999Z`)
@@ -7958,6 +7975,10 @@ export const database = {
     },
   },
 
+  // Reads here run through dropInactivePackageLinks: a package keeps its
+  // package_test_groups row when a test group is later deactivated, and that
+  // link is invisible in the package editor (which lists only active groups)
+  // yet would still be re-saved and expanded into new orders.
   packages: {
     getAll: async () => {
       const lab_id = await database.getCurrentUserLabId();
@@ -7985,14 +8006,15 @@ export const database = {
               name,
               code,
               category,
-              price
+              price,
+              is_active
             )
           )
         `)
         .eq("lab_id", lab_id)
         .eq("is_active", true)
         .order("name");
-      return { data, error };
+      return { data: dropInactivePackageLinks(data), error };
     },
 
     getById: async (id: string) => {
@@ -8021,13 +8043,14 @@ export const database = {
               clinical_purpose,
               turnaround_time,
               sample_type,
-              requires_fasting
+              requires_fasting,
+              is_active
             )
           )
         `)
         .eq("id", id)
         .single();
-      return { data, error };
+      return { data: dropInactivePackageLinks(data), error };
     },
 
     create: async (packageData: any) => {
@@ -10338,51 +10361,32 @@ const masterDataAPI = {
       return { data, error };
     },
 
+    // Uses the shared credit model (open orders + unpaid bills + pending
+    // bookings, less gateway payments and cash receipted from Account Master),
+    // so the order form agrees with the B2B portal and the check-b2b-credit
+    // edge function. Imported lazily to keep this module free of import cycles.
     checkCreditLimit: async (id: string, orderAmount: number) => {
-      const { data: account, error } = await supabase
-        .from("accounts")
-        .select(`
-          *,
-          credit_transactions!account_id(
-            amount,
-            transaction_type,
-            created_at
-          )
-        `)
-        .eq("id", id)
-        .single();
+      const { fetchAccountCreditSummary } = await import("./accountCredit");
+      const summary = await fetchAccountCreditSummary(id);
 
-      if (error || !account) {
+      if (!summary) {
         return {
           allowed: false,
           currentBalance: 0,
           creditLimit: 0,
           availableCredit: 0,
           name: "",
-          error,
+          error: new Error("Could not load account credit position"),
         };
       }
 
-      // Calculate current credit balance
-      const creditTransactions = account.credit_transactions || [];
-      const totalCredits = creditTransactions
-        .filter((t: any) => t.transaction_type === "credit")
-        .reduce((sum: number, t: any) => sum + parseFloat(t.amount), 0);
-      const totalDebits = creditTransactions
-        .filter((t: any) => t.transaction_type === "debit")
-        .reduce((sum: number, t: any) => sum + parseFloat(t.amount), 0);
-
-      const currentBalance = totalCredits - totalDebits;
-      const creditLimit = account.credit_limit || 0;
-      const availableCredit = creditLimit - currentBalance;
-      const allowed = orderAmount <= availableCredit;
-
       return {
-        allowed,
-        currentBalance,
-        creditLimit,
-        availableCredit,
-        name: account.name,
+        allowed: orderAmount <= summary.availableCredit,
+        currentBalance: summary.effectiveCreditUsed,
+        creditLimit: summary.creditLimit,
+        availableCredit: summary.availableCredit,
+        manualPaymentCredit: summary.manualPaymentCredit,
+        name: summary.accountName,
         error: null,
       };
     },
@@ -15886,6 +15890,7 @@ export interface InventoryItem {
   unit_price?: number;
   supplier_name?: string;
   supplier_contact?: string;
+  is_partner_orderable?: boolean;
   ai_data?: Record<string, any>;
   is_active: boolean;
   notes?: string;

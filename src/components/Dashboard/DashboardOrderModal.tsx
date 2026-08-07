@@ -467,12 +467,17 @@ const DashboardOrderModal: React.FC<DashboardOrderModalProps> = ({
 
       if (item.type === 'package') {
         // --- PACKAGE ADD LOGIC ---
-        const { data: pkgGroups, error: pkgError } = await supabase
+        const { data: pkgRows, error: pkgError } = await supabase
           .from('package_test_groups')
           .select('test_group_id, test_groups(*)')
           .eq('package_id', item.id);
 
         if (pkgError) throw pkgError;
+
+        // Skip test groups deactivated after they were linked to the package
+        const pkgGroups = (pkgRows || []).filter(
+          (pg: any) => pg.test_groups && pg.test_groups.is_active !== false
+        );
 
         // 1. Insert Package Header (Billed Item)
         const { data: headerTest, error: headerError } = await supabase

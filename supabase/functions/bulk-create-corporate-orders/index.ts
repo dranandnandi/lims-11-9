@@ -407,18 +407,25 @@ Deno.serve(async (req) => {
     const allTestIds = dedupeIds([...allDirectTestIds, ...Array.from(packageMap.values()).flatMap((pkg) => pkg.testGroupIds)]);
     const { data: testGroupRows, error: testGroupRowsError } = await supabase
       .from('test_groups')
-      .select('id, name, price, sample_type, sample_color')
+      .select('id, name, price, sample_type, sample_color, is_active')
       .in('id', allTestIds);
     if (testGroupRowsError || !testGroupRows) throw new Error('Failed to fetch test groups');
 
     const testGroupMap = new Map<string, TestGroupMeta>();
-    testGroupRows.forEach((tg: any) => testGroupMap.set(tg.id, {
+    // Skip test groups deactivated after they were linked to a package
+    testGroupRows.filter((tg: any) => tg.is_active !== false).forEach((tg: any) => testGroupMap.set(tg.id, {
       id: tg.id,
       name: tg.name,
       price: Number(tg.price) || 0,
       sample_type: tg.sample_type ?? null,
       sample_color: tg.sample_color ?? null,
     }));
+
+    // A package keeps its link when a test group is deactivated; drop those so
+    // dead tests are not expanded into the orders created below.
+    packageMap.forEach((pkg) => {
+      pkg.testGroupIds = pkg.testGroupIds.filter((id) => testGroupMap.has(id));
+    });
 
     const { data: accountPrices } = allTestIds.length > 0
       ? await supabase.from('account_prices').select('test_group_id, price').eq('account_id', body.account_id).in('test_group_id', allTestIds).eq('is_active', true)

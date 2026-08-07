@@ -59,7 +59,18 @@ const PackageForm: React.FC<PackageFormProps> = ({ onClose, onSubmit, package: p
           console.error('Error loading test groups:', error);
           setTestGroups([]);
         } else {
-          setTestGroups(data || []);
+          const groups = data || [];
+          setTestGroups(groups);
+          // Drop any pre-selected id that isn't in the (active-only) catalog.
+          // Such an id would be invisible in this form yet still get re-saved,
+          // silently re-linking a deactivated test group to the package.
+          const selectable = new Set(groups.map((g: TestGroup) => g.id));
+          setFormData(prev => {
+            const kept = prev.selectedTestGroups.filter((id: string) => selectable.has(id));
+            return kept.length === prev.selectedTestGroups.length
+              ? prev
+              : { ...prev, selectedTestGroups: kept };
+          });
         }
       } catch (err) {
         console.error('Failed to load test groups:', err);

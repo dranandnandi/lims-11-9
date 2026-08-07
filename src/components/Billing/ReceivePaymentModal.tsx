@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { X, Save } from 'lucide-react';
-import { database, supabase } from '../../utils/supabase';
+import { database } from '../../utils/supabase';
+import { recordAccountCashReceipt, AccountPaymentMode } from '../../utils/accountCredit';
 
 interface ReceivePaymentModalProps {
     accountId: string;
@@ -37,25 +38,20 @@ const ReceivePaymentModal: React.FC<ReceivePaymentModalProps> = ({
         setLoading(true);
         try {
             const paymentAmount = parseFloat(amount);
-            const labId = await database.getCurrentUserLabId();
 
-            // Keep account payments tied to the consolidated invoice so partial
-            // payments can be displayed against the correct B2B invoice.
-            const { error } = await supabase.from('credit_transactions').insert([{
-                account_id: accountId,
-                lab_id: labId,
+            // Single entry point shared with Account Master: writes the
+            // credit_transactions billing record AND the b2b_credit_ledger entry
+            // that frees the account's credit, in one transaction. Recording the
+            // payment in only one of the two is what used to double-count it.
+            await recordAccountCashReceipt({
+                accountId,
                 amount: paymentAmount,
-                transaction_type: 'payment',
-                payment_method: paymentMethod,
-                reference_number: reference,
-                reference_type: consolidatedInvoiceId ? 'consolidated_invoice' : 'account',
-                reference_id: consolidatedInvoiceId || accountId,
-                transaction_date: paymentDate,
-                notes: notes,
-                description: `Payment received via ${paymentMethod.toUpperCase()}`
-            }]);
-
-            if (error) throw error;
+                paymentMode: paymentMethod as AccountPaymentMode,
+                referenceNo: reference,
+                receivedOn: paymentDate,
+                remarks: notes,
+                consolidatedInvoiceId: consolidatedInvoiceId || null,
+            });
 
             // Consolidated B2B invoices are tracked in a separate table, so
             // we need an explicit status update when the payment is tied to one.
@@ -77,9 +73,9 @@ const ReceivePaymentModal: React.FC<ReceivePaymentModalProps> = ({
 
             onSuccess();
             onClose();
-        } catch (error) {
+        } catch (error: any) {
             console.error('Error recording payment:', error);
-            alert('Failed to record payment');
+            alert(error?.message || 'Failed to record payment');
         } finally {
             setLoading(false);
         }
