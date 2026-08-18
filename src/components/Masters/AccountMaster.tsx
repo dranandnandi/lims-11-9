@@ -1,12 +1,13 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, Search, Edit, Trash2, X, DollarSign, Lock, Unlock as LockOpen, Package, Eye, EyeOff, MessageSquare, Wallet } from 'lucide-react';
+import { Plus, Search, Edit, Trash2, X, DollarSign, Lock, Unlock as LockOpen, Package, Eye, EyeOff, MessageSquare, Wallet, ShieldCheck, ShieldOff, Inbox } from 'lucide-react';
 import { database, supabase } from '../../utils/supabase';
 import { getUserRoleCode } from '../../utils/permissions';
 import { createB2BAccountUser } from '../../utils/b2bAuth';
 import HeaderFooterUpload from '../Settings/HeaderFooterUpload';
 import AccountCreditModal from './AccountCreditModal';
 import PartnerDeskModal from '../B2B/PartnerDeskModal';
-import { fetchLabUnreadCounts, fetchOpenMaterialRequestCounts } from '../../utils/partnerCommsService';
+import PartnerInboxModal from '../B2B/PartnerInboxModal';
+import { fetchLabUnreadCounts, fetchOpenMaterialRequestCounts, subscribeToLabPartnerActivity } from '../../utils/partnerCommsService';
 
 // Reuse Doctor types or create Account specific types?
 // Let's define specific types here for simplicity and later move to types.ts
@@ -32,6 +33,11 @@ interface Account {
     locked_at?: string | null;
     locked_by?: string | null;
     lock_override_until?: string | null;
+    bypass_credit_check?: boolean | null;
+    credit_bypass_reason?: string | null;
+    credit_bypass_set_at?: string | null;
+    credit_bypass_set_by?: string | null;
+    credit_bypass_until?: string | null;
 }
 
 // An account is "effectively locked" when it's locked and any temporary open
@@ -41,6 +47,26 @@ const isAccountEffectivelyLocked = (account: Pick<Account, 'is_locked' | 'lock_o
     if (account.lock_override_until && new Date(account.lock_override_until).getTime() > Date.now()) return false;
     return true;
 };
+
+// The credit bypass may be time-limited the same way: on, but only until
+// credit_bypass_until. Past that the flag is still set yet counts for nothing,
+// which is what the badge below calls "expired". Mirrors isCreditCheckBypassed
+// in utils/accountCredit, the helper every credit gate actually goes through.
+const isCreditBypassActive = (account: Pick<Account, 'bypass_credit_check' | 'credit_bypass_until'>): boolean => {
+    if (account.bypass_credit_check !== true) return false;
+    if (account.credit_bypass_until && new Date(account.credit_bypass_until).getTime() <= Date.now()) return false;
+    return true;
+};
+
+// Presets offered wherever a bypass window is granted. null = no expiry.
+const CREDIT_BYPASS_WINDOWS: { hours: number | null; label: string }[] = [
+    { hours: 24, label: '24 hours' },
+    { hours: 48, label: '48 hours' },
+    { hours: 24 * 7, label: '7 days' },
+    { hours: null, label: 'until turned off' },
+];
+
+const hoursFromNow = (hours: number) => new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
 
 interface PriceMaster {
     id: string;
@@ -82,6 +108,7 @@ const initialFormData: Partial<Account> = {
     is_active: true,
     billing_mode: 'standard',
     price_master_id: null,
+    bypass_credit_check: false,
 };
 
 const initialPortalData = {
@@ -104,6 +131,9 @@ const buildAccountSavePayload = (data: Partial<Account>) => ({
     is_active: data.is_active ?? true,
     billing_mode: data.billing_mode || 'standard',
     price_master_id: data.price_master_id || null,
+    bypass_credit_check: data.bypass_credit_check === true,
+    credit_bypass_reason: data.bypass_credit_check === true ? ((data.credit_bypass_reason || '').trim() || null) : null,
+    credit_bypass_until: data.bypass_credit_check === true ? (data.credit_bypass_until || null) : null,
 });
 
 const AccountMaster: React.FC = () => {
@@ -125,6 +155,10 @@ const AccountMaster: React.FC = () => {
     const [lockModalAccount, setLockModalAccount] = useState<Account | null>(null);
     const [lockReason, setLockReason] = useState('');
     const [lockSubmitting, setLockSubmitting] = useState(false);
+
+    // Credit-bypass window — admin only, same submitting flag as the lock
+    const [bypassModalAccount, setBypassModalAccount] = useState<Account | null>(null);
+    const [bypassReason, setBypassReason] = useState('');
 
     // Stored portal credential (admin-only view; readable only by lab admins via RLS)
     const [storedCredential, setStoredCredential] = useState<{ email: string; password_text: string; updated_at: string } | null>(null);
@@ -148,8 +182,12 @@ const AccountMaster: React.FC = () => {
 
     // Partner desk (two-way chat + material requests)
     const [partnerDesk, setPartnerDesk] = useState<{ account: Account; tab: 'chat' | 'materials' } | null>(null);
+    const [showPartnerInbox, setShowPartnerInbox] = useState(false);
     const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
     const [openRequestCounts, setOpenRequestCounts] = useState<Record<string, number>>({});
+
+    const totalUnreadMessages = Object.values(unreadCounts).reduce((sum, count) => sum + count, 0);
+    const totalOpenRequests = Object.values(openRequestCounts).reduce((sum, count) => sum + count, 0);
 
     // Package Pricing State
     const [priceTab, setPriceTab] = useState<'tests' | 'packages'>('tests');
@@ -225,6 +263,22 @@ const AccountMaster: React.FC = () => {
         setUnreadCounts(unread);
         setOpenRequestCounts(openRequests);
     };
+
+    // Keep the inbox badge live while this screen is open (debounced, so a burst
+    // of partner activity causes one refresh)
+    useEffect(() => {
+        if (!labId) return;
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        const unsubscribe = subscribeToLabPartnerActivity(labId, () => {
+            if (timer) clearTimeout(timer);
+            timer = setTimeout(() => loadPartnerCounts(labId), 800);
+        });
+        return () => {
+            if (timer) clearTimeout(timer);
+            unsubscribe();
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [labId]);
 
     const handleSearch = async () => {
         // Implementation similar to DoctorMaster default text filter or DB search
@@ -340,7 +394,15 @@ const AccountMaster: React.FC = () => {
                 }
             }
 
-            const accountPayload = buildAccountSavePayload(formData);
+            const accountPayload: Record<string, unknown> = buildAccountSavePayload(formData);
+
+            // Stamp who switched the credit-check bypass (or moved its expiry), and when
+            const bypassToggled = (editingAccount?.bypass_credit_check === true) !== (formData.bypass_credit_check === true);
+            const bypassWindowChanged = (editingAccount?.credit_bypass_until || null) !== (formData.credit_bypass_until || null);
+            if (bypassToggled || bypassWindowChanged) {
+                accountPayload.credit_bypass_set_at = new Date().toISOString();
+                accountPayload.credit_bypass_set_by = currentUserId;
+            }
 
             if (editingAccount) {
                 const { data, error } = await supabase.from('accounts').update(accountPayload).eq('id', editingAccount.id).select();
@@ -409,8 +471,14 @@ const AccountMaster: React.FC = () => {
         setError(null);
     };
 
-    // Applies a lock-state change and refreshes local state
-    const applyLockUpdate = async (account: Account, payload: Partial<Account>) => {
+    const openBypassModal = (account: Account) => {
+        setBypassModalAccount(account);
+        setBypassReason(account.credit_bypass_reason || '');
+        setError(null);
+    };
+
+    // Applies a partial account update (lock state, credit bypass) and refreshes local state
+    const applyAccountUpdate = async (account: Account, payload: Partial<Account>) => {
         setLockSubmitting(true);
         setError(null);
         try {
@@ -423,6 +491,8 @@ const AccountMaster: React.FC = () => {
             setAccounts(prev => prev.map(a => (a.id === account.id ? { ...a, ...data[0] } : a)));
             setLockModalAccount(null);
             setLockReason('');
+            setBypassModalAccount(null);
+            setBypassReason('');
         } catch (err: any) {
             console.error('Error updating account lock state:', err);
             setError(err?.message || 'Failed to update account lock state.');
@@ -432,7 +502,7 @@ const AccountMaster: React.FC = () => {
     };
 
     const handleLockAccount = (account: Account) =>
-        applyLockUpdate(account, {
+        applyAccountUpdate(account, {
             is_locked: true,
             locked_reason: lockReason.trim() || null,
             locked_at: new Date().toISOString(),
@@ -442,7 +512,7 @@ const AccountMaster: React.FC = () => {
 
     // Permanent open: clear the lock entirely
     const handleOpenAccount = (account: Account) =>
-        applyLockUpdate(account, {
+        applyAccountUpdate(account, {
             is_locked: false,
             lock_override_until: null,
             locked_reason: null,
@@ -451,9 +521,25 @@ const AccountMaster: React.FC = () => {
     // Temporary open: keep locked, but grant an open window for N hours.
     // After the window expires the account is treated as locked again automatically.
     const handleTemporaryOpen = (account: Account, hours: number) =>
-        applyLockUpdate(account, {
+        applyAccountUpdate(account, {
             is_locked: true,
             lock_override_until: new Date(Date.now() + hours * 60 * 60 * 1000).toISOString(),
+        });
+
+    // --- Credit-check bypass (admin only) ---
+    // While on, no credit gate blocks this account: order creation, B2B
+    // bookings and portal report downloads all go through even over the limit.
+    // Independent of the lock — a locked account stays blocked either way.
+    //
+    // `hours` grants a window that expires on its own (null = until turned off),
+    // the same shape as the lock's temporary open.
+    const handleCreditBypass = (account: Account, enabled: boolean, reason: string, hours: number | null) =>
+        applyAccountUpdate(account, {
+            bypass_credit_check: enabled,
+            credit_bypass_reason: enabled ? (reason.trim() || null) : null,
+            credit_bypass_until: enabled && hours !== null ? hoursFromNow(hours) : null,
+            credit_bypass_set_at: new Date().toISOString(),
+            credit_bypass_set_by: currentUserId,
         });
 
     // --- Price Management Logic ---
@@ -647,13 +733,37 @@ const AccountMaster: React.FC = () => {
                     <h1 className="text-2xl font-bold text-gray-900 mb-2">Account Master</h1>
                     <p className="text-gray-600">Manage B2B accounts, corporate clients, and their custom pricing.</p>
                 </div>
-                <button
-                    onClick={handleCreateNew}
-                    className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors flex items-center gap-2"
-                >
-                    <Plus className="w-4 h-4" />
-                    Add Account
-                </button>
+                <div className="flex items-center gap-2">
+                    <button
+                        onClick={() => setShowPartnerInbox(true)}
+                        className="relative px-4 py-2 border border-blue-200 bg-blue-50 text-blue-700 rounded-lg hover:bg-blue-100 transition-colors flex items-center gap-2"
+                        title="All partner chats and material requests in one place"
+                    >
+                        <Inbox className="w-4 h-4" />
+                        Partner Inbox
+                        {totalUnreadMessages > 0 && (
+                            <span className="flex h-5 min-w-[20px] items-center justify-center rounded-full bg-red-500 px-1.5 text-[11px] font-semibold text-white">
+                                {totalUnreadMessages}
+                            </span>
+                        )}
+                        {totalOpenRequests > 0 && (
+                            <span
+                                className="flex h-5 min-w-[20px] items-center justify-center gap-0.5 rounded-full bg-amber-500 px-1.5 text-[11px] font-semibold text-white"
+                                title={`${totalOpenRequests} open material request(s)`}
+                            >
+                                <Package className="w-3 h-3" />
+                                {totalOpenRequests}
+                            </span>
+                        )}
+                    </button>
+                    <button
+                        onClick={handleCreateNew}
+                        className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors flex items-center gap-2"
+                    >
+                        <Plus className="w-4 h-4" />
+                        Add Account
+                    </button>
+                </div>
             </div>
 
             {/* Search Bar */}
@@ -722,9 +832,38 @@ const AccountMaster: React.FC = () => {
                                                 </span>
                                             )
                                         )}
+                                        {account.bypass_credit_check && (
+                                            isCreditBypassActive(account) ? (
+                                                <span
+                                                    className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium bg-amber-100 text-amber-800"
+                                                    title={account.credit_bypass_reason || 'Credit limit check is bypassed for this account'}
+                                                >
+                                                    <ShieldCheck className="w-3 h-3" />
+                                                    {account.credit_bypass_until
+                                                        ? `Credit bypass till ${new Date(account.credit_bypass_until).toLocaleString()}`
+                                                        : 'Credit bypass'}
+                                                </span>
+                                            ) : (
+                                                <span
+                                                    className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-600"
+                                                    title={`Bypass window ended ${new Date(account.credit_bypass_until as string).toLocaleString()} — credit limit is enforced again`}
+                                                >
+                                                    <ShieldOff className="w-3 h-3" /> Bypass expired
+                                                </span>
+                                            )
+                                        )}
                                     </div>
                                 </td>
                                 <td className="px-6 py-4 text-right space-x-2">
+                                    {isAdminUser && (
+                                        <button
+                                            onClick={() => openBypassModal(account)}
+                                            className={`p-1 ${isCreditBypassActive(account) ? 'text-amber-600 hover:text-amber-900' : 'text-gray-500 hover:text-gray-800'}`}
+                                            title={isCreditBypassActive(account) ? 'Credit check bypassed — manage window' : 'Bypass credit limit check'}
+                                        >
+                                            {isCreditBypassActive(account) ? <ShieldCheck className="w-4 h-4" /> : <ShieldOff className="w-4 h-4" />}
+                                        </button>
+                                    )}
                                     {isAdminUser && (
                                         <button
                                             onClick={() => openLockModal(account)}
@@ -829,6 +968,66 @@ const AccountMaster: React.FC = () => {
                                     <div>
                                         <label className="block text-sm font-medium mb-1">Default Discount (%)</label>
                                         <input type="number" max="100" value={formData.default_discount_percent || 0} onChange={e => setFormData({ ...formData, default_discount_percent: Number(e.target.value) })} className="w-full border rounded p-2" />
+                                    </div>
+                                    {/* Credit-check bypass — admin only, mirrors the lock control */}
+                                    <div className="col-span-2 rounded border border-amber-200 bg-amber-50 p-3">
+                                        <label className={`flex items-start gap-2 ${isAdminUser ? 'cursor-pointer' : 'cursor-not-allowed opacity-70'}`}>
+                                            <input
+                                                type="checkbox"
+                                                checked={formData.bypass_credit_check === true}
+                                                disabled={!isAdminUser}
+                                                onChange={e => setFormData({ ...formData, bypass_credit_check: e.target.checked })}
+                                                className="mt-0.5 h-4 w-4"
+                                            />
+                                            <span className="text-sm">
+                                                <span className="font-medium flex items-center gap-1.5">
+                                                    <ShieldCheck className="w-4 h-4 text-amber-600" />
+                                                    Bypass credit limit check
+                                                </span>
+                                                <span className="block text-xs text-gray-600 mt-0.5">
+                                                    Orders, B2B bookings and portal report downloads stay allowed even when this
+                                                    account is over its credit limit. Does not unlock a locked account.
+                                                    {!isAdminUser && ' Only an admin can change this.'}
+                                                </span>
+                                            </span>
+                                        </label>
+                                        {formData.bypass_credit_check === true && (
+                                            <>
+                                                <input
+                                                    type="text"
+                                                    value={formData.credit_bypass_reason || ''}
+                                                    disabled={!isAdminUser}
+                                                    onChange={e => setFormData({ ...formData, credit_bypass_reason: e.target.value })}
+                                                    placeholder="Reason (optional) — e.g. approved by management"
+                                                    className="mt-2 w-full border rounded p-2 text-sm disabled:bg-gray-100"
+                                                />
+                                                {/* Optional expiry, like the lock's temporary-open window */}
+                                                <label className="block text-xs font-medium text-gray-700 mt-2 mb-1">Bypass window</label>
+                                                <select
+                                                    value={formData.credit_bypass_until ? 'keep' : 'none'}
+                                                    disabled={!isAdminUser}
+                                                    onChange={e => {
+                                                        const choice = e.target.value;
+                                                        if (choice === 'keep') return;
+                                                        setFormData({
+                                                            ...formData,
+                                                            credit_bypass_until: choice === 'none' ? null : hoursFromNow(Number(choice)),
+                                                        });
+                                                    }}
+                                                    className="w-full border rounded p-2 text-sm disabled:bg-gray-100"
+                                                >
+                                                    {formData.credit_bypass_until && (
+                                                        <option value="keep">
+                                                            Keep current — {new Date(formData.credit_bypass_until).getTime() > Date.now() ? 'till' : 'expired'} {new Date(formData.credit_bypass_until).toLocaleString()}
+                                                        </option>
+                                                    )}
+                                                    <option value="none">No expiry — until turned off</option>
+                                                    {CREDIT_BYPASS_WINDOWS.filter(w => w.hours !== null).map(w => (
+                                                        <option key={w.label} value={String(w.hours)}>{w.label} from now (auto-expires)</option>
+                                                    ))}
+                                                </select>
+                                            </>
+                                        )}
                                     </div>
                                     {/* Price Master */}
                                     <div className="col-span-2 border-t pt-4 mt-2">
@@ -1266,6 +1465,92 @@ const AccountMaster: React.FC = () => {
                 </div>
             )}
 
+            {/* Credit-bypass window (admin only) — same shape as the lock's temporary open */}
+            {bypassModalAccount && (
+                <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+                    <div className="bg-white rounded-lg shadow-xl max-w-md w-full">
+                        <div className="flex justify-between items-center p-5 border-b">
+                            <h2 className="text-lg font-bold flex items-center gap-2">
+                                {isCreditBypassActive(bypassModalAccount)
+                                    ? <><ShieldCheck className="w-5 h-5 text-amber-600" /> Credit Check Bypassed</>
+                                    : <><ShieldOff className="w-5 h-5 text-gray-600" /> Bypass Credit Check</>}
+                            </h2>
+                            <button onClick={() => setBypassModalAccount(null)} disabled={lockSubmitting}><X className="w-6 h-6" /></button>
+                        </div>
+                        <div className="p-5 space-y-4">
+                            <div className="text-sm text-gray-700">
+                                <span className="font-medium">{bypassModalAccount.name}</span>
+                                {bypassModalAccount.code ? <span className="text-gray-500"> ({bypassModalAccount.code})</span> : null}
+                            </div>
+
+                            {bypassModalAccount.bypass_credit_check && (
+                                <div className="text-xs bg-gray-50 border rounded p-3 space-y-1 text-gray-600">
+                                    {bypassModalAccount.credit_bypass_reason && <div><span className="font-medium text-gray-700">Reason:</span> {bypassModalAccount.credit_bypass_reason}</div>}
+                                    {bypassModalAccount.credit_bypass_set_at && <div><span className="font-medium text-gray-700">Set at:</span> {new Date(bypassModalAccount.credit_bypass_set_at).toLocaleString()}</div>}
+                                    {bypassModalAccount.credit_bypass_until ? (
+                                        isCreditBypassActive(bypassModalAccount) ? (
+                                            <div className="text-amber-700"><span className="font-medium">Bypass runs until:</span> {new Date(bypassModalAccount.credit_bypass_until).toLocaleString()}</div>
+                                        ) : (
+                                            <div className="text-gray-700"><span className="font-medium">Expired on:</span> {new Date(bypassModalAccount.credit_bypass_until).toLocaleString()} — the credit limit is being enforced again.</div>
+                                        )
+                                    ) : (
+                                        <div className="text-amber-700 font-medium">No expiry — runs until turned off.</div>
+                                    )}
+                                </div>
+                            )}
+
+                            {error && <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded p-2">{error}</div>}
+
+                            <p className="text-sm text-gray-600">
+                                While the bypass is on, orders, B2B bookings and portal report downloads go through even when this
+                                account is over its credit limit. The credit figures are still calculated and shown. It does not
+                                unlock a locked account.
+                            </p>
+
+                            <div>
+                                <label className="block text-sm font-medium mb-1">Reason (optional)</label>
+                                <textarea
+                                    value={bypassReason}
+                                    onChange={e => setBypassReason(e.target.value)}
+                                    rows={2}
+                                    placeholder="e.g. Approved by management, payment in transit"
+                                    className="w-full border rounded p-2 text-sm"
+                                />
+                            </div>
+
+                            <div className="grid gap-2">
+                                {CREDIT_BYPASS_WINDOWS.map(window => (
+                                    <button
+                                        key={window.label}
+                                        onClick={() => handleCreditBypass(bypassModalAccount, true, bypassReason, window.hours)}
+                                        disabled={lockSubmitting}
+                                        className={`w-full px-4 py-2 rounded text-white disabled:opacity-50 text-sm flex items-center justify-center gap-2 ${window.hours === null ? 'bg-gray-600 hover:bg-gray-700' : 'bg-amber-500 hover:bg-amber-600'}`}
+                                    >
+                                        <ShieldCheck className="w-4 h-4" />
+                                        {window.hours === null
+                                            ? 'Bypass until turned off'
+                                            : `Bypass for ${window.label} (auto-expires)`}
+                                    </button>
+                                ))}
+                                {bypassModalAccount.bypass_credit_check && (
+                                    <button
+                                        onClick={() => handleCreditBypass(bypassModalAccount, false, '', null)}
+                                        disabled={lockSubmitting}
+                                        className="w-full px-4 py-2 border border-green-300 text-green-700 rounded hover:bg-green-50 disabled:opacity-50 text-sm flex items-center justify-center gap-2"
+                                    >
+                                        <ShieldOff className="w-4 h-4" /> Turn bypass off (enforce credit limit now)
+                                    </button>
+                                )}
+                            </div>
+
+                            <div className="flex justify-end pt-1">
+                                <button onClick={() => setBypassModalAccount(null)} disabled={lockSubmitting} className="px-4 py-2 border rounded hover:bg-gray-50 text-sm">Close</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
+
             {/* Credit position + record cash/cheque received from this account */}
             {creditModalAccount && (
                 <AccountCreditModal
@@ -1287,6 +1572,16 @@ const AccountMaster: React.FC = () => {
                         setPartnerDesk(null);
                         loadPartnerCounts();
                     }}
+                />
+            )}
+
+            {/* Unified inbox: every partner thread and material request, newest first */}
+            {showPartnerInbox && labId && (
+                <PartnerInboxModal
+                    labId={labId}
+                    accounts={accounts.map(account => ({ id: account.id, name: account.name, code: account.code }))}
+                    onClose={() => setShowPartnerInbox(false)}
+                    onCountsChanged={() => loadPartnerCounts()}
                 />
             )}
         </div >

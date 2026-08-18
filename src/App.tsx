@@ -19,6 +19,7 @@ import Reports from './pages/Reports';
 import PeripheralSmearDemo from './components/Workflows/PeripheralSmearDemo';
 import Billing from './pages/Billing';
 import CashReconciliation from './pages/CashReconciliation';
+import B2BPatientList from './pages/B2BPatientList';
 import UserManagement from './pages/UserManagement';
 import Settings from './pages/Settings';
 import ResultVerificationConsole from './pages/ResultVerificationConsole';
@@ -80,6 +81,9 @@ import ProtectedB2BRoute from './components/Auth/ProtectedB2BRoute';
 
 // ⬇️ Public patient payment link (/pay/:token) - no session required
 import PayLink from './pages/PayLink';
+
+// ⬇️ Public no-login booking page (/book/:slug) - the website / GMB / QR target
+import PublicBooking from './pages/PublicBooking';
 
 // ⬇️ Patient Portal
 import PatientLogin from './pages/PatientLogin';
@@ -158,6 +162,9 @@ const AppRoutes: React.FC = () => {
           }
         />
         <Route path="/verify" element={<VerificationPage />} />
+        {/* Public booking link - reachable without any session */}
+        <Route path="/book/:slug" element={<PublicBooking />} />
+        <Route path="/book/:slug/embed" element={<PublicBooking />} />
         {/* Public pay link - must be reachable without a patient session */}
         <Route path="/pay/:token" element={<PayLink />} />
         <Route path="/pay/:token/success" element={<PayLink />} />
@@ -221,6 +228,10 @@ const AppRoutes: React.FC = () => {
         path="/verify"
         element={<VerificationPage />}
       />
+
+      {/* Public booking page - the website / Google Business Profile / QR target, no session required */}
+      <Route path="/book/:slug" element={<PublicBooking />} />
+      <Route path="/book/:slug/embed" element={<PublicBooking />} />
 
       {/* Public patient payment link - the QR / WhatsApp target, no session required */}
       <Route path="/pay/:token" element={<PayLink />} />
@@ -306,6 +317,7 @@ const AppRoutes: React.FC = () => {
                 <Route path="/billing" element={<Billing />} />
                 <Route path="/subscription" element={<Subscription />} />
                 <Route path="/cash-reconciliation" element={<CashReconciliation />} />
+                <Route path="/b2b-patients" element={<B2BPatientList />} />
                 <Route path="/financial-reports" element={<FinancialReports />} />
                 <Route path="/analytics" element={<Analytics />} />
                 {/* <Route path="/ai-tools" element={<AITools />} /> Hidden */}

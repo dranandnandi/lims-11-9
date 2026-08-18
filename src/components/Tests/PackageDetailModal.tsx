@@ -34,7 +34,10 @@ interface PackageDetailModalProps {
 
 const PackageDetailModal: React.FC<PackageDetailModalProps> = ({ package: pkg, testGroups, onClose, onEdit }) => {
   const testGroupIds = pkg.testGroupIds || [];
-  const includedGroups = testGroups.filter(group => testGroupIds.includes(group.id));
+  // Keep the package's own order (testGroupIds is already sorted by display_order)
+  const includedGroups = testGroupIds
+    .map(id => testGroups.find(group => group.id === id))
+    .filter(Boolean) as TestGroup[];
   const originalPrice = includedGroups.reduce((sum, group) => sum + group.price, 0);
   const savings = originalPrice - pkg.price;
   const actualDiscount = originalPrice > 0 ? ((savings / originalPrice) * 100) : 0;

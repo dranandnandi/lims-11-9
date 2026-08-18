@@ -185,8 +185,14 @@ const AccountCreditModal: React.FC<Props> = ({ account, onClose, onCreditChanged
                                 </div>
                                 <div className="rounded-lg border border-gray-200 p-4">
                                     <div className="text-xs uppercase tracking-wide text-gray-500">Credit Used</div>
-                                    <div className="text-xl font-bold text-orange-600 mt-1">{formatCurrency(summary.effectiveCreditUsed)}</div>
-                                    <div className="text-xs text-gray-400 mt-1">Open work and unpaid bills, net of payments</div>
+                                    <div className={`text-xl font-bold mt-1 ${summary.effectiveCreditUsed >= 0 ? 'text-orange-600' : 'text-green-700'}`}>
+                                        {formatCurrency(summary.effectiveCreditUsed)}
+                                    </div>
+                                    <div className="text-xs text-gray-400 mt-1">
+                                        {summary.effectiveCreditUsed < 0
+                                            ? 'In advance — paid more than has been consumed'
+                                            : 'Orders placed and bookings held, net of payments'}
+                                    </div>
                                 </div>
                                 <div className={`rounded-lg border p-4 ${availableCredit >= 0 ? 'border-green-200 bg-green-50' : 'border-red-200 bg-red-50'}`}>
                                     <div className="text-xs uppercase tracking-wide text-gray-500">Available Credit</div>
@@ -194,20 +200,26 @@ const AccountCreditModal: React.FC<Props> = ({ account, onClose, onCreditChanged
                                         {formatCurrency(availableCredit)}
                                     </div>
                                     <div className="text-xs text-gray-500 mt-1">
-                                        {availableCredit >= 0 ? 'Partner can book against this' : 'Over limit — portal bookings blocked'}
+                                        {summary.bypassCreditCheck
+                                            ? summary.bypassCreditUntil
+                                                ? `Credit check bypassed till ${new Date(summary.bypassCreditUntil).toLocaleString()}`
+                                                : 'Credit check bypassed — bookings allowed regardless'
+                                            : availableCredit >= 0
+                                                ? 'Partner can book against this'
+                                                : 'Over limit — portal bookings blocked'}
                                     </div>
                                 </div>
                             </div>
 
                             {/* Breakdown */}
                             <div className="rounded-lg border border-gray-200 divide-y divide-gray-100 text-sm">
+                                {/* The terms of the balance, in the order they apply. Open orders
+                                    and outstanding bills sit below the line as context only: both
+                                    are already inside "Orders Placed", so adding them here would
+                                    read as double the charge. */}
                                 <div className="flex items-center justify-between px-4 py-2.5">
-                                    <span className="text-gray-500">Open Orders (not yet billed)</span>
-                                    <span className="font-medium text-orange-600">{formatCurrency(summary.openOrderAmount)}</span>
-                                </div>
-                                <div className="flex items-center justify-between px-4 py-2.5">
-                                    <span className="text-gray-500">Outstanding Bills</span>
-                                    <span className="font-medium text-orange-600">{formatCurrency(summary.outstandingInvoiceAmount)}</span>
+                                    <span className="text-gray-500">Orders Placed</span>
+                                    <span className="font-medium text-orange-600">{formatCurrency(summary.orderDebitAmount)}</span>
                                 </div>
                                 <div className="flex items-center justify-between px-4 py-2.5">
                                     <span className="text-gray-500">Pending Bookings</span>
@@ -222,10 +234,18 @@ const AccountCreditModal: React.FC<Props> = ({ account, onClose, onCreditChanged
                                     <span className="font-semibold text-green-700">-{formatCurrency(summary.advanceReceiptCredit)}</span>
                                 </div>
                                 <div className="flex items-center justify-between px-4 py-2.5 bg-emerald-50/50">
-                                    <span className="text-gray-600 font-medium">
-                                        Payments Received (against open bills)
-                                    </span>
+                                    <span className="text-gray-600 font-medium">Payments Received (against bills)</span>
                                     <span className="font-semibold text-green-700">-{formatCurrency(summary.invoiceReceiptCredit)}</span>
+                                </div>
+                                {summary.advanceBalance > 0 && (
+                                    <div className="flex items-center justify-between px-4 py-2.5 bg-emerald-50">
+                                        <span className="text-gray-700 font-semibold">Advance Balance</span>
+                                        <span className="font-bold text-green-700">{formatCurrency(summary.advanceBalance)}</span>
+                                    </div>
+                                )}
+                                <div className="flex items-center justify-between px-4 py-2 text-xs text-gray-400">
+                                    <span>Of which not yet billed: {formatCurrency(summary.openOrderAmount)}</span>
+                                    <span>On outstanding bills: {formatCurrency(summary.outstandingInvoiceAmount)}</span>
                                 </div>
                             </div>
 

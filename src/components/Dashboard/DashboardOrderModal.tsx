@@ -44,6 +44,7 @@ import { useOrderStatusCentral } from "../../hooks/useOrderStatusCentral";
 import QuickStatusButtons from "../Orders/QuickStatusButtons";
 import { OrderStatusDisplay } from "../Orders/OrderStatusDisplay";
 import CreateInvoiceModal from "../Billing/CreateInvoiceModal";
+import { syncOrderBillingStatus } from "../../utils/orderInvoicing";
 import PaymentCapture from "../Billing/PaymentCapture";
 import InvoiceDeliveryTracker from "../Billing/InvoiceDeliveryTracker";
 import InvoiceGenerationModal from "../Billing/InvoiceGenerationModal";
@@ -200,6 +201,10 @@ const DashboardOrderModal: React.FC<DashboardOrderModalProps> = ({
   // Add/Remove Tests Logic
   const [currentTotal, setCurrentTotal] = useState(order.total_amount);
   const [currentDue, setCurrentDue] = useState(order.due_amount || 0);
+  // Live billing status. Adding a test or an extra charge to an already-billed order
+  // reopens it to 'partial'; the `order` prop is only refreshed by the parent list, so
+  // the buttons read this instead of going stale mid-session.
+  const [billingStatus, setBillingStatus] = useState<string | null>(order.billing_status ?? null);
   const [showAddTestModal, setShowAddTestModal] = useState(false);
   const [availableTests, setAvailableTests] = useState<any[]>([]);
   const [testSearch, setTestSearch] = useState('');
@@ -342,6 +347,10 @@ const DashboardOrderModal: React.FC<DashboardOrderModalProps> = ({
       const chargesTotal = chargesList.reduce((s: number, i: any) => s + (i.amount || 0), 0);
       setCurrentTotal((order.total_amount || 0) + chargesTotal);
       setCurrentDue(Math.max(0, (order.total_amount || 0) + chargesTotal - (order.paid_amount || 0)));
+
+      // Self-heal orders stamped 'billed' before a charge was added to them, so the
+      // charge can still be put on a supplementary invoice.
+      setBillingStatus(await syncOrderBillingStatus(order.id));
     };
     load();
   }, [labId, order.id, invoiceRefreshTrigger]);
@@ -386,6 +395,9 @@ const DashboardOrderModal: React.FC<DashboardOrderModalProps> = ({
     const chargesList = items || [];
     setOrderBillingItems(chargesList);
     recomputeTotalsFromItems(chargesList);
+    // Same rule as adding a test: a charge on an already-billed order reopens billing
+    // so a supplementary invoice can be raised for it.
+    setBillingStatus(await syncOrderBillingStatus(order.id));
     setCustomChargeName('');
     setCustomChargeAmount('');
     setSelectedChargeTypeId('');
@@ -398,6 +410,8 @@ const DashboardOrderModal: React.FC<DashboardOrderModalProps> = ({
     const remaining = orderBillingItems.filter(i => i.id !== chargeId);
     setOrderBillingItems(remaining);
     recomputeTotalsFromItems(remaining);
+    // Dropping the last pending charge closes billing again.
+    setBillingStatus(await syncOrderBillingStatus(order.id));
   };
 
   const handleSaveCollectionCharge = async () => {
@@ -557,25 +571,32 @@ const DashboardOrderModal: React.FC<DashboardOrderModalProps> = ({
       // never be written back to orders.total_amount.
       const { data: freshOrder, error: freshOrderError } = await supabase
         .from('orders')
-        .select('total_amount, collection_charge, billing_status, patient_id')
+        .select('total_amount, final_amount, collection_charge, billing_status, patient_id')
         .eq('id', order.id)
         .single();
       if (freshOrderError) throw freshOrderError;
 
-      const newOrderTotal = (Number(freshOrder.total_amount) || 0)
-        + (Number(item.price) || 0)
-        + addedCollectionCharge;
+      const addedAmount = (Number(item.price) || 0) + addedCollectionCharge;
+      const newOrderTotal = (Number(freshOrder.total_amount) || 0) + addedAmount;
       const newCollectionCharge = (Number(freshOrder.collection_charge) || 0) + addedCollectionCharge;
       const newBillingStatus = freshOrder.billing_status === 'billed'
         ? 'partial'
         : freshOrder.billing_status;
+      // final_amount is total_amount minus the order-level discount and is what the
+      // dashboard/orders lists display in preference to total_amount. Grow it by the same
+      // delta so the discount is preserved and the listed amount stops going stale.
+      const hasFinalAmount = freshOrder.final_amount !== null && freshOrder.final_amount !== undefined;
+      const newFinalAmount = hasFinalAmount
+        ? (Number(freshOrder.final_amount) || 0) + addedAmount
+        : null;
 
       const { error: orderError } = await supabase
         .from('orders')
         .update({
           total_amount: newOrderTotal,
           collection_charge: newCollectionCharge > 0 ? newCollectionCharge : null,
-          billing_status: newBillingStatus
+          billing_status: newBillingStatus,
+          ...(hasFinalAmount ? { final_amount: newFinalAmount } : {})
         })
         .eq('id', order.id);
       if (orderError) throw orderError;
@@ -644,7 +665,7 @@ const DashboardOrderModal: React.FC<DashboardOrderModalProps> = ({
         }
       }
 
-      const newCurrentTotal = newOrderTotal + billingItemsTotal;
+      const newCurrentTotal = (newFinalAmount ?? newOrderTotal) + billingItemsTotal;
       setCollectionCharge(newCollectionCharge);
       setCurrentTotal(newCurrentTotal);
       setCurrentDue(Math.max(
@@ -720,15 +741,27 @@ const DashboardOrderModal: React.FC<DashboardOrderModalProps> = ({
 
       if (deleteError) throw deleteError;
 
-      // 3. Update Order Totals
-      const priceToRemove = testData.price || 0;
-      const newTotal = Math.max(0, (currentTotal || 0) - priceToRemove);
-      const newDue = Math.max(0, (currentDue || 0) - priceToRemove);
+      // 3. Update Order Totals from the persisted values. currentTotal also carries extra
+      // billing items and the discount, so it must never be written back to orders.total_amount.
+      const priceToRemove = Number(testData.price) || 0;
+      const { data: freshOrder, error: freshOrderError } = await supabase
+        .from('orders')
+        .select('total_amount, final_amount')
+        .eq('id', order.id)
+        .single();
+      if (freshOrderError) throw freshOrderError;
+
+      const newOrderTotal = Math.max(0, (Number(freshOrder.total_amount) || 0) - priceToRemove);
+      const hasFinalAmount = freshOrder.final_amount !== null && freshOrder.final_amount !== undefined;
+      const newFinalAmount = hasFinalAmount
+        ? Math.max(0, (Number(freshOrder.final_amount) || 0) - priceToRemove)
+        : null;
 
       const { error: updateError } = await supabase
         .from('orders')
         .update({
-          total_amount: newTotal
+          total_amount: newOrderTotal,
+          ...(hasFinalAmount ? { final_amount: newFinalAmount } : {})
           // due_amount removed
         })
         .eq('id', order.id);
@@ -736,9 +769,10 @@ const DashboardOrderModal: React.FC<DashboardOrderModalProps> = ({
       if (updateError) throw updateError;
 
       // 4. Update Local State
+      const newTotal = (newFinalAmount ?? newOrderTotal) + billingItemsTotal;
       setTests(prev => prev.filter(t => t.id !== testId));
       setCurrentTotal(newTotal);
-      setCurrentDue(newDue);
+      setCurrentDue(Math.max(0, (currentDue || 0) - priceToRemove));
 
       // Refresh parent dashboard
       await onUpdateStatus(order.id, order.status);
@@ -1567,7 +1601,6 @@ const DashboardOrderModal: React.FC<DashboardOrderModalProps> = ({
                           <div key={idx} className="transform hover:scale-105 transition-transform">
                             <SampleTypeIndicator
                               sampleType={p.sample_type || 'Blood'}
-                              sampleColor={p.sample_color || order.color_code || undefined}
                               showLabel={true}
                               size="sm"
                             />
@@ -2135,7 +2168,7 @@ const DashboardOrderModal: React.FC<DashboardOrderModalProps> = ({
                   </div>
 
                   <div className="grid grid-cols-1 gap-3">
-                    {order.billing_status !== 'billed' && (
+                    {billingStatus !== 'billed' && (
                       <>
                         {order.account_billing_mode === 'monthly' ? (
                           <div className="w-full flex items-center justify-center gap-2 bg-gray-100 text-gray-600 py-2.5 px-4 rounded-lg border border-gray-200 text-sm font-semibold">
@@ -2149,10 +2182,12 @@ const DashboardOrderModal: React.FC<DashboardOrderModalProps> = ({
                               className="w-full flex items-center justify-center gap-2 bg-gradient-to-r from-blue-600 to-blue-700 text-white py-2.5 rounded-lg hover:from-blue-700 hover:to-blue-800 transition-all text-sm font-bold shadow-md hover:shadow-lg active:scale-95 transform duration-150"
                             >
                               <DollarSign className="h-4 w-4" />
-                              Create Invoice
+                              {billingStatus === 'partial' ? 'Bill Pending Items' : 'Create Invoice'}
                             </button>
                             <p className="text-xs text-gray-500 text-center">
-                              💡 Discounts from Doctor, Location, or Account will be auto-applied during invoice creation
+                              {billingStatus === 'partial'
+                                ? '💡 Raises a supplementary invoice for tests and charges added after the last invoice'
+                                : '💡 Discounts from Doctor, Location, or Account will be auto-applied during invoice creation'}
                             </p>
                           </>
                         )}
@@ -2163,7 +2198,7 @@ const DashboardOrderModal: React.FC<DashboardOrderModalProps> = ({
                     {(order.due_amount || 0) > 0 && !(order.account_name && order.account_billing_mode === 'monthly') && (
                       <button
                         onClick={() => {
-                          if (!order.invoice_id && order.billing_status !== 'billed' && order.billing_status !== 'partial') {
+                          if (!order.invoice_id && billingStatus !== 'billed' && billingStatus !== 'partial') {
                             // No invoice - ask to create first
                             const createFirst = window.confirm(
                               "No invoice found for this order.\n\nWould you like to create an invoice first?\n\nClick OK to create invoice, Cancel to go back."
@@ -2176,18 +2211,20 @@ const DashboardOrderModal: React.FC<DashboardOrderModalProps> = ({
                           }
                         }}
                         className={`w-full flex items-center justify-center gap-2 py-2.5 rounded-lg transition-all text-sm font-bold shadow-md hover:shadow-lg active:scale-95 transform duration-150 ${
-                          order.billing_status === 'billed' || order.billing_status === 'partial'
+                          billingStatus === 'billed' || billingStatus === 'partial'
                             ? 'bg-gradient-to-r from-green-600 to-green-700 text-white hover:from-green-700 hover:to-green-800'
                             : 'bg-purple-100 text-purple-700 hover:bg-purple-200 border border-purple-300'
                         }`}
-                        title={order.billing_status !== 'billed' && order.billing_status !== 'partial' ? 'Will create invoice first' : 'Record payment'}
+                        title={billingStatus !== 'billed' && billingStatus !== 'partial' ? 'Will create invoice first' : 'Record payment'}
                       >
                         <CreditCard className="h-4 w-4" />
-                        {order.billing_status !== 'billed' && order.billing_status !== 'partial' ? 'Pay (Create Invoice)' : 'Record Payment'}
+                        {billingStatus !== 'billed' && billingStatus !== 'partial' ? 'Pay (Create Invoice)' : 'Record Payment'}
                       </button>
                     )}
 
-                    {order.billing_status === 'billed' && (
+                    {/* Also shown while 'partial': the order already has an invoice to edit,
+                        it just has newer tests or charges still waiting to be billed. */}
+                    {(billingStatus === 'billed' || billingStatus === 'partial') && (
                       <>
                         {/* Post-creation discount edit */}
                         {order.invoice_id && (

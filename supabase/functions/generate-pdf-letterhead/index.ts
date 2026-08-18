@@ -87,8 +87,11 @@ function generateCode128SVG(data: string, height = 36, renderWidth = 100): strin
       rects += `<rect x="${i}" y="0" width="1" height="${height}"/>`;
     }
   }
-  // viewBox scales all modules to fit renderWidth exactly â€” no overflow
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${totalModules} ${height}" width="${renderWidth}" height="${height}" style="display:block;"><g fill="#000000">${rects}</g></svg>`;
+  // viewBox scales all modules to fit renderWidth exactly â€” no overflow.
+  // preserveAspectRatio="none" lets the template CSS resize the barcode to the
+  // configured header size without letterboxing it inside a taller/wider box;
+  // bars stay proportional to each other, so the symbol still scans.
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${totalModules} ${height}" width="${renderWidth}" height="${height}" preserveAspectRatio="none" style="display:block;"><g fill="#000000">${rects}</g></svg>`;
 }
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -939,6 +942,79 @@ type CanonicalReportFlag =
   | "abnormal"
   | null;
 
+/**
+ * Which flag letters this lab is allowed to PRINT.
+ *
+ * The flag engine always stores a verdict ('H' | 'L' | 'H*' | 'L*' | 'A') because
+ * the stored flag drives the bold/coloured value styling. Printing the letter is
+ * gated separately on the lab's Result Flag Options (labs.flag_options): a lab
+ * that never configured "Abnormal" gets no "A" beside a Positive result, but the
+ * value still prints bold.
+ *
+ * Keep in sync with src/utils/reportFlagDisplay.ts.
+ */
+function toLabFlagSymbol(raw?: string | null): string {
+  const f = String(raw ?? "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (!f || f === "normal" || f === "n") return "";
+  if (["h", "high", "hi", "hh"].includes(f)) return "H";
+  if (["l", "low", "ll", "lo"].includes(f)) return "L";
+  if (["h*", "critical_h", "critical_high", "criticalhigh", "high_critical"].includes(f)) return "H*";
+  if (["l*", "critical_l", "critical_low", "criticallow", "low_critical"].includes(f)) return "L*";
+  if (["a", "abn", "abnormal"].includes(f)) return "A";
+  if (["c", "crit", "critical"].includes(f)) return "C";
+  return "";
+}
+
+/** Configured letters, or null when the lab configured none (print everything). */
+function resolveConfiguredFlagCodes(options: unknown): string[] | null {
+  if (!Array.isArray(options) || options.length === 0) return null;
+  const codes = new Set<string>();
+  for (const opt of options) {
+    const code = toLabFlagSymbol((opt as any)?.value) ||
+      toLabFlagSymbol((opt as any)?.label);
+    if (code) codes.add(code);
+  }
+  // A list naming only "Normal" says nothing about letters — treat as unconfigured
+  // rather than blanking every flag on the report.
+  return codes.size > 0 ? [...codes] : null;
+}
+
+const FLAG_SYMBOL_BY_CANONICAL: Record<string, string> = {
+  high: "H",
+  low: "L",
+  critical_high: "H*",
+  critical_low: "L*",
+  critical: "C",
+  abnormal: "A",
+};
+// A lab with only H/L still gets "H" on a critical high; dropping the letter
+// entirely would understate the result. 'A' and 'C' have no coarser form.
+const FLAG_SYMBOL_FALLBACK: Record<string, string> = { "H*": "H", "L*": "L", C: "", A: "" };
+const FLAG_LEGEND_LABELS: Array<[string, string]> = [
+  ["H", "High"],
+  ["L", "Low"],
+  ["A", "Abnormal"],
+  ["H*", "Critical High"],
+  ["L*", "Critical Low"],
+  ["C", "Critical"],
+];
+
+function flagSymbolForReport(canonical: string, allowed: string[] | null): string {
+  const symbol = FLAG_SYMBOL_BY_CANONICAL[canonical] ?? "";
+  if (!symbol) return "";
+  if (!allowed) return symbol;
+  if (allowed.includes(symbol)) return symbol;
+  const fallback = FLAG_SYMBOL_FALLBACK[symbol] ?? "";
+  return fallback && allowed.includes(fallback) ? fallback : "";
+}
+
+function flagLegendText(allowed: string[] | null): string {
+  return FLAG_LEGEND_LABELS
+    .filter(([code]) => !allowed || allowed.includes(code))
+    .map(([code, label]) => `${code} = ${label}`)
+    .join(" &nbsp; ");
+}
+
 function normalizeReportFlag(flag?: string | null): {
   canonical: CanonicalReportFlag;
   label: string;
@@ -1270,6 +1346,36 @@ function renderTemplate(html: string, context: Record<string, any>): string {
   return stripBrokenPdfImages(result);
 }
 
+/**
+ * "Ref. Doctor" cell content: the doctor name with the degree/qualification from
+ * Doctor Master on a second line beneath it.
+ *
+ * The cell text is `: {{value}}`, so a bare block-level degree line would start at
+ * the cell's left edge — under the colon rather than under the name. Wrapping both
+ * in an inline-block makes the wrapper's content box begin exactly where the name
+ * begins, so the degree lines up under it. When there is no qualification this
+ * returns the plain name, leaving single-line cells byte-identical to before.
+ */
+function buildRefDoctorBlock(name: unknown, qualification: unknown): string {
+  const escapeCell = (v: unknown) =>
+    String(v ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+
+  const doctorName = escapeCell(name).trim();
+  const degree = escapeCell(qualification).trim();
+  if (!degree) return doctorName;
+
+  // Inline styles keep this readable in templates that do not ship the
+  // .basic-report-template CSS; that template's !important rules refine it.
+  return `<span class="ref-doctor-block" style="display:inline-block;vertical-align:top;">${doctorName}` +
+    `<div class="ref-doctor-degree" style="font-size:0.92em;font-weight:normal;color:#444;line-height:1.25;margin-top:1px;">${degree}</div>` +
+    `</span>`;
+}
+
 function buildGroupRemarkHtml(remark: unknown): string {
   const value = String(remark || "").trim();
   if (!value) return "";
@@ -1592,7 +1698,11 @@ function getNestedValue(obj: Record<string, any>, path: string): any {
  * @param printOptions - merged print options (lab printOptions + test-group print_options override)
  */
 function generateDynamicCss(settings: any, printOptions?: any): string {
-  const hasPrintOptions = printOptions && Object.keys(printOptions).length > 0;
+  // Underscore keys (_sampleType, _labFlagCodes, …) are internal passengers on the
+  // print-options bag, not styling choices — a lab carrying only those still counts
+  // as having set no print options, so no override CSS is emitted for it.
+  const hasPrintOptions = !!printOptions &&
+    Object.keys(printOptions).some((k) => !k.startsWith("_"));
   if (!settings || (!settings.resultColors && !settings.headerTextColor && !hasPrintOptions)) {
     return "";
   }
@@ -2083,13 +2193,21 @@ const PATIENT_INFO_FIELD_MAP: Record<string, { label: string; placeholder: strin
   gender:               { label: 'Gender',           placeholder: '{{patientGender}}' },
   collectionDate:       { label: 'Collected On',     placeholder: '{{collectionDate}}' },
   sampleId:             { label: 'Sample ID',        placeholder: '{{sampleId}}' },
-  referringDoctorName:  { label: 'Ref. Doctor',      placeholder: '{{referringDoctorName}}' },
+  // Resolves to the name alone unless the doctor master has a degree saved, in
+  // which case the degree renders on a second line aligned under the name.
+  referringDoctorName:  { label: 'Ref. Doctor',      placeholder: '{{referringDoctorBlock}}' },
   approvedAt:           { label: 'Approved On',      placeholder: '{{approvedAt}}' },
   phone:                { label: 'Phone',            placeholder: '{{patientPhone}}' },
   sampleCollectedBy:    { label: 'Collected By',     placeholder: '{{sampleCollectedBy}}' },
   receivedAt:           { label: 'Received Date/Time', placeholder: '{{receivedAt}}' },
   collectionCenter:     { label: 'Collection Center', placeholder: '{{collectionCenter}}' },
   b2bAccountName:       { label: 'B2B / Account Name', placeholder: '{{b2bAccountName}}' },
+  // Same value as b2bAccountName, printed under the wording labs that route work
+  // through referring centres prefer. Both keys exist so a lab can pick either label.
+  refCenter:            { label: 'Ref. Center',      placeholder: '{{refCenter}}' },
+  // The lab's own main lab (labs.default_processing_location_id), i.e. where the
+  // sample was analysed — as opposed to the collection centre it came from.
+  processingCenter:     { label: 'Proc. Center',     placeholder: '{{processingCenter}}' },
 };
 
 function buildPatientInfoHtml(
@@ -2853,6 +2971,31 @@ function generateBasicDefaultTemplateHtml(
   const patientInfoBold = (printOptions?.patientInfoBold as boolean) ?? false;
   // Vertical rule between the two patient-info column pairs (off by default).
   const patientInfoColumnDivider = (printOptions?.patientInfoColumnDivider as boolean) ?? false;
+  // Patient info header geometry. The block is a 4-cell grid (label / value /
+  // label / value); patientInfoLeftPct is the share of the row given to the LEFT
+  // label+value pair, so a lab with long patient names can widen it beyond 50%.
+  // patientInfoLabelPct is the share of each pair taken by its label column.
+  // Defaults (50 / 30) reproduce the historical fixed 15% / 35% layout.
+  const patientInfoLeftPct = Math.max(25, Math.min(75, Number(printOptions?.patientInfoLeftPct ?? 50)));
+  const patientInfoLabelPct = Math.max(15, Math.min(60, Number(printOptions?.patientInfoLabelPct ?? 30)));
+  const patientInfoRightPct = 100 - patientInfoLeftPct;
+  const patientInfoWidths = {
+    label1: Number((patientInfoLeftPct * patientInfoLabelPct / 100).toFixed(2)),
+    value1: Number((patientInfoLeftPct * (100 - patientInfoLabelPct) / 100).toFixed(2)),
+    label2: Number((patientInfoRightPct * patientInfoLabelPct / 100).toFixed(2)),
+    value2: Number((patientInfoRightPct * (100 - patientInfoLabelPct) / 100).toFixed(2)),
+  };
+  // Header title bar: the "TEST REPORT" heading and the sample barcode can each
+  // be switched off from the Basic template settings.
+  const showReportTitle = printOptions?.showReportTitle !== false;
+  const showHeaderBarcode = printOptions?.showHeaderBarcode !== false;
+  // Title bar thickness. The bar is as tall as its tallest item, so the barcode
+  // height is what usually drives it — both are adjustable to slim the header.
+  const reportTitleBarPadding = Math.max(0, Math.min(10, Number(printOptions?.reportTitleBarPadding ?? 4)));
+  const headerBarcodeWidth = Math.max(50, Math.min(160, Number(printOptions?.headerBarcodeWidth ?? 100)));
+  const headerBarcodeHeight = Math.max(12, Math.min(48, Number(printOptions?.headerBarcodeHeight ?? 36)));
+  // Slot width tracks the barcode so the centred title stays centred.
+  const headerBarcodeSlotWidth = headerBarcodeWidth + 8;
   const underlineAbnormal = (printOptions?.underlineAbnormalValues as boolean) ?? false;
   const abnormalDecoration = underlineAbnormal
     ? "text-decoration: underline !important; text-underline-offset: 2px !important;"
@@ -2862,8 +3005,17 @@ function generateBasicDefaultTemplateHtml(
   const sectionRowBackground = printOptions?.resultTableBackground === "transparent" ? "transparent" : "#f5f5f5";
   const flagSymbol = (printOptions?.flagSymbol as string) ?? "none";
   const showFlagLegend = (printOptions?.showFlagLegend as boolean) ?? false;
+  // Injected alongside the lab's print options (see _labFlagCodes at the labs
+  // fetch). A verdict outside this list still styles the value, it just prints
+  // no letter.
+  const allowedFlagCodes = (printOptions?._labFlagCodes as string[] | null) ?? null;
   // Exact gap in px between the H/L symbol and the value (0-12, default 4)
   const flagGapPx = Math.max(0, Math.min(12, Number(printOptions?.flagGapPx ?? 4)));
+  // Vertical padding applied to every result cell — the gap between two analyte rows
+  // is twice this value (0-10, default 2 = the historical basic-template spacing).
+  const analyteRowSpacing = Math.max(0, Math.min(10, Number(printOptions?.analyteRowSpacing ?? 2)));
+  // Bottom margin of each test-group block — the gap before the next group (0-40, default 14).
+  const testGroupSpacing = Math.max(0, Math.min(40, Number(printOptions?.testGroupSpacing ?? 14)));
   const testGroupTitlePosition = (printOptions?.testGroupTitlePosition as string) ?? "above_headers_center";
   const requestedQrPosition = String(printOptions?.qrPosition || "");
   const qrPosition = requestedQrPosition === "top_left" || requestedQrPosition === "top_right"
@@ -2936,6 +3088,26 @@ function generateBasicDefaultTemplateHtml(
   vertical-align: middle !important;
 }
 
+/* Rich section content must flow across pages. Holding the whole block together
+   (page-break-inside: avoid) pushed narrative sections â€” USG/scan reports, which
+   are taller than the space left under the patient header â€” wholesale onto page 2
+   and left page 1 blank. Break protection belongs on the rows and on the title,
+   not on the section as a whole. */
+.basic-report-template .section-rich-content {
+  page-break-inside: auto !important;
+  break-inside: auto !important;
+}
+
+.basic-report-template .section-rich-content > .center-title {
+  page-break-after: avoid !important;
+  break-after: avoid !important;
+}
+
+.basic-report-template .section-rich-content table tr {
+  page-break-inside: avoid !important;
+  break-inside: avoid !important;
+}
+
 /* Restore borders for clinical interpretation tables.
    Print options CSS sets .limsv2-report td { border:none !important } which kills these.
    Higher-specificity scoped rule with !important wins. */
@@ -2999,7 +3171,7 @@ function generateBasicDefaultTemplateHtml(
   align-items: center !important;
   border-top: 1.5px solid #000 !important;
   border-bottom: 1.5px solid #000 !important;
-  padding: 4px 0 !important;
+  padding: ${reportTitleBarPadding}px 0 !important;
   margin: 6px 0 10px !important;
 }
 
@@ -3016,7 +3188,7 @@ function generateBasicDefaultTemplateHtml(
 }
 
 .basic-report-template .report-title-spacer {
-  width: 110px !important;
+  width: ${showHeaderBarcode ? headerBarcodeSlotWidth : 110}px !important;
   flex-shrink: 0 !important;
 }
 
@@ -3051,7 +3223,7 @@ function generateBasicDefaultTemplateHtml(
 }
 
 .basic-report-template .report-title-barcode {
-  width: 108px !important;
+  width: ${headerBarcodeSlotWidth}px !important;
   flex-shrink: 0 !important;
   text-align: right !important;
   margin-right: 8px !important;
@@ -3060,8 +3232,8 @@ function generateBasicDefaultTemplateHtml(
 
 .basic-report-template .report-title-barcode img,
 .basic-report-template .report-title-barcode svg {
-  height: 36px !important;
-  width: 100px !important;
+  height: ${headerBarcodeHeight}px !important;
+  width: ${headerBarcodeWidth}px !important;
   display: block !important;
   margin-left: auto !important;
 }
@@ -3074,7 +3246,6 @@ function generateBasicDefaultTemplateHtml(
 }
 
 .basic-report-template .patient-header-table th {
-  width: 15% !important;
   font-weight: 700 !important;
   text-align: left !important;
   color: #000 !important;
@@ -3083,8 +3254,14 @@ function generateBasicDefaultTemplateHtml(
   border: none !important;
 }
 
+/* Configurable header geometry — cells 1/2 are the left label+value pair,
+   cells 3/4 the right pair (see patientInfoLeftPct / patientInfoLabelPct). */
+.basic-report-template .patient-header-table th:nth-child(1) { width: ${patientInfoWidths.label1}% !important; }
+.basic-report-template .patient-header-table td:nth-child(2) { width: ${patientInfoWidths.value1}% !important; }
+.basic-report-template .patient-header-table th:nth-child(3) { width: ${patientInfoWidths.label2}% !important; }
+.basic-report-template .patient-header-table td:nth-child(4) { width: ${patientInfoWidths.value2}% !important; }
+
 .basic-report-template .patient-header-table td {
-  width: 35% !important;
   padding: 2px 3px !important;
   border: none !important;
   color: #111 !important;
@@ -3095,6 +3272,24 @@ function generateBasicDefaultTemplateHtml(
 
 .basic-report-template .patient-header-table th {
   font-size: ${basePx}px !important;
+}
+
+/* Doctor degree/qualification printed on its own line under the doctor name.
+   The inline-block wrapper starts where the name starts (after the ": " prefix),
+   so the degree line indents to match instead of hugging the cell edge. */
+.basic-report-template .patient-header-table .ref-doctor-block {
+  display: inline-block !important;
+  vertical-align: top !important;
+  max-width: 100% !important;
+}
+
+.basic-report-template .patient-header-table .ref-doctor-degree {
+  font-size: ${Math.max(basePx - 1, 6)}px !important;
+  font-weight: normal !important;
+  color: #444 !important;
+  line-height: 1.25 !important;
+  margin-top: 1px !important;
+  white-space: normal !important;
 }
 ${patientInfoColumnDivider ? `
 /* Vertical rule between the left and right patient info columns.
@@ -3191,7 +3386,7 @@ ${patientInfoColumnDivider ? `
 .basic-report-template .tbl-results td,
 .basic-report-template .tbl-results th {
   border: none !important;
-  padding: 2px 4px !important;
+  padding: ${analyteRowSpacing}px 4px !important;
   line-height: 1.28 !important;
   font-size: ${basePx}px !important;
 }
@@ -3255,9 +3450,13 @@ ${patientInfoColumnDivider ? `
   word-break: break-word !important;
 }
 
+/* 'abnormal' (a Positive/Reactive qualitative verdict) takes the high/alert colour,
+   not the low colour — printing it blue read as "below range". Matches
+   src/utils/buildBasicPreviewHtml.ts so the preview and the PDF agree. */
 .basic-report-template .val.high,
 .basic-report-template .val.critical_high,
 .basic-report-template .val.critical_h,
+.basic-report-template .val.abnormal,
 .basic-report-template .val.H,
 .basic-report-template .val.High {
   color: ${highColor} !important;
@@ -3268,7 +3467,6 @@ ${patientInfoColumnDivider ? `
 .basic-report-template .val.low,
 .basic-report-template .val.critical_low,
 .basic-report-template .val.critical_l,
-.basic-report-template .val.abnormal,
 .basic-report-template .val.L,
 .basic-report-template .val.Low {
   color: ${lowColor} !important;
@@ -3351,7 +3549,7 @@ ${patientInfoColumnDivider ? `
 }
 
 .basic-report-template .narrative-panel {
-  margin: 0 0 14px !important;
+  margin: 0 0 ${testGroupSpacing}px !important;
   border-top: 1.5px solid #000 !important;
   border-bottom: 1px solid #d1d5db !important;
   padding: 8px 0 10px !important;
@@ -3486,12 +3684,17 @@ ${patientInfoColumnDivider ? `
     ? noColorCss.replace(/\.basic-report-template/g, `[data-test-group-id="${groupId}"] .basic-report-template`)
     : noColorCss;
 
-  const reportTitleBarHtml = `
+  // The bar only renders when it still has content: the title, the barcode, or a
+  // top-positioned QR slot. With all three off the report starts at the patient block.
+  const titleBarHasQrSlot = qrPosition === "top_left" || qrPosition === "top_right";
+  const reportTitleBarHtml = (!showReportTitle && !showHeaderBarcode && !titleBarHasQrSlot)
+    ? ""
+    : `
     <div class="report-title-bar">
       <div class="${qrPosition === "top_left" ? "qr-top-left-slot" : "report-title-spacer"}"></div>
-      <h2 class="report-main-title">TEST REPORT</h2>
+      ${showReportTitle ? `<h2 class="report-main-title">TEST REPORT</h2>` : `<div style="flex:1;"></div>`}
       <div class="${qrPosition === "top_right" ? "qr-top-right-slot" : "report-title-barcode"}">
-        {{barcode_image}}
+        ${showHeaderBarcode ? "{{barcode_image}}" : ""}
       </div>
     </div>
   `;
@@ -3552,7 +3755,7 @@ ${patientInfoColumnDivider ? `
             <th>Reg. Date</th><td>: {{orderDate}}</td>
           </tr>
           <tr>
-            <th>Ref. By</th><td>: {{referringDoctorName}}</td>
+            <th>Ref. By</th><td>: {{referringDoctorBlock}}</td>
             <th>Report Date</th><td>: {{reportDate}}</td>
           </tr>
         </tbody>
@@ -3764,7 +3967,7 @@ ${patientInfoColumnDivider ? `
 
 	    // Group title and column labels render once per test group.
 	    testResultsHtml += `
-	      <figure class="table" style="margin: 0 0 14px;">
+	      <figure class="table" style="margin: 0 0 ${testGroupSpacing}px;">
 	        ${!groupTitleBelowHeaders ? `
 	          <div class="${groupTitleClass}">${groupName}</div>
 	          ${specimenText}
@@ -3889,16 +4092,9 @@ ${patientInfoColumnDivider ? `
               : "**")
           : "";
 
-        // Short flag symbol: H / L / A / H* / L*
-        const flagSymbolText = (() => {
-          if (!canonicalFlag || canonicalFlag === "normal") return "";
-          if (canonicalFlag === "high") return "H";
-          if (canonicalFlag === "low") return "L";
-          if (canonicalFlag === "critical_high") return "H*";
-          if (canonicalFlag === "critical_low") return "L*";
-          if (canonicalFlag === "abnormal") return "A";
-          return "";
-        })();
+        // Short flag symbol: H / L / A / H* / L*, limited to the letters the lab
+        // configured in Settings → Result Flag Options.
+        const flagSymbolText = flagSymbolForReport(canonicalFlag, allowedFlagCodes);
 
         // Flag sits directly beside the value (the whole pair right-aligns in the result
         // column), so the visible gap is exactly flagGapPx — not the leftover column width.
@@ -4038,7 +4234,11 @@ ${patientInfoColumnDivider ? `
           if (hasCalcInGroup && calcMarker === "asterisk") parts.push("* Calculated parameter");
           if (printOptions?.flagAsterisk) parts.push("** Abnormal value");
           if (printOptions?.flagAsterisk && printOptions?.flagAsteriskCritical) parts.push("*** Critical value");
-          if (showFlagLegend && flagSymbol !== "none" && hasNumericInGroup) parts.push("H = High &nbsp; L = Low &nbsp; A = Abnormal &nbsp; H* = Critical High &nbsp; L* = Critical Low");
+          if (showFlagLegend && flagSymbol !== "none" && hasNumericInGroup) {
+            // Legend lists only the letters this report can actually print.
+            const legend = flagLegendText(allowedFlagCodes);
+            if (legend) parts.push(legend);
+          }
           return parts.length ? `<p class="calculated-note">${parts.join(" &nbsp;|&nbsp; ")}</p>` : "";
         })()}
         ${_basicGroupInterp ? `<div class="limsv2-report group-interpretation" style="margin-top:8px;padding:6px 0;border-top:1px solid #ddd;font-size:inherit;">${_basicGroupInterp}</div>` : ''}
@@ -4131,7 +4331,7 @@ ${patientInfoColumnDivider ? `
         const isRichHtml = /<table\b/i.test(rawContent);
         if (isRichHtml) {
           return `
-            <div class="section-rich-content" style="margin: 8px 0 14px; page-break-inside: avoid;">
+            <div class="section-rich-content" style="margin: 8px 0 14px;">
               <div class="center-title" style="text-align:center;font-weight:700;text-decoration:underline;font-size:${basePx + 1}px;margin:8px 0 6px;text-transform:uppercase;color:#000;">${label}</div>
               <div style="font-size:${basePx}px;">${rawContent}</div>
             </div>
@@ -7620,7 +7820,7 @@ serve(async (req) => {
         supabaseClient
           .from("orders")
           .select(
-            "sample_collected_by, account_id, location_id, collected_at_location_id",
+            "sample_collected_by, account_id, location_id, collected_at_location_id, referring_doctor_id",
           )
           .eq("id", orderId)
           .maybeSingle(),
@@ -7639,17 +7839,27 @@ serve(async (req) => {
         };
       }
 
-      const { data: resultRemarkRows, error: resultRemarkError } = await supabaseClient
+      let { data: resultRemarkRows, error: resultRemarkError } = await supabaseClient
         .from("results")
-        .select("id, test_group_id, notes")
+        .select("id, test_group_id, notes, report_remark_enabled")
         .eq("order_id", orderId);
+      if (resultRemarkError) {
+        // Tolerate a deploy that lands ahead of the report_remark_enabled
+        // migration rather than dropping every remark from the report.
+        console.warn("Retrying report remarks without the print toggle:", resultRemarkError.message);
+        ({ data: resultRemarkRows, error: resultRemarkError } = await supabaseClient
+          .from("results")
+          .select("id, test_group_id, notes")
+          .eq("order_id", orderId));
+      }
       if (resultRemarkError) {
         console.warn("Failed to load test-group report remarks:", resultRemarkError.message);
       }
       const groupRemarks = new Map<string, string>();
       for (const row of resultRemarkRows || []) {
         const remark = String(row.notes || "").trim();
-        if (row.test_group_id && remark) {
+        // An unticked remark stays in the database for reference but is not printed.
+        if (row.test_group_id && remark && (row as any).report_remark_enabled !== false) {
           groupRemarks.set(row.test_group_id, remark);
         }
       }
@@ -7678,22 +7888,42 @@ serve(async (req) => {
         const collectionLocationId =
           orderContextResult.data.collected_at_location_id ||
           orderContextResult.data.location_id;
-        const [accountResult, collectionLocationResult] = await Promise.all([
-          accountId
-            ? supabaseClient
-              .from("accounts")
-              .select("name")
-              .eq("id", accountId)
-              .maybeSingle()
-            : Promise.resolve({ data: null, error: null }),
-          collectionLocationId
-            ? supabaseClient
-              .from("locations")
-              .select("name")
-              .eq("id", collectionLocationId)
-              .maybeSingle()
-            : Promise.resolve({ data: null, error: null }),
-        ]);
+        const referringDoctorId = orderContextResult.data.referring_doctor_id;
+        const [
+          accountResult,
+          collectionLocationResult,
+          referringDoctorResult,
+          processingLabResult,
+        ] = await Promise
+          .all([
+            accountId
+              ? supabaseClient
+                .from("accounts")
+                .select("name")
+                .eq("id", accountId)
+                .maybeSingle()
+              : Promise.resolve({ data: null, error: null }),
+            collectionLocationId
+              ? supabaseClient
+                .from("locations")
+                .select("name")
+                .eq("id", collectionLocationId)
+                .maybeSingle()
+              : Promise.resolve({ data: null, error: null }),
+            referringDoctorId
+              ? supabaseClient
+                .from("doctors")
+                .select("qualification")
+                .eq("id", referringDoctorId)
+                .maybeSingle()
+              : Promise.resolve({ data: null, error: null }),
+            // Processing centre = the lab's own main lab, resolved below.
+            supabaseClient
+              .from("labs")
+              .select("name, default_processing_location_id")
+              .eq("id", job.lab_id)
+              .maybeSingle(),
+          ]);
 
         if (accountResult.error) {
           console.warn(
@@ -7707,6 +7937,18 @@ serve(async (req) => {
             collectionLocationResult.error.message,
           );
         }
+        if (referringDoctorResult.error) {
+          console.warn(
+            "Failed to enrich report with referring doctor qualification:",
+            referringDoctorResult.error.message,
+          );
+        }
+        if (processingLabResult.error) {
+          console.warn(
+            "Failed to enrich report with processing centre:",
+            processingLabResult.error.message,
+          );
+        }
 
         const b2bAccountName = accountResult.data?.name || "";
         const collectionCenter =
@@ -7714,16 +7956,55 @@ serve(async (req) => {
           context.order?.collectionCenter ||
           context.order?.locationName ||
           "";
+        const referringDoctorQualification = String(
+          referringDoctorResult.data?.qualification || "",
+        ).trim();
+
+        // Prefer the location the lab nominated as its main lab, then any location
+        // flagged as a processing centre, and finally the lab's own name so the
+        // field never prints blank on a single-site lab.
+        let processingCenter = "";
+        const defaultProcessingLocationId =
+          processingLabResult.data?.default_processing_location_id || null;
+        if (defaultProcessingLocationId) {
+          const { data: processingLocation } = await supabaseClient
+            .from("locations")
+            .select("name")
+            .eq("id", defaultProcessingLocationId)
+            .maybeSingle();
+          processingCenter = processingLocation?.name || "";
+        }
+        if (!processingCenter) {
+          const { data: flaggedLocation } = await supabaseClient
+            .from("locations")
+            .select("name")
+            .eq("lab_id", job.lab_id)
+            .eq("is_processing_center", true)
+            .limit(1)
+            .maybeSingle();
+          processingCenter = flaggedLocation?.name || "";
+        }
+        if (!processingCenter) {
+          processingCenter = processingLabResult.data?.name || "";
+        }
 
         context.order = {
           ...(context.order || {}),
           collectionCenter,
           b2bAccountName,
+          // Alias of b2bAccountName so the "Ref. Center" field can be picked
+          // instead of "B2B / Account Name" without changing the data behind it.
+          refCenter: b2bAccountName,
+          processingCenter,
+          referringDoctorQualification,
         };
         context.placeholderValues = {
           ...(context.placeholderValues || {}),
           collectionCenter,
           b2bAccountName,
+          refCenter: b2bAccountName,
+          processingCenter,
+          referringDoctorQualification,
         };
       }
 
@@ -8126,7 +8407,8 @@ serve(async (req) => {
         default_template_style,
         show_methodology,
         show_interpretation,
-        report_patient_info_config
+        report_patient_info_config,
+        flag_options
       `)
         .eq("id", job.lab_id)
         .single();
@@ -8257,7 +8539,18 @@ serve(async (req) => {
         }
       }
 
-      const pdfSettings = labSettings?.pdf_layout_settings || {};
+      // The lab's Result Flag Options ride along inside printOptions so every
+      // renderer that already receives printOptions can gate the printed flag
+      // letter without a new parameter on each template function.
+      const labFlagCodes = resolveConfiguredFlagCodes(labSettings?.flag_options);
+      const pdfSettingsRaw = (labSettings?.pdf_layout_settings || {}) as Record<string, any>;
+      const pdfSettings = labFlagCodes
+        ? {
+          ...pdfSettingsRaw,
+          printOptions: { ...(pdfSettingsRaw.printOptions || {}), _labFlagCodes: labFlagCodes },
+        }
+        : pdfSettingsRaw;
+      console.log("  🏷️ Printable flag codes:", labFlagCodes ? labFlagCodes.join(", ") : "(all — lab has none configured)");
       const ckeTemplateLetterheadUrl = templatesWithHtml.length > 0
         ? applyLetterheadImageTransform(
           await fetchCkeTemplateLetterheadUrl(supabaseClient, job.lab_id) || "",
@@ -9088,6 +9381,23 @@ serve(async (req) => {
           }
         }
 
+        // Orders booked through the order form only have order_tests rows, so
+        // the condition chosen at collection / result entry lives there.
+        const { data: orderTestConditionRows } = await supabaseClient
+          .from("order_tests")
+          .select("test_group_id, sample_condition")
+          .eq("order_id", orderId)
+          .in("test_group_id", testGroupIdsToFetch);
+
+        if (orderTestConditionRows) {
+          for (const row of orderTestConditionRows) {
+            const condition = String(row.sample_condition || "").trim();
+            if (row.test_group_id && condition && !testGroupSampleConditions.has(row.test_group_id)) {
+              testGroupSampleConditions.set(row.test_group_id, condition);
+            }
+          }
+        }
+
         // For any groups not found in order_tests, try the test_groups table
         // Also fetch default_template_style and print_options for all groups
         const { data: testGroupsData } = await supabaseClient
@@ -9495,7 +9805,23 @@ serve(async (req) => {
           sampleCollectedBy: baseContext.order?.sampleCollectedBy || "",
           b2bAccountName: baseContext.order?.b2bAccountName ||
             baseContext.placeholderValues?.b2bAccountName || "",
+          refCenter: baseContext.order?.refCenter ||
+            baseContext.placeholderValues?.refCenter ||
+            baseContext.order?.b2bAccountName ||
+            baseContext.placeholderValues?.b2bAccountName || "",
+          processingCenter: baseContext.order?.processingCenter ||
+            baseContext.placeholderValues?.processingCenter || "",
           referringDoctorName: applyNameCase(baseContext.order?.referringDoctorName),
+          referringDoctorQualification:
+            baseContext.order?.referringDoctorQualification ||
+            baseContext.placeholderValues?.referringDoctorQualification || "",
+          // Pre-rendered "Ref. Doctor" cell — name plus the degree beneath it. Falls
+          // back to the plain name when the doctor master has no degree saved.
+          referringDoctorBlock: buildRefDoctorBlock(
+            applyNameCase(baseContext.order?.referringDoctorName),
+            baseContext.order?.referringDoctorQualification ||
+              baseContext.placeholderValues?.referringDoctorQualification,
+          ),
           approvedAt: baseContext.order?.approvedAtFormatted ||
             baseContext.order?.approved_at || baseContext.meta?.approvedAt ||
             "",

@@ -55,6 +55,7 @@ const navigation = [
 
   // Corporate Bulk Registration
   { name: 'Corporate Bulk', href: '/corporate-bulk', icon: Building2, category: 'corporate' },
+  { name: 'B2B Patient List', href: '/b2b-patients', icon: Building2, category: 'corporate' },
 
   // Business & Administrative
   { name: 'Billing', href: '/billing', icon: Receipt, category: 'business' },
@@ -121,7 +122,7 @@ const categoryConfig: Record<CategoryKey, {
 const sections: { label: string; emoji: string; category: CategoryKey }[] = [
   { label: 'Daily Operations',   emoji: '🔬', category: 'core' },
   { label: 'Patient Management', emoji: '👥', category: 'management' },
-  { label: 'Corporate Bulk',     emoji: '🏢', category: 'corporate' },
+  { label: 'Corporate & B2B',    emoji: '🏢', category: 'corporate' },
   { label: 'Business & Reports', emoji: '💼', category: 'business' },
   { label: 'Communication',      emoji: '💬', category: 'communication' },
   { label: 'Quality Control',    emoji: '🛡️', category: 'qc' },

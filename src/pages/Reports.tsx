@@ -34,7 +34,7 @@ import {
   format,
   isValid,
 } from 'date-fns';
-import { getCalendarDateRange, type CalendarDateFilter } from '../utils/dateRangeFilters';
+import { getCalendarDateRange, parseLocalDateString, toLocalDateString, type CalendarDateFilter } from '../utils/dateRangeFilters';
 import {
   viewPDFReport,
   generateTemplatePreviewPDF,
@@ -123,6 +123,9 @@ interface ApprovedResult {
   print_pdf_generated_at?: string;
   compact_ecopy_url?: string;
   compact_ecopy_generated_at?: string;
+  printed_at?: string | null;
+  printed_by?: string | null;
+  print_count?: number;
   ordered_test_names?: string[];
   // Smart Report fields
   smart_report_url?: string;
@@ -192,6 +195,8 @@ const Reports: React.FC = () => {
   const [selectedDoctor, setSelectedDoctor] = useState('all');
   const [selectedAccount, setSelectedAccount] = useState('all');
   const [dateFilter, setDateFilter] = useState<DateFilter>('today');
+  const [customStartDate, setCustomStartDate] = useState('');
+  const [customEndDate, setCustomEndDate] = useState('');
   const [sortField, setSortField] = useState<SortField>(DEFAULT_REPORT_SORT.field);
   const [sortDirection, setSortDirection] = useState<SortDirection>(DEFAULT_REPORT_SORT.direction);
   const [showFilters, setShowFilters] = useState(false);
@@ -377,7 +382,10 @@ const Reports: React.FC = () => {
       // Store lab ID for PDF settings
       setUserLabId(lab_id);
 
-      const dateRange = getCalendarDateRange(dateFilter);
+      const dateRange = getCalendarDateRange(dateFilter, new Date(), {
+        start: customStartDate,
+        end: customEndDate,
+      });
 
       // ✅ Apply location filtering for access control
       const { shouldFilter, locationIds } = await database.shouldFilterByLocation();
@@ -429,7 +437,7 @@ const Reports: React.FC = () => {
           for (const orderIdBatch of chunkArray(orderIds, RELATED_LOOKUP_BATCH_SIZE)) {
             const { data: reportsData } = await supabase
               .from('reports')
-              .select('id, order_id, status, generated_date, report_type, pdf_url, pdf_generated_at, print_pdf_url, print_pdf_generated_at, print_layout_mode, compact_ecopy_url, compact_ecopy_generated_at')
+              .select('id, order_id, status, generated_date, report_type, pdf_url, pdf_generated_at, print_pdf_url, print_pdf_generated_at, print_layout_mode, compact_ecopy_url, compact_ecopy_generated_at, printed_at, printed_by, print_count')
               .in('order_id', orderIdBatch);
             existingReports.push(...((reportsData as any[]) || []));
           }
@@ -588,6 +596,9 @@ const Reports: React.FC = () => {
             print_pdf_generated_at: (finalReport?.print_pdf_generated_at || draftReport?.print_pdf_generated_at) || undefined,
             compact_ecopy_url: (finalReport?.compact_ecopy_url || draftReport?.compact_ecopy_url) || undefined,
             compact_ecopy_generated_at: (finalReport?.compact_ecopy_generated_at || draftReport?.compact_ecopy_generated_at) || undefined,
+            printed_at: (finalReport?.printed_at || draftReport?.printed_at) || null,
+            printed_by: (finalReport?.printed_by || draftReport?.printed_by) || null,
+            print_count: (finalReport?.print_count ?? draftReport?.print_count ?? 0),
             phone: resolvedPhone,
             ordered_test_names: orderedTestNames.length > 0 ? orderedTestNames : undefined,
             // Smart Report fields
@@ -607,7 +618,7 @@ const Reports: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  }, [dateFilter, pollPDFQueueStatus]);
+  }, [dateFilter, customStartDate, customEndDate, pollPDFQueueStatus]);
 
   useEffect(() => {
     const checkAdminStatus = async () => {
@@ -999,6 +1010,64 @@ const Reports: React.FC = () => {
 
 
 
+  // Stamp an order's report as printed so the list shows a "Printed" status and
+  // staff can tell at a glance which hard copies have already been taken out.
+  const markOrderPrinted = useCallback(async (orderIds: string | string[]) => {
+    const ids = Array.from(new Set((Array.isArray(orderIds) ? orderIds : [orderIds]).filter(Boolean)));
+    if (ids.length === 0) return;
+
+    const printedAt = new Date().toISOString();
+
+    // Optimistic — flip the badge/row colour straight away.
+    setApprovedResults(prev => prev.map(result => (
+      ids.includes(result.order_id)
+        ? { ...result, printed_at: printedAt, print_count: (result.print_count ?? 0) + 1 }
+        : result
+    )));
+
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+
+      const { data: existingRows } = await supabase
+        .from('reports')
+        .select('order_id, print_count')
+        .in('order_id', ids);
+
+      const countByOrder = new Map<string, number>(
+        ((existingRows as Array<{ order_id: string; print_count: number | null }>) || [])
+          .map(row => [row.order_id, row.print_count ?? 0])
+      );
+
+      const updates = await Promise.all(ids.map(orderId =>
+        supabase
+          .from('reports')
+          .update({
+            printed_at: printedAt,
+            printed_by: user?.id ?? null,
+            print_count: (countByOrder.get(orderId) ?? 0) + 1,
+            updated_at: printedAt,
+          })
+          .eq('order_id', orderId)
+          .select('order_id')
+      ));
+
+      const failed = updates.find(update => update.error);
+      if (failed?.error) throw failed.error;
+
+      // A row that was not written (missing report row / blocked by RLS) must not
+      // keep showing an optimistic "Printed" badge.
+      const savedCount = updates.reduce((total, update) => total + ((update.data as unknown[])?.length ?? 0), 0);
+      if (savedCount < ids.length) {
+        console.warn(`Print status saved for ${savedCount}/${ids.length} orders — re-syncing.`);
+        void loadApprovedResults();
+      }
+    } catch (error) {
+      console.error('Could not record print status:', error);
+      // Re-sync so the badge never claims a print that was not saved.
+      void loadApprovedResults();
+    }
+  }, [loadApprovedResults]);
+
   const handleLetterheadGeneration = async (
     orderId: string,
     printLayoutMode: 'standard' | 'compact' = 'standard',
@@ -1031,6 +1100,9 @@ const Reports: React.FC = () => {
 
       if (generatedUrl) {
         window.open(generatedUrl, '_blank');
+        if (trackingType === 'compact-print') {
+          await markOrderPrinted(orderId);
+        }
       } else {
         alert('Report generated but no URL returned. Check console.');
       }
@@ -1297,6 +1369,7 @@ const Reports: React.FC = () => {
 
         if (status.status === 'completed' && status.zip_url) {
           window.open(status.zip_url, '_blank');
+          await markOrderPrinted(orderIds);
           return;
         }
         if (status.status === 'failed') {
@@ -1311,7 +1384,7 @@ const Reports: React.FC = () => {
       setIsBulkPrintingSelectedReports(false);
       setBulkPrintProgress(null);
     }
-  }, [orderGroups, selectedOrders]);
+  }, [markOrderPrinted, orderGroups, selectedOrders]);
 
   const moveOrderSettingsGroup = useCallback((index: number, direction: -1 | 1) => {
     setOrderSettingsGroups(prev => {
@@ -1409,9 +1482,10 @@ const Reports: React.FC = () => {
     if (!generatedUrl) throw new Error('Compact print generated but no URL returned.');
 
     window.open(generatedUrl, '_blank');
+    await markOrderPrinted(orderId);
     await loadApprovedResults();
     return generatedUrl;
-  }, [loadApprovedResults]);
+  }, [loadApprovedResults, markOrderPrinted]);
 
   const saveOrderReportSettings = useCallback(async (
     orderId: string,
@@ -1697,6 +1771,22 @@ const Reports: React.FC = () => {
 
   const selectAllOrders = () => setSelectedOrders(new Set(orderGroups.map((g) => g.order_id)));
   const clearSelection = () => setSelectedOrders(new Set());
+
+  const dateFilterLabel = (() => {
+    if (dateFilter === 'all') return 'All dates';
+    if (dateFilter !== 'custom') return dateFilter;
+    const pretty = (value: string) => {
+      const parsed = parseLocalDateString(value);
+      return parsed ? parsed.toLocaleDateString() : null;
+    };
+    const from = customStartDate ? pretty(customStartDate) : null;
+    const to = customEndDate ? pretty(customEndDate) : null;
+    if (from && to) return from === to ? from : `${from} to ${to}`;
+    if (from) return `From ${from}`;
+    if (to) return `Up to ${to}`;
+    return 'All dates';
+  })();
+
   const clearAllFilters = () => {
     setSearchTerm('');
     setSelectedStatus('all');
@@ -1704,6 +1794,8 @@ const Reports: React.FC = () => {
     setSelectedDoctor('all');
     setSelectedAccount('all');
     setDateFilter('today');
+    setCustomStartDate('');
+    setCustomEndDate('');
     setSortField(DEFAULT_REPORT_SORT.field);
     setSortDirection(DEFAULT_REPORT_SORT.direction);
   };
@@ -2135,6 +2227,36 @@ const Reports: React.FC = () => {
     }
   };
 
+  // Print status for an order: used for the badge, row tint and button colours.
+  const getPrintInfo = (group: OrderGroup) => {
+    const result = group.results[0] as ApprovedResult | undefined;
+    const printedAt = result?.printed_at || null;
+    const printCount = result?.print_count ?? 0;
+    return {
+      printedAt,
+      printCount,
+      isPrinted: Boolean(printedAt),
+      label: printedAt
+        ? `Printed ${safeFormatDate(printedAt, 'MMM d, yyyy h:mm a')}${printCount > 1 ? ` • ${printCount} times` : ''}`
+        : 'Not printed yet',
+    };
+  };
+
+  const getPrintedBadge = (group: OrderGroup) => {
+    const { isPrinted, printCount, label } = getPrintInfo(group);
+    if (!isPrinted) return null;
+
+    return (
+      <span
+        className="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-slate-700 text-white border border-slate-800"
+        title={label}
+      >
+        <Printer className="w-3 h-3 mr-1" />
+        Printed{printCount > 1 ? ` ×${printCount}` : ''}
+      </span>
+    );
+  };
+
   const getStatusBadge = (group: OrderGroup) => {
     const result = group.results[0] as ApprovedResult;
 
@@ -2471,16 +2593,51 @@ const Reports: React.FC = () => {
                   <label className="block text-sm font-medium text-gray-700 mb-2">Date Range</label>
                   <select
                     value={dateFilter}
-                    onChange={(e) => setDateFilter(e.target.value as DateFilter)}
+                    onChange={(e) => {
+                      const next = e.target.value as DateFilter;
+                      if (next === 'custom' && !customStartDate && !customEndDate) {
+                        // Seed both ends with today so switching over doesn't load every record.
+                        const today = toLocalDateString(new Date());
+                        setCustomStartDate(today);
+                        setCustomEndDate(today);
+                      }
+                      setDateFilter(next);
+                    }}
                     className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
                   >
                     <option value="today">Today</option>
                     <option value="yesterday">Yesterday</option>
                     <option value="week">This Week</option>
                     <option value="month">This Month</option>
+                    <option value="custom">Custom Range</option>
                     <option value="all">All Dates</option>
                   </select>
                 </div>
+
+                {dateFilter === 'custom' && (
+                  <>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-2">From Date</label>
+                      <input
+                        type="date"
+                        value={customStartDate}
+                        max={customEndDate || undefined}
+                        onChange={(e) => setCustomStartDate(e.target.value)}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-2">To Date</label>
+                      <input
+                        type="date"
+                        value={customEndDate}
+                        min={customStartDate || undefined}
+                        onChange={(e) => setCustomEndDate(e.target.value)}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                      />
+                    </div>
+                  </>
+                )}
 
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-2">Report Status</label>
@@ -2809,7 +2966,9 @@ const Reports: React.FC = () => {
                 {orderGroups.map((group, index) => (
                   <div
                     key={group.order_id}
-                    className={`p-6 hover:bg-gray-50 transition-colors ${index % 2 === 0 ? 'bg-white' : 'bg-gray-25'
+                    className={`p-6 transition-colors border-l-4 ${getPrintInfo(group).isPrinted
+                      ? 'border-l-slate-500 bg-slate-50 hover:bg-slate-100'
+                      : `border-l-transparent hover:bg-gray-50 ${index % 2 === 0 ? 'bg-white' : 'bg-gray-25'}`
                       }`}
                   >
                     {/* Desktop View */}
@@ -2865,6 +3024,7 @@ const Reports: React.FC = () => {
 
                         <div className="col-span-4 flex items-center justify-end gap-2">
                           {getStatusBadge(group)}
+                          {getPrintedBadge(group)}
                           {getPDFAutoGenBadge(group.order_id)}
                         </div>
                       </div>
@@ -2908,7 +3068,7 @@ const Reports: React.FC = () => {
                                       className={`flex items-center px-1.5 py-1 text-xs rounded-r transition-colors border-l border-amber-700 ${(group.results[0] as ApprovedResult)?.draft_report?.print_pdf_url ? 'bg-amber-500 text-white hover:bg-amber-600' : 'bg-gray-200 text-gray-500 cursor-not-allowed'}`}
                                       onClick={() => {
                                         const url = (group.results[0] as ApprovedResult)?.draft_report?.print_pdf_url;
-                                        if (url) window.open(url, '_blank');
+                                        if (url) { window.open(url, '_blank'); void markOrderPrinted(group.order_id); }
                                       }}
                                       disabled={!(group.results[0] as ApprovedResult)?.draft_report?.print_pdf_url}
                                       title="Download print draft"
@@ -2974,17 +3134,18 @@ const Reports: React.FC = () => {
                                 </button>
 
                                 <button
-                                  className={`flex items-center px-1.5 py-1 text-xs rounded transition-colors ${(group.results[0] as ApprovedResult)?.final_report?.print_pdf_url ? 'bg-emerald-600 text-white hover:bg-emerald-700' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'} ${isPdfGenerating(group.order_id, 'compact-print') ? 'opacity-60 cursor-not-allowed' : ''}`}
+                                  className={`flex items-center space-x-1 px-1.5 py-1 text-xs rounded transition-colors ${getPrintInfo(group).isPrinted ? 'bg-slate-700 text-white hover:bg-slate-800' : (group.results[0] as ApprovedResult)?.final_report?.print_pdf_url ? 'bg-emerald-600 text-white hover:bg-emerald-700' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'} ${isPdfGenerating(group.order_id, 'compact-print') ? 'opacity-60 cursor-not-allowed' : ''}`}
                                   onClick={() => {
                                     const printUrl = (group.results[0] as ApprovedResult)?.final_report?.print_pdf_url;
-                                    if (printUrl) { window.open(printUrl, '_blank'); return; }
+                                    if (printUrl) { window.open(printUrl, '_blank'); void markOrderPrinted(group.order_id); return; }
                                     void handleLetterheadGeneration(group.order_id, 'compact', 'compact-print');
                                   }}
                                   onContextMenu={(e) => { e.preventDefault(); if (window.confirm('Regenerate compact print PDF?')) void handleLetterheadGeneration(group.order_id, 'compact', 'compact-print'); }}
                                   disabled={isPdfGenerating(group.order_id, 'compact-print')}
-                                  title={isPdfGenerating(group.order_id, 'compact-print') ? 'Generating compact print…' : (group.results[0] as ApprovedResult)?.final_report?.print_pdf_url ? 'Open compact print PDF. Right-click to regenerate.' : 'Generate compact print PDF'}
+                                  title={isPdfGenerating(group.order_id, 'compact-print') ? 'Generating compact print…' : getPrintInfo(group).isPrinted ? `${getPrintInfo(group).label} — click to print again` : (group.results[0] as ApprovedResult)?.final_report?.print_pdf_url ? 'Open compact print PDF. Right-click to regenerate.' : 'Generate compact print PDF'}
                                 >
                                   {isPdfGenerating(group.order_id, 'compact-print') ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Printer className="w-3.5 h-3.5" />}
+                                  {getPrintInfo(group).isPrinted && <CheckCircle className="w-3 h-3" />}
                                 </button>
                                 <button
                                   className={`flex items-center px-1.5 py-1 text-xs rounded transition-colors ${(group.results[0] as ApprovedResult)?.compact_ecopy_url ? 'bg-indigo-600 text-white hover:bg-indigo-700' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'} ${isPdfGenerating(group.order_id, 'compact-ecopy') ? 'opacity-60 cursor-not-allowed' : ''}`}
@@ -3137,7 +3298,7 @@ const Reports: React.FC = () => {
 
                     {/* Mobile Card View */}
                     <div className="lg:hidden">
-                      <div className="bg-white rounded-lg border border-gray-200 p-4 shadow-sm">
+                      <div className={`rounded-lg border p-4 shadow-sm ${getPrintInfo(group).isPrinted ? 'bg-slate-50 border-slate-300' : 'bg-white border-gray-200'}`}>
                         <div className="flex items-start justify-between mb-4">
                           <div className="flex items-center space-x-3">
                             <input
@@ -3155,7 +3316,10 @@ const Reports: React.FC = () => {
                               </div>
                             </div>
                           </div>
-                          {getStatusBadge(group)}
+                          <div className="flex flex-col items-end gap-1">
+                            {getStatusBadge(group)}
+                            {getPrintedBadge(group)}
+                          </div>
                         </div>
 
                         <div className="space-y-3">
@@ -3219,7 +3383,7 @@ const Reports: React.FC = () => {
                                         className={`flex items-center justify-center px-3 py-2 text-sm rounded-r-md transition-colors border-l border-amber-700 ${(group.results[0] as ApprovedResult)?.draft_report?.print_pdf_url ? 'bg-amber-500 text-white hover:bg-amber-600' : 'bg-gray-200 text-gray-500 cursor-not-allowed'}`}
                                         onClick={() => {
                                           const url = (group.results[0] as ApprovedResult)?.draft_report?.print_pdf_url;
-                                          if (url) window.open(url, '_blank');
+                                          if (url) { window.open(url, '_blank'); void markOrderPrinted(group.order_id); }
                                         }}
                                         disabled={!(group.results[0] as ApprovedResult)?.draft_report?.print_pdf_url}
                                         title="Download print draft"
@@ -3407,17 +3571,17 @@ const Reports: React.FC = () => {
                                     <Settings className="w-4 h-4" />
                                   </button>
                                   <button
-                                    className={`flex-1 flex items-center justify-center space-x-1 px-3 py-2 text-sm rounded-md transition-colors ${(group.results[0] as ApprovedResult)?.final_report?.print_pdf_url ? 'bg-emerald-600 text-white hover:bg-emerald-700' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'}`}
+                                    className={`flex-1 flex items-center justify-center space-x-1 px-3 py-2 text-sm rounded-md transition-colors ${getPrintInfo(group).isPrinted ? 'bg-slate-700 text-white hover:bg-slate-800' : (group.results[0] as ApprovedResult)?.final_report?.print_pdf_url ? 'bg-emerald-600 text-white hover:bg-emerald-700' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'}`}
                                     onClick={() => {
                                       const printUrl = (group.results[0] as ApprovedResult)?.final_report?.print_pdf_url;
-                                      if (printUrl) { window.open(printUrl, '_blank'); return; }
-                                      void handleLetterheadGeneration(group.order_id, 'compact');
+                                      if (printUrl) { window.open(printUrl, '_blank'); void markOrderPrinted(group.order_id); return; }
+                                      void handleLetterheadGeneration(group.order_id, 'compact', 'compact-print');
                                     }}
-                                    onContextMenu={(e) => { e.preventDefault(); if (window.confirm('Regenerate compact print PDF?')) void handleLetterheadGeneration(group.order_id, 'compact'); }}
-                                    title={(group.results[0] as ApprovedResult)?.final_report?.print_pdf_url ? 'Open compact print PDF. Right-click to regenerate.' : 'Generate compact print PDF'}
+                                    onContextMenu={(e) => { e.preventDefault(); if (window.confirm('Regenerate compact print PDF?')) void handleLetterheadGeneration(group.order_id, 'compact', 'compact-print'); }}
+                                    title={getPrintInfo(group).isPrinted ? `${getPrintInfo(group).label} — tap to print again` : (group.results[0] as ApprovedResult)?.final_report?.print_pdf_url ? 'Open compact print PDF. Right-click to regenerate.' : 'Generate compact print PDF'}
                                   >
                                     <Printer className="w-4 h-4" />
-                                    <span>Print</span>
+                                    <span>{getPrintInfo(group).isPrinted ? 'Printed' : 'Print'}</span>
                                   </button>
                                   <button
                                     className={`flex-1 flex items-center justify-center space-x-1 px-3 py-2 text-sm rounded-md transition-colors ${(group.results[0] as ApprovedResult)?.compact_ecopy_url ? 'bg-indigo-600 text-white hover:bg-indigo-700' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'}`}
@@ -3546,7 +3710,7 @@ const Reports: React.FC = () => {
               <div className="flex items-center">
                 <Calendar className="h-4 w-4 text-blue-600 mr-2" />
                 <span className="text-blue-900 font-medium">
-                  Viewing: {dateFilter === 'all' ? 'All dates' : dateFilter}
+                  Viewing: {dateFilterLabel}
                 </span>
               </div>
               <div className="flex items-center">
@@ -3851,8 +4015,10 @@ const Reports: React.FC = () => {
                     type="button"
                     className="px-4 py-2 text-sm bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50"
                     onClick={() => {
-                      if (orderSettingsExistingPrintUrl) window.open(orderSettingsExistingPrintUrl, '_blank');
-                      else void handleRegenerateFromOrderSettings();
+                      if (orderSettingsExistingPrintUrl) {
+                        window.open(orderSettingsExistingPrintUrl, '_blank');
+                        if (orderSettingsOrderId) void markOrderPrinted(orderSettingsOrderId);
+                      } else void handleRegenerateFromOrderSettings();
                     }}
                     disabled={orderSettingsLoading || orderSettingsSaving || !orderSettingsOrderId}
                   >

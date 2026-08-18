@@ -11,6 +11,7 @@ interface Payment {
   payment_date: string;
   received_by: string | null;
   created_at: string;
+  invoices?: { patient_name: string | null; invoice_number: string | null } | null;
 }
 
 interface PaymentSummary {
@@ -71,6 +72,34 @@ const PaymentSummaryReport: React.FC = () => {
 
   const totalCollected = payments.reduce((sum, payment) => sum + payment.amount, 0);
 
+  const patientNameOf = (payment: Payment) => payment.invoices?.patient_name?.trim() || '-';
+
+  // Prefer the human-readable invoice number; the uuid is the only fallback
+  const invoiceLabelOf = (payment: Payment) =>
+    payment.invoices?.invoice_number?.trim() || payment.invoice_id;
+
+  const exportCsv = () => {
+    const header = ['Date', 'Patient', 'Invoice ID', 'Method', 'Reference', 'Amount'];
+    const rows = payments.map((payment) => [
+      new Date(payment.payment_date).toLocaleDateString(),
+      patientNameOf(payment),
+      invoiceLabelOf(payment),
+      payment.payment_method,
+      payment.payment_reference || '',
+      String(payment.amount),
+    ]);
+
+    const csv = [header, ...rows]
+      .map((row) => row.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(','))
+      .join('\r\n');
+
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(new Blob([`﻿${csv}`], { type: 'text/csv;charset=utf-8;' }));
+    link.download = `payment_collections_${startDate}_to_${endDate}.csv`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+  };
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -80,7 +109,11 @@ const PaymentSummaryReport: React.FC = () => {
             <Printer className="h-4 w-4 mr-2" />
             Print Report
           </button>
-          <button className="flex items-center px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors">
+          <button
+            onClick={exportCsv}
+            disabled={payments.length === 0}
+            className="flex items-center px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+          >
             <Download className="h-4 w-4 mr-2" />
             Export CSV
           </button>
@@ -264,6 +297,9 @@ const PaymentSummaryReport: React.FC = () => {
                   Date
                 </th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                  Patient
+                </th>
+                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                   Invoice ID
                 </th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
@@ -280,7 +316,7 @@ const PaymentSummaryReport: React.FC = () => {
             <tbody className="bg-white divide-y divide-gray-200">
               {payments.length === 0 ? (
                 <tr>
-                  <td colSpan={5} className="px-6 py-4 text-center text-gray-500">
+                  <td colSpan={6} className="px-6 py-4 text-center text-gray-500">
                     No payment data available for the selected date range
                   </td>
                 </tr>
@@ -290,8 +326,11 @@ const PaymentSummaryReport: React.FC = () => {
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600">
                       {new Date(payment.payment_date).toLocaleDateString()}
                     </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+                      {patientNameOf(payment)}
+                    </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                      {payment.invoice_id}
+                      {invoiceLabelOf(payment)}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
                       <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${

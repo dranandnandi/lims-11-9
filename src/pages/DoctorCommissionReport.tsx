@@ -6,7 +6,11 @@ import {
     TrendingUp, AlertCircle, RefreshCw, Bike, Stethoscope, FileDown
 } from 'lucide-react';
 import { supabase, database } from '../utils/supabase';
-import { downloadCommissionReportPdf } from '../utils/commissionReportPdf';
+import {
+    downloadCommissionReportPdf,
+    type CommissionPdfItemDetail,
+    type CommissionPdfOptionalColumn
+} from '../utils/commissionReportPdf';
 
 interface PhlebotomistVisit {
     order_id: string;
@@ -23,6 +27,22 @@ interface Doctor {
     id: string;
     name: string;
 }
+
+/** Levels the exported PDF can show the sharing breakdown at */
+const PDF_DETAIL_OPTIONS: Array<{ value: CommissionPdfItemDetail; label: string; hint: string }> = [
+    { value: 'none', label: 'Order only', hint: 'Order rows with the order-level sharing amount, no test listing' },
+    { value: 'names', label: 'Test names', hint: 'List test names under each order, sharing amount shown at order level only' },
+    { value: 'full', label: 'Test-wise', hint: 'Each test with its amount, sharing percent and commission' }
+];
+
+/** Columns the user can drop from the exported statement */
+const PDF_OPTIONAL_COLUMNS: Array<{ key: CommissionPdfOptionalColumn; label: string }> = [
+    { key: 'status', label: 'Status' },
+    { key: 'payment', label: 'Payment' },
+    { key: 'adjust', label: 'Adjustments' },
+    { key: 'base', label: 'Base' },
+    { key: 'commission', label: 'Commission' }
+];
 
 type AdjustmentMode = 'none' | 'exclude_from_base' | 'deduct_from_commission' | 'split_50_50';
 
@@ -119,7 +139,9 @@ const DoctorCommissionReport: React.FC = () => {
     const [includeUnbilled, setIncludeUnbilled] = useState(false);
     const [searchQuery, setSearchQuery] = useState('');
     const [pdfBusy, setPdfBusy] = useState(false);
-    const [pdfIncludeItems, setPdfIncludeItems] = useState(true);
+    // Detail level the PDF prints under each order row (see commissionReportPdf)
+    const [pdfItemDetail, setPdfItemDetail] = useState<CommissionPdfItemDetail>('full');
+    const [pdfHiddenColumns, setPdfHiddenColumns] = useState<CommissionPdfOptionalColumn[]>([]);
 
     // Phlebotomist Visits tab
     const [activeTab, setActiveTab] = useState<'doctor' | 'phlebotomist'>('doctor');
@@ -640,7 +662,8 @@ const DoctorCommissionReport: React.FC = () => {
                 dateFrom,
                 dateTo,
                 labName,
-                includeItems: pdfIncludeItems
+                itemDetail: pdfItemDetail,
+                hiddenColumns: pdfHiddenColumns
             });
         } catch (err) {
             console.error('Error generating commission PDF:', err);
@@ -802,17 +825,6 @@ const DoctorCommissionReport: React.FC = () => {
                                         {pdfBusy ? <RefreshCw className="h-4 w-4 animate-spin" /> : <FileDown className="h-4 w-4" />}
                                         Export PDF (A4 landscape)
                                     </button>
-                                    <label className="flex items-center gap-2 cursor-pointer select-none">
-                                        <input
-                                            type="checkbox"
-                                            checked={pdfIncludeItems}
-                                            onChange={(e) => setPdfIncludeItems(e.target.checked)}
-                                            className="rounded border-gray-300 text-emerald-600 focus:ring-emerald-500"
-                                        />
-                                        <span className="text-sm text-gray-700">
-                                            Test-wise breakup in PDF
-                                        </span>
-                                    </label>
                                 </>
                             )}
                             <label className="flex items-center gap-2 cursor-pointer select-none">
@@ -839,6 +851,55 @@ const DoctorCommissionReport: React.FC = () => {
                         </button>
                     )}
                 </div>
+
+                {/* PDF layout options — what the exported statement shows */}
+                {activeTab === 'doctor' && commissions.length > 0 && (
+                    <div className="mt-4 rounded-lg border border-gray-200 bg-gray-50 p-4 space-y-3">
+                        <div className="flex flex-wrap items-center gap-3">
+                            <span className="text-sm font-medium text-gray-700">PDF sharing detail:</span>
+                            <div className="flex rounded-lg border border-gray-300 overflow-hidden bg-white">
+                                {PDF_DETAIL_OPTIONS.map((option) => (
+                                    <button
+                                        key={option.value}
+                                        type="button"
+                                        onClick={() => setPdfItemDetail(option.value)}
+                                        title={option.hint}
+                                        className={`px-3 py-1.5 text-sm border-l border-gray-300 first:border-l-0 transition-colors ${
+                                            pdfItemDetail === option.value
+                                                ? 'bg-emerald-600 text-white'
+                                                : 'text-gray-700 hover:bg-gray-100'
+                                        }`}
+                                    >
+                                        {option.label}
+                                    </button>
+                                ))}
+                            </div>
+                            <span className="text-xs text-gray-500">
+                                {PDF_DETAIL_OPTIONS.find(o => o.value === pdfItemDetail)?.hint}
+                            </span>
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+                            <span className="text-sm font-medium text-gray-700">PDF columns:</span>
+                            {PDF_OPTIONAL_COLUMNS.map((column) => (
+                                <label key={column.key} className="flex items-center gap-2 cursor-pointer select-none">
+                                    <input
+                                        type="checkbox"
+                                        checked={!pdfHiddenColumns.includes(column.key)}
+                                        onChange={(e) => setPdfHiddenColumns(prev => (
+                                            e.target.checked
+                                                ? prev.filter(key => key !== column.key)
+                                                : [...prev, column.key]
+                                        ))}
+                                        className="rounded border-gray-300 text-emerald-600 focus:ring-emerald-500"
+                                    />
+                                    <span className="text-sm text-gray-700">{column.label}</span>
+                                </label>
+                            ))}
+                            <span className="text-xs text-gray-500">Unticked columns are left out; the rest widen to fill the page.</span>
+                        </div>
+                    </div>
+                )}
 
                 {error && (
                     <div className="mt-4 p-3 bg-red-50 text-red-700 rounded-lg flex items-center gap-2">

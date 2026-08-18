@@ -16,6 +16,7 @@ interface Phlebotomist {
   email: string;
   role: string;
   phone?: string;
+  contact_number?: string;
 }
 
 const PhlebotomistSelect: React.FC<PhlebotomistSelectProps> = ({
@@ -98,7 +99,7 @@ const PhlebotomistSelect: React.FC<PhlebotomistSelectProps> = ({
       <option value="">{placeholder}</option>
       {phlebotomists.map((phlebotomist) => (
         <option key={phlebotomist.id} value={phlebotomist.id}>
-          {phlebotomist.name} {phlebotomist.phone ? `(${phlebotomist.phone})` : ''}
+          {phlebotomist.name} {(phlebotomist.contact_number || phlebotomist.phone) ? `(${phlebotomist.contact_number || phlebotomist.phone})` : ''}
         </option>
       ))}
       {phlebotomists.length === 0 && (

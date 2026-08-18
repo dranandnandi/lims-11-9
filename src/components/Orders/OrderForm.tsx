@@ -27,6 +27,7 @@ import {
 } from 'lucide-react';
 import { database, supabase, formatAge, LabPatientFieldConfig, DEFAULT_PATIENT_FORM_SETTINGS, type LabPatientFormSettings } from '../../utils/supabase';
 import { notificationTriggerService, formatName } from '../../utils/notificationTriggerService';
+import { detectGenderFromName } from '../../utils/genderDetection';
 import { useQZTray } from '../../contexts/QZTrayContext';
 import { SampleTypeIndicator } from '../Common/SampleTypeIndicator';
 import { getLabCurrency } from '../../utils/currency';
@@ -266,6 +267,11 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
   const [discountType, setDiscountType] = useState<'percentage' | 'fixed'>('percentage');
   const [discountValue, setDiscountValue] = useState<number>(0);
   const [discountBy, setDiscountBy] = useState<'lab' | 'doctor'>('lab');
+  // Set when the default discount of the bill-to account / location / doctor is pre-filled,
+  // so the UI can name its source and order submission can tell it apart from a manual one.
+  const [autoDiscountLabel, setAutoDiscountLabel] = useState<string | null>(null);
+  // Once the operator edits the discount themselves we stop overwriting it.
+  const discountTouchedRef = useRef(false);
   const [paymentMethod, setPaymentMethod] = useState<'cash' | 'card' | 'upi' | 'online'>('cash');
   const [amountPaid, setAmountPaid] = useState<number>(0);
   const [takeFullPayment, setTakeFullPayment] = useState<boolean>(false);
@@ -581,6 +587,10 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
   const [creditInfo, setCreditInfo] = useState<{
     kind: 'location' | 'account';
     allowed: boolean;
+    /** Account Master flag: credit never blocks this account */
+    bypassCreditCheck?: boolean;
+    /** When a time-limited bypass runs out (ISO). Null/absent = no expiry. */
+    bypassCreditUntil?: string | null;
     currentBalance: number;
     creditLimit: number;
     availableCredit: number;
@@ -617,18 +627,6 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
   const [npGenderAutoDetected, setNpGenderAutoDetected] = useState(false);
   const [npGenderManuallySet, setNpGenderManuallySet] = useState(false);
 
-  const npDetectGender = (sal: string, first: string, last: string): 'Male' | 'Female' | '' => {
-    const s = sal.toLowerCase().replace('.', '');
-    if (['mr', 'master', 'shri', 'shriman'].includes(s)) return 'Male';
-    if (['mrs', 'ms', 'miss', 'smt', 'shrimati', 'ku', 'kumari', 'baby'].includes(s)) return 'Female';
-    const words = `${first} ${last}`.toLowerCase().split(/\s+/);
-    const female = ['ben', 'bhen', 'bai', 'devi', 'kumari', 'shrimati', 'smt', 'sister', 'mata', 'amma', 'didi'];
-    const male = ['bhai', 'bro', 'shriman', 'lal', 'singh', 'ram', 'kumar'];
-    if (words.some(w => female.includes(w))) return 'Female';
-    if (words.some(w => male.includes(w))) return 'Male';
-    return '';
-  };
-
   const npGetFullName = () =>
     [npSalutation, npFirstName.trim(), npMiddleName.trim(), npLastName.trim()].filter(Boolean).join(' ');
 
@@ -640,10 +638,12 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
   // Auto-detect gender when split name fields change (skipped if user manually picked)
   useEffect(() => {
     if (!npGenderManuallySet) {
-      const detected = npDetectGender(npSalutation, npFirstName, npLastName);
+      const detected = detectGenderFromName(npSalutation, npFirstName, npMiddleName, npLastName);
       if (detected) {
         setNewPatient(p => ({ ...p, gender: detected }));
         setNpGenderAutoDetected(true);
+      } else {
+        setNpGenderAutoDetected(false);
       }
     }
     // Always sync composed name
@@ -923,6 +923,8 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
             setCreditInfo({
               kind: 'account',
               allowed: !!res.allowed,
+              bypassCreditCheck: !!res.bypassCreditCheck,
+              bypassCreditUntil: res.bypassCreditUntil ?? null,
               currentBalance: Number(res.currentBalance ?? 0),
               creditLimit: Number(res.creditLimit ?? 0),
               availableCredit: Number(res.availableCredit ?? 0),
@@ -1394,6 +1396,8 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
     setDiscountType('percentage');
     setDiscountValue(0);
     setDiscountBy('lab');
+    setAutoDiscountLabel(null);
+    discountTouchedRef.current = false;
     setPaymentMethod('cash');
     setAmountPaid(0);
     setTakeFullPayment(false);
@@ -1697,8 +1701,11 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
         }
       }
 
-      // Auto-create invoice and payment if discount or payment is provided
-      if (discountValue > 0 || amountPaid > 0) {
+      // Auto-create invoice and payment if a manual discount or a payment is provided.
+      // A discount merely pre-filled from the account/location/doctor master must NOT bill the
+      // order here — it is re-derived when the invoice is raised (CreateInvoiceModal) and the
+      // order has to stay unbilled for monthly accounts to consolidate it.
+      if ((discountValue > 0 && discountTouchedRef.current) || amountPaid > 0) {
         try {
           setSubmissionProgress('Creating invoice and payment...');
 
@@ -2101,6 +2108,57 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
     setCollectionCharge(autoCharge);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedTests.join(',')]);
+
+  // Pre-fill the default discount configured in the masters: bill-to account first, then
+  // location, then referring doctor — the same precedence CreateInvoiceModal uses when the
+  // invoice is raised later, so the order total no longer sits at full price until billing.
+  // Tests already on an account contract rate are excluded: their discount is baked into the
+  // price, which is why the pre-fill can land as an amount instead of a straight percentage.
+  React.useEffect(() => {
+    if (discountTouchedRef.current) return;
+
+    const account = selectedAccount ? accounts.find(a => a.id === selectedAccount) : null;
+    const location = selectedLocation ? locations.find(l => l.id === selectedLocation) : null;
+    const doctor = selectedDoctor && selectedDoctor !== SELF_DOCTOR_ID
+      ? doctors.find(d => d.id === selectedDoctor)
+      : null;
+
+    const source =
+      Number(account?.default_discount_percent) > 0 ? { pct: Number(account!.default_discount_percent), name: account!.name } :
+      Number(location?.default_discount_percent) > 0 ? { pct: Number(location!.default_discount_percent), name: location!.name } :
+      Number(doctor?.default_discount_percent) > 0 ? { pct: Number(doctor!.default_discount_percent), name: `Dr. ${doctor!.name}` } :
+      null;
+
+    if (!source) {
+      setDiscountValue(0);
+      setAutoDiscountLabel(null);
+      return;
+    }
+
+    const contractedTotal = selectedTestRows.reduce(
+      (sum, t) => sum + (selectedAccount && accountPrices[t.id] !== undefined ? resolvePrice(t.id, t.price).price : 0),
+      0
+    );
+    const discountableTotal = totalAmount - contractedTotal;
+
+    if (discountableTotal <= 0) {
+      setDiscountValue(0);
+      setAutoDiscountLabel(contractedTotal > 0 ? `${source.name} is billed at contract rates` : null);
+      return;
+    }
+
+    if (contractedTotal > 0) {
+      setDiscountType('fixed');
+      setDiscountValue(Math.round(discountableTotal * source.pct) / 100);
+      setAutoDiscountLabel(`${source.pct}% default discount (${source.name}) on non-contract tests`);
+    } else {
+      setDiscountType('percentage');
+      setDiscountValue(source.pct);
+      setAutoDiscountLabel(`Default discount from ${source.name}`);
+    }
+    // selectedTestRows / resolvePrice are derived from the deps already listed
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedAccount, selectedLocation, selectedDoctor, accounts, locations, doctors, accountPrices, totalAmount, selectedTests.join(',')]);
 
   // Calculate discount
   const discountAmount = discountValue > 0
@@ -2569,7 +2627,6 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
                               />
                               <SampleTypeIndicator
                                 sampleType={t.sample_type || 'Blood'}
-                                sampleColor={t.sample_color || undefined}
                                 size="sm"
                               />
                               <div>
@@ -2656,7 +2713,6 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
                             <div className="flex items-center gap-3">
                               <SampleTypeIndicator
                                 sampleType={t.sample_type || 'Blood'}
-                                sampleColor={t.sample_color || undefined}
                                 size="sm"
                               />
                               <span className={`${isPackage ? 'text-purple-800' : 'text-green-800'} font-medium`}>{t.name}</span>
@@ -3304,6 +3360,14 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
                       </span>
                     )}
                   </div>
+                  {creditInfo.bypassCreditCheck && (
+                    <div className="col-span-3 rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                      Credit check is bypassed for this account — orders are allowed even over the limit
+                      {creditInfo.bypassCreditUntil
+                        ? ` until ${new Date(creditInfo.bypassCreditUntil).toLocaleString()}, after which the limit applies again.`
+                        : '.'}
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -3549,7 +3613,11 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
                   <div className="flex gap-2 flex-1">
                     <button
                       type="button"
-                      onClick={() => setDiscountType(discountType === 'percentage' ? 'fixed' : 'percentage')}
+                      onClick={() => {
+                        discountTouchedRef.current = true;
+                        setAutoDiscountLabel(null);
+                        setDiscountType(discountType === 'percentage' ? 'fixed' : 'percentage');
+                      }}
                       className="px-3 py-1.5 text-xs border border-gray-300 rounded-md hover:bg-gray-100 bg-white"
                     >
                       {discountType === 'percentage' ? '%' : currencySymbol}
@@ -3559,12 +3627,19 @@ const OrderForm: React.FC<OrderFormProps> = ({ onClose, onSubmit, preSelectedPat
                       min="0"
                       max={discountType === 'percentage' ? 100 : totalAmount}
                       value={discountValue}
-                      onChange={(e) => setDiscountValue(Number(e.target.value))}
+                      onChange={(e) => {
+                        discountTouchedRef.current = true;
+                        setAutoDiscountLabel(null);
+                        setDiscountValue(Number(e.target.value));
+                      }}
                       placeholder={`Enter discount${discountType === 'percentage' ? ' %' : ''}`}
                       className="flex-1 px-3 py-1.5 text-sm border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500"
                     />
                   </div>
                 </div>
+                {autoDiscountLabel && (
+                  <div className="pl-[92px] -mt-1 text-xs text-blue-600">{autoDiscountLabel}</div>
+                )}
                 {/* Discount By — determines if discount should affect doctor commission */}
                 {discountValue > 0 && (
                   <div className="flex items-center gap-3">

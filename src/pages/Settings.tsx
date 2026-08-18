@@ -17,6 +17,7 @@ import PatientFormSettings from '../components/Settings/PatientFormSettings';
 import LabBillingItemSettings from '../components/Settings/LabBillingItemSettings';
 import PriceMasterSettings from '../components/Settings/PriceMasterSettings';
 import PaymentGatewaySettings from '../components/Settings/PaymentGatewaySettings';
+import PublicBookingSettings from '../components/Settings/PublicBookingSettings';
 import SampleTypeColorsConfig from '../components/Settings/SampleTypeColorsConfig';
 import AccessionSettings, { type AccessionCollectionConfig } from '../components/Settings/AccessionSettings';
 import BarcodeLabelLayoutConfig from '../components/Settings/BarcodeLabelLayoutConfig';
@@ -172,6 +173,8 @@ interface LabSettings {
 	    flagSymbol?: 'none' | 'before' | 'after';
 	    showFlagLegend?: boolean;
 	    flagGapPx?: number;
+	    analyteRowSpacing?: number;
+	    testGroupSpacing?: number;
 	    testGroupTitlePosition?: 'below_headers' | 'above_headers_center' | 'above_headers_left';
 	    qrHorizontalOffset?: number;
 	    qrPosition?: 'bottom_left' | 'top_left' | 'top_right' | 'header_right';
@@ -192,6 +195,8 @@ interface LabSettings {
   auto_print_barcode_on_order?: boolean;
   auto_print_report_on_approval?: boolean;
   show_approve_all_in_result_entry?: boolean;
+  default_collapsed_order_cards?: boolean;
+  tat_alert_max_overdue_hours?: number;
   sample_type_colors?: Record<string, string>;
   accession_collection_config?: AccessionCollectionConfig | null;
   portal_settings?: PortalSettings | null;
@@ -787,6 +792,8 @@ const Settings: React.FC = () => {
             auto_print_barcode_on_order: (labData as any).auto_print_barcode_on_order ?? false,
             auto_print_report_on_approval: (labData as any).auto_print_report_on_approval ?? false,
             show_approve_all_in_result_entry: (labData as any).show_approve_all_in_result_entry ?? false,
+            default_collapsed_order_cards: (labData as any).default_collapsed_order_cards ?? false,
+            tat_alert_max_overdue_hours: (labData as any).tat_alert_max_overdue_hours ?? 72,
             sample_type_colors: (labData as any).sample_type_colors ?? {},
             accession_collection_config: (labData as any).accession_collection_config ?? { sample_type_flows: {} },
             portal_settings: normalizePortalSettings((labData as any).portal_settings, true),
@@ -968,6 +975,7 @@ const Settings: React.FC = () => {
     { id: 'invoices', name: 'Invoice Templates', icon: FileText },
     ...(labInterfaceEnabled ? [{ id: 'analyzer', name: 'Analyzer Interface', icon: Activity }] : []),
     { id: 'patient_portal', name: 'Patient Portal', icon: Smartphone },
+    { id: 'public_booking', name: 'Public Booking Link', icon: Globe },
     { id: 'patient_form', name: 'Patient Form', icon: UserCheck },
     { id: 'billing_items', name: 'Billing Items', icon: FileText },
     { id: 'price_masters', name: 'Price Masters', icon: Tag },
@@ -1200,6 +1208,8 @@ const Settings: React.FC = () => {
         auto_print_barcode_on_order: labSettings.auto_print_barcode_on_order ?? false,
         auto_print_report_on_approval: labSettings.auto_print_report_on_approval ?? false,
         show_approve_all_in_result_entry: labSettings.show_approve_all_in_result_entry ?? false,
+        default_collapsed_order_cards: labSettings.default_collapsed_order_cards ?? false,
+        tat_alert_max_overdue_hours: labSettings.tat_alert_max_overdue_hours ?? 72,
         sample_type_colors: labSettings.sample_type_colors || {},
         accession_collection_config: labSettings.accession_collection_config || { sample_type_flows: {} },
         portal_settings: normalizePortalSettings(labSettings.portal_settings),
@@ -2499,6 +2509,8 @@ const Settings: React.FC = () => {
                           { key: 'receivedAt', label: 'Received Date/Time' },
                           { key: 'collectionCenter', label: 'Collection Center' },
                           { key: 'b2bAccountName', label: 'B2B / Account Name' },
+                          { key: 'refCenter', label: 'Ref. Center (B2B)' },
+                          { key: 'processingCenter', label: 'Proc. Center (Main Lab)' },
                           ...customPatientFields.map(f => ({ key: `custom_${f.field_key}`, label: f.label })),
                         ].map(field => {
                           const currentFields = labSettings.report_patient_info_config?.fields || ['patientName','patientId','age','gender','collectionDate','sampleId','referringDoctorName','approvedAt'];
@@ -3526,6 +3538,54 @@ const Settings: React.FC = () => {
                       </label>
                     </div>
 
+                    {/* Order List View */}
+                    <div className="border-t border-gray-100 pt-5">
+                      <h4 className="text-sm font-semibold text-gray-700 mb-1">Order List View</h4>
+                      <p className="text-xs text-gray-500 mb-3">
+                        Sets how the Test Orders list opens on the dashboard. Staff can still switch between collapsed and expanded with the button on the page — this only decides which one they land on.
+                      </p>
+                      <label className="flex items-start cursor-pointer gap-3">
+                        <input
+                          type="checkbox"
+                          checked={labSettings.default_collapsed_order_cards ?? false}
+                          onChange={(e) => setLabSettings(prev => prev ? { ...prev, default_collapsed_order_cards: e.target.checked } : prev)}
+                          className="mt-0.5 h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded"
+                        />
+                        <div>
+                          <span className="text-sm font-medium text-gray-800">Open order cards collapsed by default</span>
+                          <p className="text-xs text-gray-400 mt-0.5">Shows one compact row per order so more orders fit on screen. Leave off to open the full cards with test chips visible.</p>
+                        </div>
+                      </label>
+                    </div>
+
+                    {/* TAT Alerts */}
+                    <div className="border-t border-gray-100 pt-5">
+                      <h4 className="text-sm font-semibold text-gray-700 mb-1">TAT Alerts</h4>
+                      <p className="text-xs text-gray-500 mb-3">
+                        Controls the floating TAT alert panel. Orders that breached longer ago than this are treated as stale and dropped from the panel, so the list keeps showing breaches the team can still act on.
+                      </p>
+                      <div className="flex items-center gap-3">
+                        <input
+                          type="number"
+                          min={1}
+                          max={720}
+                          value={labSettings.tat_alert_max_overdue_hours ?? 72}
+                          onChange={(e) => {
+                            const parsed = parseInt(e.target.value, 10);
+                            setLabSettings(prev => prev ? {
+                              ...prev,
+                              tat_alert_max_overdue_hours: Number.isFinite(parsed) && parsed > 0 ? parsed : undefined,
+                            } : prev);
+                          }}
+                          className="w-24 px-3 py-2 border border-gray-300 rounded-md text-sm focus:ring-blue-500 focus:border-blue-500"
+                        />
+                        <div>
+                          <span className="text-sm font-medium text-gray-800">Hide alerts overdue by more than this many hours</span>
+                          <p className="text-xs text-gray-400 mt-0.5">Default 72 (3 days). Lower it to 24 or 48 if stale breaches are crowding out fresh ones.</p>
+                        </div>
+                      </div>
+                    </div>
+
                     {/* Sample Type Colors */}
                     <div className="border-t border-gray-100 pt-5">
                       <h4 className="text-sm font-semibold text-gray-700 mb-1 flex items-center gap-2">
@@ -3716,6 +3776,13 @@ const Settings: React.FC = () => {
         {activeTab === 'patient_portal' && labId && (
           <div className="p-6">
             <PatientPortalSettings labId={labId} />
+          </div>
+        )}
+
+        {/* Public Booking Link Tab */}
+        {activeTab === 'public_booking' && labId && (
+          <div className="p-6">
+            <PublicBookingSettings labId={labId} />
           </div>
         )}
 

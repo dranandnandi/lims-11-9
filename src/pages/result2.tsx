@@ -640,7 +640,6 @@ const Result2: React.FC = () => {
                             {/* Sample Type Indicator */}
                             <SampleTypeIndicator
                               sampleType={testGroup.sample_type || 'Blood'}
-                              sampleColor={testGroup.color_code || undefined}
                               size="sm"
                             />
                             <span className="font-medium text-gray-900 truncate">{testGroup.patient_name}</span>
@@ -689,7 +688,6 @@ const Result2: React.FC = () => {
                               {/* Sample Type Indicator */}
                               <SampleTypeIndicator
                                 sampleType={testGroup.sample_type || 'Blood'}
-                                sampleColor={testGroup.color_code || undefined}
                                 size="md"
                               />
                               <div className="flex-1">

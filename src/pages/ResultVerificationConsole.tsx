@@ -56,7 +56,7 @@ import {
   getVerificationPermissionForDepartment,
 } from "../utils/resultPermissions";
 import { evaluateTextCalculation, normalizeCalculationResultType } from "../utils/calculationRules";
-import { calculateFlag } from "../utils/flagCalculation";
+import { calculateFlag, detectFlagConflict } from "../utils/flagCalculation";
 import { FALLBACK_DECIMAL_PLACES, normalizeDecimalPlaces, roundHalfUp } from "../utils/resultValueFormat";
 
 /* =========================================
@@ -152,11 +152,11 @@ type BulkApprovalProgress = {
    Helpers
 ========================================= */
 
-const todayISO = () => new Date().toISOString().slice(0, 10);
-const fromYesterdayISO = () => {
+// Local calendar date — order_date is a plain date column, so UTC (toISOString)
+// would roll back a day for IST times before 05:30.
+const todayISO = () => {
   const d = new Date();
-  d.setDate(d.getDate() - 1);
-  return d.toISOString().slice(0, 10);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 };
 
 const fmtDate = (iso: string) =>
@@ -665,7 +665,7 @@ const AttachmentViewer: React.FC<AttachmentViewerProps> = ({ attachments, viewMo
 const ResultVerificationConsole: React.FC = () => {
   const { loading: permissionsLoading, hasAnyPermission, hasPermission } = usePermissions();
   // filters
-  const [from, setFrom] = useState(fromYesterdayISO());
+  const [from, setFrom] = useState(todayISO());
   const [to, setTo] = useState(todayISO());
 	  const [q, setQ] = useState("");
 	  const [stateFilter, setStateFilter] = useState<StateFilter>("all");
@@ -2357,12 +2357,28 @@ const ResultVerificationConsole: React.FC = () => {
             ) : (
               (() => {
                 const flagLabel = getDisplayFlagLabel(a.flag);
-                if (!flagLabel || getCanonicalFlag(a.flag) === "normal") return null;
+                const isNormal = !flagLabel || getCanonicalFlag(a.flag) === "normal";
                 const styles = getFlagBadgeStyles(a.flag);
+                // A flag that contradicts the value and range stored beside it is
+                // surfaced here rather than silently printed on the report.
+                const conflict = detectFlagConflict(String(a.value ?? "").replace(/,/g, ""), a.reference_range || "", a.flag);
                 return (
-                  <span className={`inline-flex items-center px-2 py-1 rounded-full text-xs font-bold ${styles.bg} ${styles.text} border`}>
-                    {flagLabel}
-                  </span>
+                  <div className="flex flex-col gap-1">
+                    {!isNormal && (
+                      <span className={`inline-flex items-center px-2 py-1 rounded-full text-xs font-bold ${styles.bg} ${styles.text} border`}>
+                        {flagLabel}
+                      </span>
+                    )}
+                    {conflict.conflict && (
+                      <span
+                        className="inline-flex items-start gap-1 text-[11px] leading-tight text-amber-700"
+                        title={conflict.message}
+                      >
+                        <AlertTriangle className="h-3 w-3 mt-px shrink-0" />
+                        {conflict.expected ? `Range says ${conflict.expected}` : "Range says normal"}
+                      </span>
+                    )}
+                  </div>
                 );
               })()
             )}

@@ -53,11 +53,31 @@ export interface CommissionPdfDoctor {
   details: CommissionPdfDetail[];
 }
 
+/**
+ * How much of the per-order test / billing item breakdown the statement prints:
+ * - `none`  : order rows only, sharing shown at order level
+ * - `names` : test & billing item names listed, sharing still only at order level
+ * - `full`  : each item with its amount, sharing percent and commission
+ */
+export type CommissionPdfItemDetail = "none" | "names" | "full";
+
+/** Table columns that can be dropped from the statement to slim it down */
+export type CommissionPdfOptionalColumn =
+  | "status"
+  | "payment"
+  | "adjust"
+  | "base"
+  | "commission";
+
 export interface CommissionPdfOptions {
   dateFrom: string;
   dateTo: string;
   labName?: string;
-  /** Print the per-order test / billing item breakdown under each row */
+  /** Detail level for the per-order breakdown under each row (default `full`) */
+  itemDetail?: CommissionPdfItemDetail;
+  /** Columns to leave out; the remaining ones stretch to fill the page width */
+  hiddenColumns?: CommissionPdfOptionalColumn[];
+  /** @deprecated use `itemDetail`; kept so older callers keep working */
   includeItems?: boolean;
 }
 
@@ -74,7 +94,7 @@ interface Column {
 }
 
 const COLUMNS: Column[] = [
-  { key: "order", label: "Order", width: 78, align: "left" },
+  { key: "order", label: "Order", width: 54, align: "left" },
   { key: "patient", label: "Patient", width: 118, align: "left" },
   { key: "date", label: "Date", width: 56, align: "left" },
   { key: "status", label: "Status", width: 48, align: "left" },
@@ -88,8 +108,24 @@ const COLUMNS: Column[] = [
   { key: "commission", label: "Commission", width: 66, align: "right" },
 ];
 
-const columnX = (index: number) =>
-  PAGE_MARGIN + COLUMNS.slice(0, index).reduce((sum, col) => sum + col.width, 0);
+/**
+ * Drops the hidden columns and stretches the survivors proportionally so the
+ * table always fills the page width instead of leaving a ragged right edge.
+ */
+const layoutColumns = (hidden: CommissionPdfOptionalColumn[] = []): Column[] => {
+  const hiddenSet = new Set<string>(hidden);
+  const kept = COLUMNS.filter((col) => !hiddenSet.has(col.key));
+  const total = kept.reduce((sum, col) => sum + col.width, 0);
+  if (!total) return kept;
+  const scale = CONTENT_WIDTH / total;
+  return kept.map((col) => ({ ...col, width: col.width * scale }));
+};
+
+/** Last 5 characters of the order reference — enough to identify it on paper */
+const shortOrderRef = (value: string): string => {
+  const text = String(value ?? "").trim();
+  return text.length > 5 ? text.slice(-5) : text || "-";
+};
 
 const money = (value: number | null | undefined): string =>
   `Rs. ${Number(value || 0).toLocaleString("en-IN", { maximumFractionDigits: 2 })}`;
@@ -124,7 +160,17 @@ export const generateCommissionReportPdf = (
   const doc = new jsPDF({ unit: "pt", format: "a4", orientation: "landscape" });
   const pageHeight = doc.internal.pageSize.getHeight();
   const rightEdge = PAGE_MARGIN + CONTENT_WIDTH;
-  const includeItems = options.includeItems !== false;
+  const itemDetail: CommissionPdfItemDetail =
+    options.itemDetail ?? (options.includeItems === false ? "none" : "full");
+  const columns = layoutColumns(options.hiddenColumns);
+  const columnX = (index: number) =>
+    PAGE_MARGIN + columns.slice(0, index).reduce((sum, col) => sum + col.width, 0);
+  const columnIndex = (key: string) => columns.findIndex((col) => col.key === key);
+  /** Right edge of a column, or the page's right edge if that column is hidden */
+  const columnRight = (key: string): number => {
+    const index = columnIndex(key);
+    return index < 0 ? rightEdge : columnX(index) + columns[index].width;
+  };
 
   const totals = commissions.reduce(
     (acc, c) => ({
@@ -182,7 +228,7 @@ export const generateCommissionReportPdf = (
     doc.setFont("helvetica", "bold");
     doc.setFontSize(8);
     doc.setTextColor(55, 65, 81);
-    COLUMNS.forEach((col, index) => {
+    columns.forEach((col, index) => {
       const x = col.align === "right" ? columnX(index) + col.width - 4 : columnX(index) + 4;
       doc.text(col.label, x, y + 12, { align: col.align });
     });
@@ -228,9 +274,8 @@ export const generateCommissionReportPdf = (
     doc.setFontSize(9);
     doc.setTextColor(17, 24, 39);
     doc.text(
-      `Revenue ${money(commission.total_revenue)}   Commission ${
-        commission.is_configured ? money(commission.total_commission) : "not configured"
-      }`,
+      `Revenue ${money(commission.total_revenue)}` +
+        (commission.is_configured ? `   Commission ${money(commission.total_commission)}` : ""),
       rightEdge - 6,
       y + 11,
       { align: "right" },
@@ -255,35 +300,45 @@ export const generateCommissionReportPdf = (
       // splitTextToSize measures with the active font, so match the draw settings first
       doc.setFont("helvetica", "normal");
       doc.setFontSize(7.5);
-      const cells: Record<string, string[]> = {
-        order: wrap(detail.order_id, COLUMNS[0].width),
-        patient: wrap(detail.patient_name, COLUMNS[1].width),
-        date: wrap(shortDate(detail.date), COLUMNS[2].width),
-        status: wrap(detail.is_billed ? "Billed" : titleCase(detail.billing_status || "unbilled"), COLUMNS[3].width),
-        gross: wrap(money(detail.gross_amount), COLUMNS[4].width),
-        discount: wrap(discountText(detail), COLUMNS[5].width),
-        paid: wrap(money(detail.paid_amount), COLUMNS[6].width),
-        due: wrap(detail.due_amount > 0 ? money(detail.due_amount) : "-", COLUMNS[7].width),
-        payment: wrap(titleCase(detail.payment_status), COLUMNS[8].width),
-        adjust: wrap(adjustmentsText(detail), COLUMNS[9].width),
-        base: wrap(money(detail.sharing_base), COLUMNS[10].width),
-        commission: wrap(commission.is_configured ? money(detail.commission) : "-", COLUMNS[11].width),
+      const values: Record<string, string> = {
+        order: shortOrderRef(detail.order_id),
+        patient: detail.patient_name,
+        date: shortDate(detail.date),
+        status: detail.is_billed ? "Billed" : titleCase(detail.billing_status || "unbilled"),
+        gross: money(detail.gross_amount),
+        discount: discountText(detail),
+        paid: money(detail.paid_amount),
+        due: detail.due_amount > 0 ? money(detail.due_amount) : "-",
+        payment: titleCase(detail.payment_status),
+        adjust: adjustmentsText(detail),
+        base: money(detail.sharing_base),
+        commission: commission.is_configured ? money(detail.commission) : "-",
       };
-      const lineCount = Math.max(...COLUMNS.map((col) => cells[col.key].length));
+      const cells: Record<string, string[]> = {};
+      columns.forEach((col) => {
+        cells[col.key] = wrap(values[col.key], col.width);
+      });
+      const lineCount = Math.max(...columns.map((col) => cells[col.key].length));
       const rowHeight = Math.max(16, lineCount * 9 + 8);
 
-      const itemLines = includeItems && detail.line_items.length > 0
-        ? detail.line_items.map((item) =>
-            `${item.name} [${item.item_type === "billing_item" ? "Billing" : "Test"}] ${money(item.amount)}` +
-            (commission.is_configured
-              ? ` @ ${item.sharing_percent}% = ${money(item.commission)}`
-              : ""),
-          )
-        : [];
+      const showItems = itemDetail !== "none" && detail.line_items.length > 0;
+      const itemLines = !showItems
+        ? []
+        : itemDetail === "names"
+          ? detail.line_items.map((item) => item.name)
+          : detail.line_items.map((item) =>
+              `${item.name} [${item.item_type === "billing_item" ? "Billing" : "Test"}] ${money(item.amount)}` +
+              (commission.is_configured
+                ? ` @ ${item.sharing_percent}% = ${money(item.commission)}`
+                : ""),
+            );
       let wrappedItems: string[] = [];
       if (itemLines.length) {
         doc.setFontSize(7);
-        wrappedItems = doc.splitTextToSize(itemLines.join("   -   "), CONTENT_WIDTH - 24) as string[];
+        const joined = itemDetail === "names"
+          ? `Tests: ${itemLines.join(", ")}`
+          : itemLines.join("   -   ");
+        wrappedItems = doc.splitTextToSize(joined, CONTENT_WIDTH - 24) as string[];
       }
       const itemsHeight = wrappedItems.length ? wrappedItems.length * 9 + 10 : 0;
 
@@ -298,7 +353,7 @@ export const generateCommissionReportPdf = (
 
       doc.setFont("helvetica", "normal");
       doc.setFontSize(7.5);
-      COLUMNS.forEach((col, index) => {
+      columns.forEach((col, index) => {
         if (col.key === "commission") {
           doc.setFont("helvetica", "bold");
           doc.setTextColor(detail.is_billed ? 5 : 180, detail.is_billed ? 150 : 83, detail.is_billed ? 105 : 9);
@@ -334,13 +389,15 @@ export const generateCommissionReportPdf = (
     doc.setFontSize(8);
     doc.setTextColor(17, 24, 39);
     doc.text(`Subtotal - ${commission.doctor_name}`, PAGE_MARGIN + 4, y + 12);
-    doc.text(money(commission.total_revenue), columnX(4) + COLUMNS[4].width - 4, y + 12, { align: "right" });
-    doc.text(
-      commission.is_configured ? money(commission.total_commission) : "-",
-      columnX(11) + COLUMNS[11].width - 4,
-      y + 12,
-      { align: "right" },
-    );
+    doc.text(money(commission.total_revenue), columnRight("gross") - 4, y + 12, { align: "right" });
+    if (columnIndex("commission") >= 0) {
+      doc.text(
+        commission.is_configured ? money(commission.total_commission) : "-",
+        columnRight("commission") - 4,
+        y + 12,
+        { align: "right" },
+      );
+    }
     y += 26;
   }
 

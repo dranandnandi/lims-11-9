@@ -25,8 +25,12 @@ interface Phlebo {
     id: string;
     name: string;
     email: string;
+    // User Management saves the number as `contact_number`; older rows use `phone`.
     phone?: string;
+    contact_number?: string;
 }
+
+const phleboPhone = (p?: Phlebo) => p?.contact_number || p?.phone || undefined;
 
 const BookingQueue: React.FC<BookingQueueProps> = ({ onProcessBooking, onViewAll, onCountChange }) => {
     const navigate = useNavigate();
@@ -392,7 +396,7 @@ const BookingQueue: React.FC<BookingQueueProps> = ({ onProcessBooking, onViewAll
             message = buildB2BMessage(selectedBooking, account?.name, phleboName);
         } else {
             const phlebo = phlebos.find(p => p.id === (selectedBooking.assigned_phlebo_id || selectedPhleboId));
-            phone = phlebo?.phone;
+            phone = phleboPhone(phlebo);
             message = buildPhleboMessage(selectedBooking, phleboName);
         }
 
@@ -443,6 +447,7 @@ const BookingQueue: React.FC<BookingQueueProps> = ({ onProcessBooking, onViewAll
             case 'front_desk': return <User className="w-4 h-4 text-green-500" />;
             case 'patient_app': return <Phone className="w-4 h-4 text-purple-500" />;
             case 'phone_call': return <Phone className="w-4 h-4 text-orange-500" />;
+            case 'public_web': return <Globe className="w-4 h-4 text-teal-500" />;
             default: return <Globe className="w-4 h-4 text-gray-500" />;
         }
     };
@@ -459,7 +464,7 @@ const BookingQueue: React.FC<BookingQueueProps> = ({ onProcessBooking, onViewAll
     };
 
     const currentPhlebo = phlebos.find(p => p.id === (selectedBooking?.assigned_phlebo_id || selectedPhleboId));
-    const canSendPhleboWA = !!(currentPhlebo?.phone);
+    const canSendPhleboWA = !!phleboPhone(currentPhlebo);
     const canSendPatientWA = !!(selectedBooking?.patient_info?.phone);
     const selectedB2BAccountId = selectedBooking ? getB2BAccountId(selectedBooking) : null;
     const selectedB2BAccount = selectedB2BAccountId ? b2bAccounts[selectedB2BAccountId] : undefined;
@@ -710,8 +715,17 @@ const BookingQueue: React.FC<BookingQueueProps> = ({ onProcessBooking, onViewAll
                                     <h4 className="text-xs font-semibold text-gray-500 uppercase mb-1">Source</h4>
                                     <div className="flex items-center gap-1">
                                         {getSourceIcon(selectedBooking.booking_source)}
-                                        <span className="text-sm capitalize">{selectedBooking.booking_source.replace('_', ' ')}</span>
+                                        <span className="text-sm capitalize">
+                                            {selectedBooking.booking_source === 'public_web'
+                                                ? 'Online booking link'
+                                                : selectedBooking.booking_source.replace('_', ' ')}
+                                        </span>
                                     </div>
+                                    {selectedBooking.public_reference && (
+                                        <p className="text-xs font-mono text-gray-500 mt-0.5">
+                                            Ref {selectedBooking.public_reference}
+                                        </p>
+                                    )}
                                 </div>
                                 <div>
                                     <h4 className="text-xs font-semibold text-gray-500 uppercase mb-1">Status</h4>
@@ -732,6 +746,16 @@ const BookingQueue: React.FC<BookingQueueProps> = ({ onProcessBooking, onViewAll
                                     </span>
                                 </div>
                             </div>
+
+                            {/* Note the patient typed on the public booking page */}
+                            {typeof selectedBooking.source_meta?.notes === 'string' && selectedBooking.source_meta.notes && (
+                                <div>
+                                    <h4 className="text-xs font-semibold text-gray-500 uppercase mb-1">Patient's Note</h4>
+                                    <p className="text-sm text-gray-700 bg-amber-50 border border-amber-200 rounded-lg p-3 whitespace-pre-wrap">
+                                        {selectedBooking.source_meta.notes}
+                                    </p>
+                                </div>
+                            )}
 
                             {/* Tests */}
                             {selectedBooking.test_details && selectedBooking.test_details.length > 0 && (
@@ -933,7 +957,7 @@ const BookingQueue: React.FC<BookingQueueProps> = ({ onProcessBooking, onViewAll
                                         <button
                                             onClick={() => handleSendWhatsApp('b2b')}
                                             disabled={!canSendB2BWA || sendingWA === 'b2b'}
-                                            title={!canSendB2BWA ? 'B2B account has no billing phone (set it in Account Master)' : 'Notify B2B account about this booking'}
+                                            title={!canSendB2BWA ? 'Client has no billing phone (set it in Account Master)' : 'Notify client about this booking'}
                                             className={`flex-1 flex items-center justify-center gap-1.5 px-3 py-2 text-sm font-medium rounded-lg border transition-colors
                                                 ${waSentTo.has('b2b')
                                                     ? 'bg-indigo-50 border-indigo-300 text-indigo-700'
@@ -947,15 +971,19 @@ const BookingQueue: React.FC<BookingQueueProps> = ({ onProcessBooking, onViewAll
                                             ) : (
                                                 <Building2 className="w-4 h-4 text-indigo-600" />
                                             )}
-                                            {waSentTo.has('b2b') ? 'Sent to B2B' : 'Notify B2B'}
+                                            {waSentTo.has('b2b') ? 'Sent to Client' : 'Notify Client'}
                                         </button>
                                     )}
                                 </div>
-                                {!(selectedBooking.assigned_phlebo_id || selectedPhleboId) && (
+                                {!(selectedBooking.assigned_phlebo_id || selectedPhleboId) ? (
                                     <p className="mt-1.5 text-xs text-amber-600">Assign a phlebotomist to enable phlebo notification.</p>
-                                )}
+                                ) : !currentPhlebo ? (
+                                    <p className="mt-1.5 text-xs text-amber-600">Assigned phlebotomist is inactive or no longer marked as a phlebotomist — reassign to enable phlebo notification.</p>
+                                ) : !canSendPhleboWA ? (
+                                    <p className="mt-1.5 text-xs text-amber-600">{currentPhlebo.name} has no contact number — set it in User Management to enable phlebo notification.</p>
+                                ) : null}
                                 {selectedIsB2B && !canSendB2BWA && (
-                                    <p className="mt-1.5 text-xs text-amber-600">B2B account has no billing phone — set it in Masters → Accounts to enable B2B notification.</p>
+                                    <p className="mt-1.5 text-xs text-amber-600">Client has no billing phone — set it in Masters → Accounts to enable client notification.</p>
                                 )}
                             </div>
                         </div>

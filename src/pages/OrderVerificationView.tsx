@@ -152,11 +152,11 @@ type AttachmentViewMode = "test" | "all";
 type StateFilter = "all" | "pending" | "partial" | "ready";
 type OrderSortMode = "sample_desc" | "sample_asc" | "date_desc" | "patient_az";
 
-const todayISO = () => new Date().toISOString().slice(0, 10);
-const fromYesterdayISO = () => {
+// Local calendar date — order_date is a plain date column, so UTC (toISOString)
+// would roll back a day for IST times before 05:30.
+const todayISO = () => {
   const d = new Date();
-  d.setDate(d.getDate() - 1);
-  return d.toISOString().slice(0, 10);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 };
 
 const fetchRowsByIds = async (
@@ -222,7 +222,7 @@ const fetchPanelStatusRows = async (
 };
 
 const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToPanel }) => {
-  const [from, setFrom] = useState(fromYesterdayISO());
+  const [from, setFrom] = useState(todayISO());
   const [to, setTo] = useState(todayISO());
   const [q, setQ] = useState("");
   const [stateFilter, setStateFilter] = useState<StateFilter>("all");
@@ -287,6 +287,11 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
 
   // Quick preview state
   const [labPrintOptions, setLabPrintOptions] = useState<Record<string, unknown>>({});
+  // labs.flag_options as configured — unlike labFlagOptions below it is NOT merged
+  // with the defaults, because the preview must print only the lab's own letters.
+  const [labConfiguredFlagOptions, setLabConfiguredFlagOptions] = useState<
+    Array<{ value: string; label: string }> | null
+  >(null);
   const [labPdfLayoutSettings, setLabPdfLayoutSettings] = useState<Record<string, any>>({});
   // Per-lab configurable patient-field list + custom field labels (same source the PDF uses).
   const [labPatientInfoConfig, setLabPatientInfoConfig] = useState<{ layout?: string; fields: string[] } | null>(null);
@@ -414,6 +419,7 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
           // Merge lab flag options with defaults (lab options take precedence, defaults fill gaps)
           if (labData?.flag_options && Array.isArray(labData.flag_options) && labData.flag_options.length > 0) {
             const labFlags = labData.flag_options as { value: string; label: string }[];
+            setLabConfiguredFlagOptions(labFlags);
             // Create merged list: lab options first, then any defaults not in lab options
             const labValues = new Set(labFlags.map(f => f.value));
             const merged = [
@@ -1407,7 +1413,7 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
         return { ...fallback, imageUrl: sigUrl };
       };
 
-      const [patientRes, orderRes, tgaRes, tgRes, sectionsRes, verifierRes] = await Promise.all([
+      const [patientRes, orderRes, tgaRes, tgRes, sectionsRes, verifierRes, otgConditionRes] = await Promise.all([
         supabase
           .from("patients")
           .select("age, age_unit, gender, display_id")
@@ -1420,7 +1426,7 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
         groupIds.length > 0
           ? supabase
               .from("test_groups")
-              .select("id, print_options, group_interpretation")
+              .select("id, print_options, group_interpretation, sample_type")
               .in("id", groupIds)
           : Promise.resolve({ data: [] as any[], error: null }),
         // report sections (findings, impression, etc.)
@@ -1433,6 +1439,14 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
           : Promise.resolve({ data: [] as any[], error: null }),
         // signatory: first verified_by user across all result_values
         fetchVerifierForPreview(),
+        // sample condition picked at collection — same source the PDF reads
+        groupIds.length > 0
+          ? supabase
+              .from("order_test_groups")
+              .select("test_group_id, sample_condition")
+              .eq("order_id", order.orderId)
+              .in("test_group_id", groupIds)
+          : Promise.resolve({ data: [] as any[], error: null }),
       ]);
 
       [
@@ -1442,6 +1456,7 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
         ["test_groups", tgRes.error],
         ["result_section_content", sectionsRes.error],
         ["verifier", verifierRes.error],
+        ["order_test_groups", otgConditionRes.error],
       ].forEach(([label, error]) => {
         if (error) {
           console.warn(`[QuickPreview] ${label} query returned an error`, error);
@@ -1510,28 +1525,67 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
             .maybeSingle(),
           supabase
             .from("orders")
-            .select("sample_collected_by, account_id, location_id, collected_at_location_id")
+            .select("sample_collected_by, account_id, location_id, collected_at_location_id, referring_doctor_id")
             .eq("id", order.orderId)
             .maybeSingle(),
         ]);
 
         let b2bAccountName = "";
+        let referringDoctorQualification = "";
         let collectionCenterName =
           reportCtx?.order?.collectionCenter || reportCtx?.order?.locationName || "";
         if (oEnrich.data) {
           const accountId = (oEnrich.data as any).account_id;
           const locId =
             (oEnrich.data as any).collected_at_location_id || (oEnrich.data as any).location_id;
-          const [acc, loc] = await Promise.all([
+          const doctorId = (oEnrich.data as any).referring_doctor_id;
+          const [acc, loc, doc] = await Promise.all([
             accountId
               ? supabase.from("accounts").select("name").eq("id", accountId).maybeSingle()
               : Promise.resolve({ data: null } as any),
             locId
               ? supabase.from("locations").select("name").eq("id", locId).maybeSingle()
               : Promise.resolve({ data: null } as any),
+            doctorId
+              ? supabase.from("doctors").select("qualification").eq("id", doctorId).maybeSingle()
+              : Promise.resolve({ data: null } as any),
           ]);
           b2bAccountName = (acc.data as any)?.name || "";
           collectionCenterName = (loc.data as any)?.name || collectionCenterName;
+          referringDoctorQualification = String((doc.data as any)?.qualification || "").trim();
+        }
+
+        // Processing centre = our own main lab. Same fallback chain the PDF uses:
+        // the lab's nominated processing location → a location flagged as one → the lab name.
+        let processingCenterName = "";
+        const previewLabId = currentLabId || (await database.getCurrentUserLabId());
+        if (previewLabId) {
+          const { data: labRow } = await supabase
+            .from("labs")
+            .select("name, default_processing_location_id")
+            .eq("id", previewLabId)
+            .maybeSingle();
+          const defaultProcessingLocationId =
+            (labRow as any)?.default_processing_location_id || null;
+          if (defaultProcessingLocationId) {
+            const { data: procLoc } = await supabase
+              .from("locations")
+              .select("name")
+              .eq("id", defaultProcessingLocationId)
+              .maybeSingle();
+            processingCenterName = (procLoc as any)?.name || "";
+          }
+          if (!processingCenterName) {
+            const { data: flaggedLoc } = await supabase
+              .from("locations")
+              .select("name")
+              .eq("lab_id", previewLabId)
+              .eq("is_processing_center", true)
+              .limit(1)
+              .maybeSingle();
+            processingCenterName = (flaggedLoc as any)?.name || "";
+          }
+          if (!processingCenterName) processingCenterName = (labRow as any)?.name || "";
         }
 
         const cp = (reportCtx?.patient || {}) as any;
@@ -1551,7 +1605,10 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
           collectionCenter: collectionCenterName,
           sampleCollectedBy: co.sampleCollectedBy || (oEnrich.data as any)?.sample_collected_by || "",
           b2bAccountName,
+          refCenter: b2bAccountName,
+          processingCenter: processingCenterName,
           referringDoctorName: co.referringDoctorName || (orderRes.data?.doctor ?? ""),
+          referringDoctorQualification,
           approvedAt: co.approvedAtFormatted || co.approvedAt || "",
         });
 
@@ -1653,10 +1710,23 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
       // Build lookup: test_group_id → merged printOptions (lab-level overridden by group-level)
       const groupPrintOptions = new Map<string, Record<string, unknown>>();
       const groupInterpretations = new Map<string, string>(); // test_group_id → group_interpretation HTML
+      const groupSampleTypes = new Map<string, string>();     // test_group_id → sample_type
       for (const tg of tgRes.data || []) {
         const groupOpts = tg.print_options || {};
         groupPrintOptions.set(tg.id, { ...labPrintOptions, ...groupOpts });
         if (tg.group_interpretation) groupInterpretations.set(tg.id, tg.group_interpretation);
+        const sampleType = String((tg as any).sample_type || "").trim();
+        if (sampleType) groupSampleTypes.set(tg.id, sampleType);
+      }
+
+      // test_group_id → condition chosen at collection (first non-empty wins,
+      // matching how generate-pdf-letterhead resolves it).
+      const groupSampleConditions = new Map<string, string>();
+      for (const row of (otgConditionRes.data || []) as any[]) {
+        const condition = String(row.sample_condition || "").trim();
+        if (row.test_group_id && condition && !groupSampleConditions.has(row.test_group_id)) {
+          groupSampleConditions.set(row.test_group_id, condition);
+        }
       }
 
       // 3. Determine the dominant print options (first group that has its own wins; else lab)
@@ -1726,6 +1796,12 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
             printOptions: panel.test_group_id
               ? (groupPrintOptions.get(panel.test_group_id) ?? null)
               : null,
+            sampleType: panel.test_group_id
+              ? (groupSampleTypes.get(panel.test_group_id) ?? null)
+              : null,
+            sampleCondition: panel.test_group_id
+              ? (groupSampleConditions.get(panel.test_group_id) ?? null)
+              : null,
           };
 	        })
 	        .filter(g => g.analytes.length > 0);
@@ -1769,6 +1845,7 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
 	        signatoryImageUrl,
 	        verificationUrl,
 	        printOptions: resolvedPrintOptions,
+	        labFlagOptions: labConfiguredFlagOptions,
 	        pdfLayoutSettings: labPdfLayoutSettings,
 	        printLayoutMode,
         compactPlan: {

@@ -81,8 +81,11 @@ interface TestGroup {
     showSampleCondition?: boolean;
     showSignature?: boolean;
     forceTableLayout?: boolean;
+    analyteRowSpacing?: number;
+    testGroupSpacing?: number;
   } | null;
   group_interpretation?: string | null;
+  default_report_remark?: string | null;
   global_test_catalog_id?: string | null;
   analyzer_connection_id?: string | null;
   is_section_only?: boolean;
@@ -219,6 +222,7 @@ const TestGroupForm: React.FC<TestGroupFormProps> = ({ onClose, onSubmit, testGr
     ref_range_ai_config: testGroup?.ref_range_ai_config || { enabled: false, consider_age: true },
     required_patient_inputs: testGroup?.required_patient_inputs || [],
     group_interpretation: testGroup?.group_interpretation || '',
+    default_report_remark: testGroup?.default_report_remark || '',
     global_test_catalog_id: testGroup?.global_test_catalog_id || '',
     analyzer_connection_id: testGroup?.analyzer_connection_id || '',
     is_section_only: testGroup?.is_section_only ?? false,
@@ -275,11 +279,12 @@ const TestGroupForm: React.FC<TestGroupFormProps> = ({ onClose, onSubmit, testGr
   const [newSampleCondition, setNewSampleCondition] = useState('');
 
   // Group interpretation CKEditor state
-  const [interpEditorInstance, setInterpEditorInstance] = useState<any>(null);
   const [interpCkLoaded, setInterpCkLoaded] = useState(false);
+  const [interpCkError, setInterpCkError] = useState<string | null>(null);
   const [interpTab, setInterpTab] = useState<'visual' | 'html'>('visual');
   const [showInterpEditor, setShowInterpEditor] = useState(!!testGroup?.group_interpretation);
   const interpEditorRef = useRef<HTMLDivElement>(null);
+  const interpInitRef = useRef(false);
 
   // Load analytes and outsourced labs
   useEffect(() => {
@@ -298,30 +303,55 @@ const TestGroupForm: React.FC<TestGroupFormProps> = ({ onClose, onSubmit, testGr
         link.rel = 'stylesheet'; link.href = CKEDITOR_CSS_URL;
         document.head.appendChild(link);
       }
-      if (!document.querySelector(`script[src="${CKEDITOR_SCRIPT_URL}"]`)) {
-        await new Promise<void>((resolve, reject) => {
-          const s = document.createElement('script');
-          s.src = CKEDITOR_SCRIPT_URL; s.async = true;
-          s.onload = () => resolve(); s.onerror = () => reject();
-          document.head.appendChild(s);
-        });
+      const existing = document.querySelector(`script[src="${CKEDITOR_SCRIPT_URL}"]`);
+      await new Promise<void>((resolve, reject) => {
+        if (existing) {
+          // Another component started the load — wait for that same tag to finish.
+          if ((window as any).CKEDITOR) { resolve(); return; }
+          existing.addEventListener('load', () => resolve());
+          existing.addEventListener('error', () => reject(new Error('CKEditor CDN script failed to load')));
+          return;
+        }
+        const s = document.createElement('script');
+        s.src = CKEDITOR_SCRIPT_URL; s.async = true;
+        s.onload = () => resolve();
+        s.onerror = () => reject(new Error('CKEditor CDN script failed to load'));
+        document.head.appendChild(s);
+      });
+      if (!(window as any).CKEDITOR?.ClassicEditor) {
+        throw new Error('CKEditor loaded but did not expose ClassicEditor');
       }
       setInterpCkLoaded(true);
     };
-    load().catch(console.error);
+    load().catch((e) => {
+      console.error('CKEditor load error', e);
+      setInterpCkError(e?.message || 'Could not load the visual editor');
+    });
   }, [showInterpEditor]);
 
-  // Init CKEditor once loaded and ref is ready
+  // Init CKEditor once loaded and the visual tab is on screen.
+  // CKEditor gets its own throwaway <div> (not the React-managed host) so that
+  // React never fights it over the DOM, and StrictMode's double mount can't
+  // leave a half-built editor behind.
   useEffect(() => {
-    if (!interpCkLoaded || !interpEditorRef.current || interpEditorInstance || interpTab !== 'visual') return;
+    if (!showInterpEditor || !interpCkLoaded || interpTab !== 'visual') return;
+    const host = interpEditorRef.current;
+    if (!host || interpInitRef.current) return;
+    interpInitRef.current = true;
+
+    let cancelled = false;
+    let created: any = null;
+    const mount = document.createElement('div');
+    host.appendChild(mount);
+
     const init = async () => {
       try {
         const CKE = (window as any).CKEDITOR;
-        if (!CKE) return;
+        if (!CKE?.ClassicEditor) throw new Error('CKEditor bundle is not available');
         const { Essentials, Bold, Italic, Underline, Link, List, Paragraph, Heading,
                 Alignment, Indent, IndentBlock, Table, TableToolbar, BlockQuote, Undo, SourceEditing } = CKE;
-        const editor = await CKE.ClassicEditor.create(interpEditorRef.current, {
-          licenseKey: (import.meta.env.VITE_CKEDITOR_LICENSE_KEY as string) || '',
+        const buildConfig = (licenseKey: string) => ({
+          licenseKey,
           plugins: [Essentials, Bold, Italic, Underline, Link, List, Paragraph, Heading,
                     Alignment, Indent, IndentBlock, Table, TableToolbar, BlockQuote, Undo, SourceEditing],
           toolbar: ['heading', '|', 'bold', 'italic', 'underline', '|',
@@ -330,17 +360,42 @@ const TestGroupForm: React.FC<TestGroupFormProps> = ({ onClose, onSubmit, testGr
                     'insertTable', 'blockQuote', '|', 'undo', 'redo'],
           table: { contentToolbar: ['tableColumn', 'tableRow', 'mergeTableCells'] },
         });
+        const envKey = (import.meta.env.VITE_CKEDITOR_LICENSE_KEY as string) || '';
+        // Every plugin above is open source, so GPL is a valid fallback if the
+        // configured key is missing/expired/invalid (CKEditor 47 refuses to start otherwise).
+        let editor: any;
+        try {
+          editor = await CKE.ClassicEditor.create(mount, buildConfig(envKey || 'GPL'));
+        } catch (licenseErr) {
+          if (!envKey) throw licenseErr;
+          console.warn('CKEditor license key rejected, falling back to GPL', licenseErr);
+          mount.innerHTML = '';
+          editor = await CKE.ClassicEditor.create(mount, buildConfig('GPL'));
+        }
+        created = editor;
+        if (cancelled) { editor.destroy().catch(() => {}); return; }
         editor.setData(formData.group_interpretation || '');
         editor.model.document.on('change:data', () => {
           setFormData(prev => ({ ...prev, group_interpretation: editor.getData() }));
         });
         const el = editor.ui.view.editable.element;
         if (el) { el.style.minHeight = '140px'; el.style.maxHeight = '320px'; el.style.overflowY = 'auto'; }
-        setInterpEditorInstance(editor);
-      } catch (e) { console.error('CKEditor init error', e); }
+        setInterpCkError(null);
+      } catch (e: any) {
+        console.error('CKEditor init error', e);
+        // Never leave an empty box — surface the reason and let the HTML tab take over.
+        setInterpCkError(e?.message || 'The visual editor could not start');
+      }
     };
     init();
-  }, [interpCkLoaded, interpTab]);
+
+    return () => {
+      cancelled = true;
+      interpInitRef.current = false;
+      if (created) created.destroy().catch(() => {}).finally(() => mount.remove());
+      else mount.remove();
+    };
+  }, [showInterpEditor, interpCkLoaded, interpTab]);
 
   const loadData = async () => {
     try {
@@ -870,6 +925,7 @@ const TestGroupForm: React.FC<TestGroupFormProps> = ({ onClose, onSubmit, testGr
         report_priority: formData.report_priority ? parseInt(formData.report_priority, 10) : null,
         print_options: formData.print_options || null,
         group_interpretation: groupInterpretationHtml,
+        default_report_remark: formData.default_report_remark?.trim() || null,
         global_test_catalog_id: formData.global_test_catalog_id || null,
         analyzer_connection_id: formData.analyzer_connection_id || null,
         is_section_only: formData.is_section_only,
@@ -2142,6 +2198,46 @@ const TestGroupForm: React.FC<TestGroupFormProps> = ({ onClose, onSubmit, testGr
                         className="w-20 px-2 py-1 border border-gray-300 rounded text-sm" />
                     </div>
                   </div>
+
+                  {/* Basic-template spacing — leave blank to inherit the lab setting */}
+                  {([
+                    { key: 'analyteRowSpacing', label: 'Analyte Row Gap (px)', min: 0, max: 10, labDefault: 2, hint: 'Space above & below each analyte row' },
+                    { key: 'testGroupSpacing', label: 'Test Group Gap (px)', min: 0, max: 40, labDefault: 14, hint: 'Space printed below this test group' },
+                  ] as { key: string; label: string; min: number; max: number; labDefault: number; hint: string }[]).map(({ key, label, min, max, labDefault, hint }) => {
+                    const current = (formData.print_options as any)?.[key];
+                    const clearKey = () => setFormData(prev => {
+                      const next = { ...(prev.print_options || {}) } as Record<string, unknown>;
+                      delete next[key];
+                      return { ...prev, print_options: Object.keys(next).length > 0 ? next as typeof prev.print_options : null };
+                    });
+                    return (
+                      <div key={key} className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <span className="text-sm text-gray-700">{label}</span>
+                          <p className="text-xs text-gray-500 mt-0.5">{hint} · lab default {labDefault}</p>
+                        </div>
+                        <div className="flex items-center gap-2 flex-shrink-0">
+                          {current !== undefined && current !== null && (
+                            <button type="button"
+                              onClick={clearKey}
+                              className="text-xs px-2 py-0.5 rounded border bg-white text-gray-500 border-gray-300 hover:border-amber-400">
+                              ↩ Lab
+                            </button>
+                          )}
+                          <input type="number" min={min} max={max}
+                            value={current ?? ''}
+                            placeholder="Lab default"
+                            onChange={(e) => {
+                              if (e.target.value === '') { clearKey(); return; }
+                              const parsed = Math.max(min, Math.min(max, parseInt(e.target.value, 10)));
+                              if (Number.isNaN(parsed)) return;
+                              setFormData(prev => ({ ...prev, print_options: { ...(prev.print_options || {}), [key]: parsed } }));
+                            }}
+                            className="w-20 px-2 py-1 border border-gray-300 rounded text-sm" />
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             </div>
@@ -2194,32 +2290,53 @@ const TestGroupForm: React.FC<TestGroupFormProps> = ({ onClose, onSubmit, testGr
                       <Code className="h-3 w-3" /> HTML
                     </button>
                   </div>
-                  {/* Visual (CKEditor) tab — always mounted so CKEditor stays bound to its DOM node */}
-                  <div style={{ display: interpTab === 'visual' ? 'block' : 'none' }} className="border border-purple-200 rounded bg-white">
-                    {!interpCkLoaded && (
-                      <div className="flex items-center justify-center h-24 text-sm text-gray-400">Loading editor…</div>
-                    )}
-                    <div ref={interpEditorRef} style={{ display: interpCkLoaded ? 'block' : 'none' }} />
-                  </div>
+                  {/* Visual (CKEditor) tab */}
+                  {interpTab === 'visual' && (
+                    <div className="border border-purple-200 rounded bg-white">
+                      {interpCkError ? (
+                        <div className="p-3 text-xs text-red-600">
+                          Visual editor could not load ({interpCkError}). Switch to the <strong>HTML</strong> tab to
+                          write the interpretation — it saves exactly the same way.
+                        </div>
+                      ) : !interpCkLoaded ? (
+                        <div className="flex items-center justify-center h-24 text-sm text-gray-400">Loading editor…</div>
+                      ) : null}
+                      <div ref={interpEditorRef} style={{ display: interpCkLoaded && !interpCkError ? 'block' : 'none' }} />
+                    </div>
+                  )}
                   {/* HTML tab */}
                   {interpTab === 'html' && (
                     <textarea
                       rows={8}
                       value={formData.group_interpretation || ''}
-                      onChange={(e) => {
-                        const html = e.target.value;
-                        setFormData(prev => ({ ...prev, group_interpretation: html }));
-                        // Sync to CKEditor if active
-                        if (interpEditorInstance) {
-                          try { interpEditorInstance.setData(html); } catch (_) {}
-                        }
-                      }}
+                      onChange={(e) => setFormData(prev => ({ ...prev, group_interpretation: e.target.value }))}
                       placeholder="<p>Paste or type HTML here...</p>"
                       className="w-full px-3 py-2 border border-purple-200 rounded bg-white text-xs font-mono focus:outline-none focus:ring-2 focus:ring-purple-400"
                     />
                   )}
                 </div>
               )}
+            </div>
+
+            {/* Default Report Remark */}
+            <div className="bg-amber-50 border border-amber-200 rounded-lg p-4">
+              <div className="flex items-center gap-2 mb-2">
+                <FileText className="h-4 w-4 text-amber-600" />
+                <span className="text-sm font-medium text-amber-900">Default Report Remark</span>
+                <span className="text-xs text-amber-600 bg-amber-100 px-1.5 py-0.5 rounded">Prefilled during result entry</span>
+              </div>
+              <textarea
+                rows={2}
+                maxLength={2000}
+                value={formData.default_report_remark || ''}
+                onChange={(e) => setFormData(prev => ({ ...prev, default_report_remark: e.target.value }))}
+                placeholder="e.g. Kindly correlate clinically."
+                className="w-full px-3 py-2 border border-amber-200 rounded bg-white text-sm focus:outline-none focus:ring-2 focus:ring-amber-300"
+              />
+              <p className="mt-1 text-xs text-amber-700">
+                Plain text loaded into the Report Remarks box for every order of this group. The
+                technician can edit it, or untick it there to leave it off that report.
+              </p>
             </div>
 
             {/* Pre-Collection Guidelines */}

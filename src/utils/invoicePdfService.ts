@@ -290,8 +290,8 @@ export async function generateConsolidatedInvoicePDF(
     // 2. Fetch lab details
     const { data: lab } = await supabase.from('labs').select('*').eq('id', labId).single();
 
-    // 3. Use the lab's default invoice template for consolidated PDFs too.
-    const template = await fetchDefaultTemplate(labId);
+    // 3. Prefer the lab's B2B template (patient-wise layout); fall back to the default.
+    const template = (await fetchB2BTemplate(labId)) || (await fetchDefaultTemplate(labId));
     const html = template
       ? await buildConsolidatedInvoiceHtmlBundle(data, lab, template)
       : buildConsolidatedInvoiceHtml(data, lab);
@@ -317,6 +317,59 @@ export async function generateConsolidatedInvoicePDF(
   }
 }
 
+/**
+ * Amount received against a consolidated (B2B account) invoice.
+ * Mirrors the allocation shown in Monthly Account Billing: payments booked
+ * against this invoice count directly; account-level payments that name no
+ * invoice are allocated to the account's invoices oldest-first.
+ */
+async function computeConsolidatedAmountPaid(consolidated: any): Promise<number> {
+  const totalAmount = Number(consolidated.total_amount || 0);
+  if (!consolidated.account_id) return 0;
+
+  const [{ data: accountInvoices }, { data: payments }] = await Promise.all([
+    supabase
+      .from('consolidated_invoices')
+      .select('id, total_amount, billing_period_start, created_at')
+      .eq('account_id', consolidated.account_id),
+    supabase
+      .from('credit_transactions')
+      .select('amount, reference_type, reference_id')
+      .eq('account_id', consolidated.account_id)
+      .eq('transaction_type', 'payment'),
+  ]);
+
+  const paymentRows = payments || [];
+  const sumFor = (invoiceId: string) =>
+    paymentRows
+      .filter((p: any) => p.reference_type === 'consolidated_invoice' && p.reference_id === invoiceId)
+      .reduce((sum: number, p: any) => sum + Number(p.amount || 0), 0);
+
+  const directPaid = sumFor(consolidated.id);
+
+  let unassignedPool = paymentRows
+    .filter((p: any) => p.reference_type !== 'consolidated_invoice')
+    .reduce((sum: number, p: any) => sum + Number(p.amount || 0), 0);
+
+  const chronological = [...(accountInvoices || [])].sort((a: any, b: any) =>
+    String(a.billing_period_start).localeCompare(String(b.billing_period_start)) ||
+    String(a.created_at || '').localeCompare(String(b.created_at || ''))
+  );
+
+  let allocatedToThis = 0;
+  for (const current of chronological) {
+    const remaining = Math.max(0, Number(current.total_amount || 0) - sumFor(current.id));
+    const allocated = Math.min(unassignedPool, remaining);
+    unassignedPool -= allocated;
+    if (current.id === consolidated.id) {
+      allocatedToThis = allocated;
+      break;
+    }
+  }
+
+  return Math.min(totalAmount, directPaid + allocatedToThis);
+}
+
 async function fetchConsolidatedInvoiceData(id: string) {
   const { data: consolidated, error } = await supabase
     .from('consolidated_invoices')
@@ -329,9 +382,50 @@ async function fetchConsolidatedInvoiceData(id: string) {
   // Fetch linked invoices
   const { data: invoices } = await supabase
     .from('invoices')
-    .select('*, patient:patients(name), invoice_items(*, package:packages(name))')
+    .select('*, patient:patients(name, age, age_unit, gender, date_of_birth), invoice_items(*, package:packages(name))')
     .eq('consolidated_invoice_id', id)
     .order('invoice_date');
+
+  const invoiceList = invoices || [];
+
+  // B2B account invoices are created per order without invoice_items rows, so the
+  // patient-wise blocks would collapse to a single "invoice total" line. Pull the
+  // tests straight from order_tests for those (read-only — no rows are written).
+  const missingItems = invoiceList.filter(
+    (inv: any) => (!inv.invoice_items || inv.invoice_items.length === 0) && inv.order_id
+  );
+  if (missingItems.length > 0) {
+    const orderIds = Array.from(new Set(missingItems.map((inv: any) => inv.order_id)));
+    const { data: orderTests } = await supabase
+      .from('order_tests')
+      // order_tests has two FKs to packages, so the embed must name the constraint
+      .select('id, order_id, test_name, price, is_canceled, package:packages!order_tests_package_id_fkey(name)')
+      .in('order_id', orderIds);
+
+    const testsByOrder = new Map<string, any[]>();
+    (orderTests || [])
+      .filter((t: any) => !t.is_canceled)
+      .forEach((t: any) => {
+        const bucket = testsByOrder.get(t.order_id) || [];
+        bucket.push({
+          test_name: t.test_name,
+          package: t.package || null,
+          quantity: 1,
+          price: Number(t.price || 0),
+          discount_amount: 0,
+          total: Number(t.price || 0),
+        });
+        testsByOrder.set(t.order_id, bucket);
+      });
+
+    missingItems.forEach((inv: any) => {
+      const derived = testsByOrder.get(inv.order_id);
+      if (derived && derived.length > 0) inv.invoice_items = derived;
+    });
+  }
+
+  const totalAmount = Number(consolidated.total_amount || 0);
+  const amountPaid = await computeConsolidatedAmountPaid(consolidated);
 
   // Normalize field names for template consumption
   const normalized = {
@@ -349,12 +443,14 @@ async function fetchConsolidatedInvoiceData(id: string) {
     // Map DB column names to template names
     total_discount: consolidated.discount_amount || 0,
     tax: consolidated.tax_amount || 0,
-    total: consolidated.total_amount || 0,
-    invoices: invoices || [],
-    invoice_count: (invoices || []).length,
+    total: totalAmount,
+    amount_paid: amountPaid,
+    balance_due: Math.max(0, totalAmount - amountPaid),
+    invoices: invoiceList,
+    invoice_count: invoiceList.length,
     patient_count: (() => {
       const uniquePatients = new Set(
-        (invoices || []).map((inv: any) => inv.patient_id || inv.patient?.name || inv.patient_name || inv.id)
+        invoiceList.map((inv: any) => inv.patient_id || inv.patient?.name || inv.patient_name || inv.id)
       );
       return uniquePatients.size;
     })(),
@@ -393,8 +489,10 @@ async function buildConsolidatedInvoiceHtmlBundle(
     '{{amount_in_words}}': amountToIndianWords(data.total || 0),
     '{{total_amount_in_words}}': amountToIndianWords(data.total || 0),
     '{{grand_total_in_words}}': amountToIndianWords(data.total || 0),
-    '{{amount_paid}}': formatCurrency(0),
-    '{{balance_due}}': formatCurrency(data.total || 0),
+    '{{amount_paid}}': formatCurrency(data.amount_paid || 0),
+    '{{balance_due}}': formatCurrency(
+      data.balance_due != null ? data.balance_due : (data.total || 0)
+    ),
     '{{payment_type}}': 'Bill to Account',
     '{{payment_status}}': String(data.status || 'sent').toUpperCase(),
     '{{lab_name}}': lab?.name || '',
@@ -460,15 +558,82 @@ async function buildConsolidatedInvoiceHtmlBundle(
   );
   html = html.replace(/{{tax_disclaimer}}/g, template.tax_disclaimer || '');
 
+  const badgeCss = `
+    .payment-status-badge { display: inline-block; padding: 8px 16px; border-radius: 4px; font-weight: bold; font-size: 14px; }
+    .payment-status-badge.pending { background: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
+  `;
+
+  const pageSize = template.page_size || 'A4';
+  const letterheadUrl = template.letterhead_image_url;
+
+  // Letterhead background mode — same technique as single-invoice PDFs so the
+  // image repeats on every page of a multi-patient bill.
+  if (letterheadUrl) {
+    const PAGE_DIM: Record<string, { w: string; h: string }> = {
+      A4: { w: '210mm', h: '297mm' },
+      A5: { w: '148mm', h: '210mm' },
+      Letter: { w: '216mm', h: '279mm' },
+    };
+    const dim = PAGE_DIM[pageSize] || PAGE_DIM['A4'];
+    const topMm = template.letterhead_space_mm || 40;
+    const botMm = template.letterhead_bottom_mm || 20;
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Invoice ${data.invoice_number || ''}</title>
+  <style>
+    @page { size: ${pageSize}; margin: 0; }
+    html, body { margin: 0; padding: 0; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    #inv-lh-bg {
+      position: fixed;
+      top: 0; left: 0;
+      width: ${dim.w}; height: ${dim.h};
+      z-index: 0; pointer-events: none;
+      background-image: url('${letterheadUrl}');
+      background-repeat: no-repeat;
+      background-position: top center;
+      background-size: cover;
+      -webkit-print-color-adjust: exact; print-color-adjust: exact;
+    }
+    #inv-content-wrap { position: relative; z-index: 1; }
+    ${badgeCss}
+    ${css}
+  </style>
+</head>
+<body>
+  <div id="inv-lh-bg"></div>
+  <table style="width:100%;border:none;border-collapse:collapse;position:relative;z-index:1;">
+    <thead style="display:table-header-group;">
+      <tr><td style="border:none;padding:0;"><div style="height:${topMm}mm;"></div></td></tr>
+    </thead>
+    <tfoot style="display:table-footer-group;">
+      <tr><td style="border:none;padding:0;"><div style="height:${botMm}mm;"></div></td></tr>
+    </tfoot>
+    <tbody>
+      <tr><td style="border:none;padding:0 6mm;">
+        <div id="inv-content-wrap">${html}</div>
+      </td></tr>
+    </tbody>
+  </table>
+</body>
+</html>`;
+  }
+
+  const topMargin = template.letterhead_space_mm ? `${template.letterhead_space_mm}mm` : '5mm';
+
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Invoice ${data.invoice_number || ''}</title>
   <style>
+    @page { size: ${pageSize}; margin: 5mm; margin-top: ${topMargin}; }
+    ${badgeCss}
     ${css}
-    .payment-status-badge { display: inline-block; padding: 8px 16px; border-radius: 4px; font-weight: bold; font-size: 14px; }
-    .payment-status-badge.pending { background: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
   </style>
 </head>
 <body>
@@ -492,6 +657,30 @@ function buildConsolidatedInvoiceRows(invoices: any[]): string {
   `).join('');
 }
 
+function formatPatientAgeGender(patient: any): string {
+  if (!patient) return '';
+  const genderRaw: string = patient.gender || '';
+  const gender = genderRaw
+    ? genderRaw.charAt(0).toUpperCase() + genderRaw.slice(1).toLowerCase()
+    : '';
+
+  let ageStr = '';
+  if (patient.date_of_birth) {
+    const birthDate = new Date(patient.date_of_birth);
+    const today = new Date();
+    let age = today.getFullYear() - birthDate.getFullYear();
+    const m = today.getMonth() - birthDate.getMonth();
+    if (m < 0 || (m === 0 && today.getDate() < birthDate.getDate())) age--;
+    if (age >= 0) ageStr = `${age} yrs`;
+  }
+  if (!ageStr && patient.age != null) {
+    ageStr = `${patient.age} ${patient.age_unit || 'yrs'}`;
+  }
+
+  if (gender && ageStr) return `${ageStr} / ${gender}`;
+  return gender || ageStr;
+}
+
 function buildPatientServiceBlocks(invoices: any[]): string {
   if (!invoices || invoices.length === 0) {
     return '<div class="patient-service-empty">No patient services found</div>';
@@ -500,32 +689,48 @@ function buildPatientServiceBlocks(invoices: any[]): string {
   return invoices.map((inv: any, index: number) => {
     const items = Array.isArray(inv.invoice_items) ? inv.invoice_items : [];
     const serviceRows = items.length > 0
-      ? items.map((item: any) => {
+      ? items.map((item: any, itemIndex: number) => {
           const packageName = item.package?.name || item.package_name || '';
           const itemName = item.test_name || item.name || 'Service';
           const label = packageName
             ? `${escapeHtml(itemName)}<div class="patient-item-package">Package: ${escapeHtml(packageName)}</div>`
             : escapeHtml(itemName);
+          const itemDiscount = Number(item.discount_amount || 0);
+          const rate = Number(item.price || 0);
+          const qty = Number(item.quantity || 1);
+          const amount = item.total != null ? Number(item.total) : rate * qty - itemDiscount;
           return `
             <tr>
+              <td style="text-align:center;">${itemIndex + 1}</td>
               <td>${label}</td>
-              <td style="text-align:center;">${Number(item.quantity || 1)}</td>
-              <td style="text-align:right;">${formatCurrency(Number(item.price || 0))}</td>
-              <td style="text-align:right;">${formatCurrency(Number(item.total || 0))}</td>
+              <td style="text-align:center;">${qty}</td>
+              <td style="text-align:right;">${formatCurrency(rate)}</td>
+              <td style="text-align:right;">${itemDiscount > 0 ? `-${formatCurrency(itemDiscount)}` : '-'}</td>
+              <td style="text-align:right;">${formatCurrency(amount)}</td>
             </tr>
           `;
         }).join('')
       : `
         <tr>
-          <td>${escapeHtml(inv.invoice_number || 'Invoice')}</td>
+          <td style="text-align:center;">1</td>
+          <td>${escapeHtml(inv.invoice_number || 'Laboratory Services')}</td>
           <td style="text-align:center;">1</td>
           <td style="text-align:right;">${formatCurrency(Number(inv.subtotal || inv.total || 0))}</td>
+          <td style="text-align:right;">-</td>
           <td style="text-align:right;">${formatCurrency(Number(inv.total || 0))}</td>
         </tr>
       `;
 
     const patientTotal = Number(inv.total || 0);
     const patientName = inv.patient?.name || inv.patient_name || 'Unknown Patient';
+    const ageGender = formatPatientAgeGender(inv.patient);
+    const testCount = items.length || 1;
+    const metaParts = [
+      `Invoice: ${escapeHtml(inv.invoice_number || '-')}`,
+      inv.invoice_date ? `Date: ${formatDate(inv.invoice_date)}` : '',
+      ageGender ? escapeHtml(ageGender) : '',
+      `${testCount} test${testCount === 1 ? '' : 's'}`,
+    ].filter(Boolean);
 
     return `
       <div class="patient-service-block">
@@ -533,7 +738,7 @@ function buildPatientServiceBlocks(invoices: any[]): string {
           <div>
             <div class="patient-service-index">Patient ${index + 1}</div>
             <div class="patient-service-name">${escapeHtml(patientName)}</div>
-            <div class="patient-service-meta">Invoice: ${escapeHtml(inv.invoice_number || '-')}</div>
+            <div class="patient-service-meta">${metaParts.join(' &nbsp;|&nbsp; ')}</div>
           </div>
           <div class="patient-service-total">
             <span>Patient Amount</span>
@@ -543,13 +748,21 @@ function buildPatientServiceBlocks(invoices: any[]): string {
         <table class="patient-service-items">
           <thead>
             <tr>
-              <th>Test / Package</th>
-              <th style="text-align:center;">Qty</th>
-              <th style="text-align:right;">Rate</th>
-              <th style="text-align:right;">Amount</th>
+              <th style="width:6%; text-align:center;">#</th>
+              <th style="width:46%;">Test / Package</th>
+              <th style="width:8%; text-align:center;">Qty</th>
+              <th style="width:14%; text-align:right;">Rate (₹)</th>
+              <th style="width:12%; text-align:right;">Disc.</th>
+              <th style="width:14%; text-align:right;">Amount (₹)</th>
             </tr>
           </thead>
           <tbody>${serviceRows}</tbody>
+          <tfoot>
+            <tr>
+              <td colspan="5" style="text-align:right;">Patient Total</td>
+              <td style="text-align:right;">${formatCurrency(patientTotal)}</td>
+            </tr>
+          </tfoot>
         </table>
         <div class="patient-service-words">Amount in words: ${amountToIndianWords(patientTotal)}</div>
       </div>
@@ -804,6 +1017,24 @@ async function fetchTemplateById(templateId: string): Promise<InvoiceTemplate | 
 }
 
 /**
+ * Fetch the lab's B2B (corporate/account) invoice template.
+ * Used for consolidated account invoices, which render patient-wise blocks.
+ */
+async function fetchB2BTemplate(labId: string): Promise<InvoiceTemplate | null> {
+  const { data } = await supabase
+    .from('invoice_templates')
+    .select('*')
+    .eq('lab_id', labId)
+    .eq('category', 'b2b')
+    .eq('is_active', true)
+    .order('updated_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  return data || null;
+}
+
+/**
  * Fetch default template for lab
  */
 async function fetchDefaultTemplate(labId: string): Promise<InvoiceTemplate | null> {
@@ -958,6 +1189,17 @@ async function buildInvoiceHtmlBundle(invoice: Invoice, template: InvoiceTemplat
     '{{account_phone}}': accountPhone,
     '{{account_email}}': accountEmail,
     '{{account_gst}}': accountGst,
+    // Present so B2B/account templates render cleanly for a single invoice too
+    '{{billing_period}}': (() => {
+      const period = (invoice as any).billing_period;
+      if (!period) return formatDate(invoice.invoice_date);
+      const match = /^(\d{4})-(\d{2})$/.exec(String(period));
+      if (!match) return String(period);
+      const d = new Date(Number(match[1]), Number(match[2]) - 1, 1);
+      return d.toLocaleDateString('en-IN', { year: 'numeric', month: 'long' });
+    })(),
+    '{{patient_count}}': '1',
+    '{{invoice_count}}': '1',
     '{{lab_name}}': invoice.lab?.name || '',
     '{{lab_address}}': invoice.lab?.address || '',
     '{{lab_phone}}': invoice.lab?.phone || '',

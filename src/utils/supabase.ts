@@ -70,7 +70,26 @@ const getDailySequenceFromOrder = (order: any): number => {
   return Number.isFinite(parsed) ? parsed : 0;
 };
 
-// Strips package_test_groups rows whose test group has since been deactivated.
+// Sorts package_test_groups rows by the package-level display_order the user set
+// in the package editor. Rows predating that column fall back to test group name.
+export const sortPackageTestGroups = <T extends any[]>(rows: T): T => {
+  if (!Array.isArray(rows)) return rows;
+  return [...rows].sort((a: any, b: any) => {
+    const ao = Number.isFinite(Number(a?.display_order))
+      ? Number(a.display_order)
+      : Number.MAX_SAFE_INTEGER;
+    const bo = Number.isFinite(Number(b?.display_order))
+      ? Number(b.display_order)
+      : Number.MAX_SAFE_INTEGER;
+    if (ao !== bo) return ao - bo;
+    return String(a?.test_groups?.name || "").localeCompare(
+      String(b?.test_groups?.name || ""),
+    );
+  }) as T;
+};
+
+// Strips package_test_groups rows whose test group has since been deactivated,
+// then applies the package's own display order.
 // The package editor only lists active groups, so a deactivated link is
 // invisible there yet would still be re-saved and expanded into new orders.
 const dropInactivePackageLinks = <T,>(pkg: T): T => {
@@ -78,8 +97,10 @@ const dropInactivePackageLinks = <T,>(pkg: T): T => {
     if (!p || !Array.isArray(p.package_test_groups)) return p;
     return {
       ...p,
-      package_test_groups: p.package_test_groups.filter(
-        (ptg: any) => ptg?.test_groups && ptg.test_groups.is_active !== false,
+      package_test_groups: sortPackageTestGroups(
+        p.package_test_groups.filter(
+          (ptg: any) => ptg?.test_groups && ptg.test_groups.is_active !== false,
+        ),
       ),
     };
   };
@@ -1360,7 +1381,7 @@ export const database = {
 
         const { data, error } = await supabase
           .from("users")
-          .select("id, name, email, role, phone, is_phlebotomist")
+          .select("id, name, email, role, phone, contact_number, is_phlebotomist")
           .eq("lab_id", lab_id)
           .eq("status", "Active")
           .eq("is_phlebotomist", true)
@@ -3639,6 +3660,7 @@ export const database = {
                   name,
                   package_test_groups(
                     test_group_id,
+                    display_order,
                     test_groups(id, name, is_active)
                   )
                 `)
@@ -3662,7 +3684,8 @@ export const database = {
                   pd.id === pkg.id
                 );
                 if (pkgDetails?.package_test_groups) {
-                  pkgDetails.package_test_groups.forEach((ptg: any) => {
+                  // Expand in the package's own display order
+                  sortPackageTestGroups(pkgDetails.package_test_groups).forEach((ptg: any) => {
                     // Skip test groups deactivated after they were linked
                     if (ptg.test_groups && ptg.test_groups.is_active !== false) {
                       orderTestsData.push({
@@ -5699,9 +5722,10 @@ export const database = {
       endDate?: string,
       method?: string,
     ) => {
+      // Patient name lives on the invoice, not the payment row
       let query = supabase
         .from("payments")
-        .select("*");
+        .select("*, invoices(patient_name, invoice_number)");
 
       if (startDate) {
         query = query.gte("payment_date", startDate);
@@ -7185,6 +7209,7 @@ export const database = {
             ref_range_ai_config,
             collection_charge,
             group_interpretation,
+            default_report_remark,
             global_test_catalog_id,
             analyzer_connection_id,
             is_section_only,
@@ -7298,6 +7323,7 @@ export const database = {
             ref_range_ai_config,
 	            collection_charge,
 		            group_interpretation,
+		            default_report_remark,
 		            global_test_catalog_id,
 		            analyzer_connection_id,
 	            is_section_only,
@@ -7407,6 +7433,7 @@ export const database = {
             default_outsourced_lab_id,
             required_patient_inputs,
             ref_range_ai_config,
+            default_report_remark,
             test_group_analytes(
               analyte_id,
               lab_analyte_id,
@@ -7518,6 +7545,7 @@ export const database = {
 	            : null,
 	          collection_charge: testGroupData.collection_charge ?? null,
 		          group_interpretation: testGroupData.group_interpretation || null,
+		          default_report_remark: testGroupData.default_report_remark || null,
 		          global_test_catalog_id: testGroupData.global_test_catalog_id || null,
 		          analyzer_connection_id: testGroupData.analyzer_connection_id || null,
 	          is_section_only: testGroupData.is_section_only || false,
@@ -7744,6 +7772,7 @@ export const database = {
 	              : null,
 	            collection_charge: updates.collection_charge ?? null,
 	            group_interpretation: updates.group_interpretation ?? null,
+	            default_report_remark: updates.default_report_remark ?? null,
 	            analyzer_connection_id: updates.analyzer_connection_id || null,
 		            is_section_only: updates.is_section_only || false,
 		            updated_at: new Date().toISOString(),
@@ -8001,6 +8030,7 @@ export const database = {
           lab_id,
           package_test_groups(
             test_group_id,
+            display_order,
             test_groups(
               id,
               name,
@@ -8034,6 +8064,7 @@ export const database = {
           lab_id,
           package_test_groups(
             test_group_id,
+            display_order,
             test_groups(
               id,
               name,
@@ -8074,9 +8105,11 @@ export const database = {
       if (
         testGroupIds && Array.isArray(testGroupIds) && testGroupIds.length > 0
       ) {
-        const links = testGroupIds.map((tgId: string) => ({
+        // Array position is the package-level display order chosen in the editor
+        const links = testGroupIds.map((tgId: string, index: number) => ({
           package_id: pkg.id,
           test_group_id: tgId,
+          display_order: index,
         }));
 
         const { error: linkError } = await supabase
@@ -8112,9 +8145,10 @@ export const database = {
 
         // Insert new links if any
         if (testGroupIds.length > 0) {
-          const links = testGroupIds.map((tgId: string) => ({
+          const links = testGroupIds.map((tgId: string, index: number) => ({
             package_id: id,
             test_group_id: tgId,
+            display_order: index,
           }));
 
           const { error: linkError } = await supabase
@@ -9817,6 +9851,7 @@ const masterDataAPI = {
       name: string;
       license_number?: string;
       specialization?: string;
+      qualification?: string;
       phone?: string;
       email?: string;
       hospital?: string;
@@ -9849,6 +9884,7 @@ const masterDataAPI = {
       name?: string;
       license_number?: string;
       specialization?: string;
+      qualification?: string;
       phone?: string;
       email?: string;
       hospital?: string;
@@ -10361,17 +10397,19 @@ const masterDataAPI = {
       return { data, error };
     },
 
-    // Uses the shared credit model (open orders + unpaid bills + pending
-    // bookings, less gateway payments and cash receipted from Account Master),
-    // so the order form agrees with the B2B portal and the check-b2b-credit
-    // edge function. Imported lazily to keep this module free of import cycles.
+    // Uses the shared credit model (ledger debits less credits, plus pending
+    // bookings held in reserve), so the order form agrees with the B2B portal
+    // and the check-b2b-credit edge function. Note availableCredit can exceed
+    // the credit limit when the partner is in advance - do not clamp it here.
+    // Imported lazily to keep this module free of import cycles.
     checkCreditLimit: async (id: string, orderAmount: number) => {
-      const { fetchAccountCreditSummary } = await import("./accountCredit");
+      const { fetchAccountCreditSummary, isCreditAllowed } = await import("./accountCredit");
       const summary = await fetchAccountCreditSummary(id);
 
       if (!summary) {
         return {
           allowed: false,
+          bypassCreditCheck: false,
           currentBalance: 0,
           creditLimit: 0,
           availableCredit: 0,
@@ -10381,7 +10419,10 @@ const masterDataAPI = {
       }
 
       return {
-        allowed: orderAmount <= summary.availableCredit,
+        // Accounts flagged in Account Master are never blocked by credit
+        allowed: isCreditAllowed(summary, orderAmount),
+        bypassCreditCheck: summary.bypassCreditCheck,
+        bypassCreditUntil: summary.bypassCreditUntil,
         currentBalance: summary.effectiveCreditUsed,
         creditLimit: summary.creditLimit,
         availableCredit: summary.availableCredit,

@@ -1,6 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { Plus, Link, Users, Activity, ChevronRight, ChevronDown, Search, TestTube, X, Calendar, CheckCircle, AlertCircle, FlaskConical, ClipboardEdit, ArrowDownUp } from 'lucide-react';
-import { database, supabase } from '../../utils/supabase';
+import React, { useState } from 'react';
+import { Plus, Link, Users, Activity, ChevronRight, ChevronDown, Calendar, CheckCircle, AlertCircle, FlaskConical, ClipboardEdit, ArrowDownUp } from 'lucide-react';
 import { OrderStatusDisplay } from './OrderStatusDisplay';
 import { SampleTypeIndicator } from '../Common/SampleTypeIndicator';
 import { TATStatusBadge } from './TATStatusBadge';
@@ -31,7 +30,6 @@ interface Order {
     has_section_content?: boolean;
     section_verification_status?: string | null;
   }[];
-  can_add_tests?: boolean;
   hours_until_tat_breach?: number | null;
   is_tat_breached?: boolean | null;
   tat_hours?: number | null;
@@ -64,7 +62,6 @@ type VisitSortMode = 'current' | 'sample_desc' | 'sample_asc' | 'patient_az';
 interface PatientVisitCardProps {
   visit: PatientVisit;
   sortMode: VisitSortMode;
-  onAddTests: (orderId: string) => void;
   onCreateFollowUp: (parentOrderId: string) => void;
   onViewActivity: (visitGroupId: string) => void;
   onViewOrderDetails?: (order: Order) => void;
@@ -107,7 +104,6 @@ const getPendingPanels = (order: Order) => {
 const PatientVisitCard: React.FC<PatientVisitCardProps> = ({
   visit,
   sortMode,
-  onAddTests,
   onCreateFollowUp,
   onViewActivity,
   onViewOrderDetails,
@@ -219,16 +215,6 @@ const PatientVisitCard: React.FC<PatientVisitCardProps> = ({
                 <Activity className="h-4 w-4" />
               </button>
 
-              {primaryOrder && primaryOrder.can_add_tests && (
-                <button
-                  onClick={() => onAddTests(primaryOrder.id)}
-                  className="p-2 text-green-600 hover:bg-green-50 rounded-lg transition-colors"
-                  title="Add Tests to Current Order"
-                >
-                  <Plus className="h-4 w-4" />
-                </button>
-              )}
-
               {primaryOrder && onQuickResultEntry && (
                 <button
                   onClick={() => onQuickResultEntry(primaryOrder)}
@@ -281,7 +267,6 @@ const PatientVisitCard: React.FC<PatientVisitCardProps> = ({
                         <div className="flex flex-wrap items-center gap-2 mt-0.5">
                           <SampleTypeIndicator
                             sampleType={order.sample_type || 'Blood'}
-                            sampleColor={order.color_name}
                             size="sm"
                           />
                           <div className="text-sm text-gray-600 flex flex-wrap items-center gap-2">
@@ -368,16 +353,6 @@ const PatientVisitCard: React.FC<PatientVisitCardProps> = ({
                   <div className="flex flex-col items-start gap-2 md:flex-row md:items-center md:gap-3">
                     <OrderStatusDisplay order={order} compact={true} />
 
-                    {order.can_add_tests && (
-                      <button
-                        onClick={() => onAddTests(order.id)}
-                        className="p-2 text-green-600 hover:bg-green-50 rounded-lg transition-colors border-2 border-green-200 hover:border-green-300"
-                        title="Add tests to this order"
-                      >
-                        <Plus className="h-4 w-4" />
-                      </button>
-                    )}
-
                     {onQuickResultEntry && (
                       <button
                         onClick={() => onQuickResultEntry(order)}
@@ -416,210 +391,13 @@ const EnhancedOrdersPage: React.FC<EnhancedOrdersPageProps> = ({
   onNewSession,
   onNewPatientVisit
 }) => {
-  const [showAddTestModal, setShowAddTestModal] = useState(false);
-  const [selectedOrderId, setSelectedOrderId] = useState<string | null>(null);
   // activity modal state planned for future implementation
   // const [showActivityModal, setShowActivityModal] = useState(false);
   // const [selectedVisitGroupId, setSelectedVisitGroupId] = useState<string | null>(null);
-  const [availableTests, setAvailableTests] = useState<any[]>([]);
-  const [selectedTests, setSelectedTests] = useState<any[]>([]);
-  const [searchQuery, setSearchQuery] = useState('');
   const [selectedRange, setSelectedRange] = useState<'today' | 'yesterday' | 'last7' | 'all'>('today');
   const [sortMode, setSortMode] = useState<VisitSortMode>('current');
-  const [isLoadingTests, setIsLoadingTests] = useState(false);
 
   console.log('Orders version of EnhancedOrdersPage is rendering');
-
-  // Fetch tests and packages from database
-  const fetchTestsAndPackages = async () => {
-    setIsLoadingTests(true);
-    try {
-      // Fetch test groups
-      const { data: testGroups, error: testGroupsError } = await database.testGroups.getAll();
-      if (testGroupsError) {
-        console.error('Error fetching test groups:', testGroupsError);
-      }
-
-      // Fetch packages
-      const { data: packages, error: packagesError } = await database.packages.getAll();
-      if (packagesError) {
-        console.error('Error fetching packages:', packagesError);
-      }
-
-      // Transform test groups to match the expected format
-      const transformedTests = testGroups?.map(test => ({
-        id: test.id,
-        name: test.name,
-        price: test.price,
-        category: test.category,
-        sample: test.sample_type,
-        code: test.code,
-        type: 'test'
-      })) || [];
-
-      // Transform packages to match the expected format
-      const transformedPackages = packages?.map(pkg => ({
-        id: pkg.id,
-        name: pkg.name,
-        price: pkg.price,
-        category: 'Package',
-        sample: 'Various',
-        description: pkg.description,
-        type: 'package'
-      })) || [];
-
-      setAvailableTests([...transformedTests, ...transformedPackages]);
-    } catch (error) {
-      console.error('Error fetching tests and packages:', error);
-    } finally {
-      setIsLoadingTests(false);
-    }
-  };
-
-  useEffect(() => {
-    fetchTestsAndPackages();
-  }, []);
-
-  const filteredTests = availableTests.filter(test =>
-    test.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    test.category.toLowerCase().includes(searchQuery.toLowerCase())
-  );
-
-  const toggleTestSelection = (test: any) => {
-    setSelectedTests(prev => {
-      const isSelected = prev.some(t => t.id === test.id);
-      if (isSelected) {
-        return prev.filter(t => t.id !== test.id);
-      } else {
-        return [...prev, test];
-      }
-    });
-  };
-
-  const getTotalPrice = () => {
-    return selectedTests.reduce((sum, test) => sum + test.price, 0);
-  };
-
-  const handleAddSelectedTests = async () => {
-    if (selectedTests.length === 0 || !selectedOrderId) return;
-
-    try {
-      console.log('Adding tests to order:', selectedOrderId, selectedTests);
-
-      // Find the current order to get existing data
-      const currentOrder = orders.find(order => order.id === selectedOrderId);
-      if (!currentOrder) {
-        alert('Order not found');
-        return;
-      }
-
-      // Separate packages from individual tests
-      const packages = selectedTests.filter(test => test.type === 'package');
-      const individualTests = selectedTests.filter(test => test.type !== 'package');
-
-      // Build order_tests records
-      const newOrderTests: any[] = [];
-
-      // Add individual tests
-      individualTests.forEach(test => {
-        newOrderTests.push({
-          order_id: selectedOrderId,
-          test_name: test.name,
-          test_group_id: test.id || null,
-          package_id: null
-        });
-      });
-
-      // Add packages and their test groups
-      if (packages.length > 0) {
-        // Fetch package details
-        const packageIds = packages.map(p => p.id);
-        const { data: packageDetails } = await supabase
-          .from('packages')
-          .select(`
-            id,
-            name,
-            package_test_groups(
-              test_group_id,
-              test_groups(id, name, is_active)
-            )
-          `)
-          .in('id', packageIds);
-
-        packages.forEach(pkg => {
-          // Add package entry
-          newOrderTests.push({
-            order_id: selectedOrderId,
-            test_name: `📦 ${pkg.name}`,
-            test_group_id: null,
-            package_id: pkg.id
-          });
-
-          // Expand package test groups
-          const pkgDetails = packageDetails?.find(pd => pd.id === pkg.id);
-          if (pkgDetails?.package_test_groups) {
-            pkgDetails.package_test_groups.forEach((ptg: any) => {
-              // Skip test groups deactivated after they were linked
-              if (ptg.test_groups && ptg.test_groups.is_active !== false) {
-                newOrderTests.push({
-                  order_id: selectedOrderId,
-                  test_name: ptg.test_groups.name,
-                  test_group_id: ptg.test_groups.id,
-                  package_id: pkg.id
-                });
-              }
-            });
-          }
-        });
-      }
-
-      // Insert new tests into order_tests table
-      const { error: testsError } = await supabase
-        .from('order_tests')
-        .insert(newOrderTests);
-
-      if (testsError) {
-        console.error('Error inserting order tests:', testsError);
-        alert('Failed to add tests. Please try again.');
-        return;
-      }
-
-      // Calculate new total amount and update the order
-      const newTestsTotal = selectedTests.reduce((sum, test) => sum + test.price, 0);
-      const updatedTotalAmount = currentOrder.total_amount + newTestsTotal;
-
-      // Update the order's total amount
-      const { data, error } = await database.orders.update(selectedOrderId, {
-        total_amount: updatedTotalAmount
-      });
-
-      if (error) {
-        console.error('Error updating order total:', error);
-        alert('Tests added but failed to update total amount.');
-        return;
-      }
-
-      console.log('Order updated successfully:', data);
-
-      // Reset modal state
-      setSelectedTests([]);
-      setSearchQuery('');
-      setShowAddTestModal(false);
-      setSelectedOrderId(null);
-
-      // Refresh the orders data if the callback is provided
-      if (onRefreshOrders) {
-        await onRefreshOrders();
-      }
-
-      // Show success message
-      alert(`Successfully added ${selectedTests.length} tests to the order! Total cost: ₹${newTestsTotal.toLocaleString()}`);
-
-    } catch (error) {
-      console.error('Error adding tests:', error);
-      alert('Failed to add tests. Please try again.');
-    }
-  };
 
   // Normalizes any date-like string to YYYY-MM-DD
   const normalizeDate = (raw?: string) => {
@@ -655,8 +433,7 @@ const EnhancedOrdersPage: React.FC<EnhancedOrdersPageProps> = ({
         ...order,
         patient_name: safePatientName,
         order_date: safeDate,
-        order_type: order.order_type || 'initial',
-        can_add_tests: order.can_add_tests !== false && !['Completed', 'Delivered'].includes(order.status)
+        order_type: order.order_type || 'initial'
       };
 
       const group = visitGroups[visitGroupId];
@@ -807,11 +584,6 @@ const EnhancedOrdersPage: React.FC<EnhancedOrdersPageProps> = ({
     }
   };
 
-  const handleAddTests = (orderId: string) => {
-    setSelectedOrderId(orderId);
-    setShowAddTestModal(true);
-  };
-
   const handleCreateFollowUp = (parentOrderId: string) => {
     // Logic to create follow-up order
     console.log('Creating follow-up order for:', parentOrderId);
@@ -957,7 +729,6 @@ const EnhancedOrdersPage: React.FC<EnhancedOrdersPageProps> = ({
                     key={visit.visit_group_id}
                     visit={visit}
                     sortMode={sortMode}
-                    onAddTests={handleAddTests}
                     onCreateFollowUp={handleCreateFollowUp}
                     onViewActivity={handleViewActivity}
                     onQuickResultEntry={onQuickResultEntry}
@@ -994,169 +765,6 @@ const EnhancedOrdersPage: React.FC<EnhancedOrdersPageProps> = ({
         )}
       </div>
 
-      {/* Test Selection Modal */}
-      {showAddTestModal && selectedOrderId && (
-        <div className="fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-lg shadow-xl w-full max-w-4xl max-h-[90vh] overflow-hidden">
-            {/* Modal Header */}
-            <div className="flex items-center justify-between p-6 border-b border-gray-200">
-              <h3 className="text-lg font-semibold text-gray-900">
-                Add Tests to Order #{selectedOrderId?.substring(0, 8)}...
-              </h3>
-              <button
-                onClick={() => {
-                  setShowAddTestModal(false);
-                  setSelectedTests([]);
-                  setSearchQuery('');
-                }}
-                className="text-gray-400 hover:text-gray-500 p-1 rounded"
-              >
-                <X className="h-6 w-6" />
-              </button>
-            </div>
-
-            <div className="flex h-96">
-              {/* Left Panel - Test Selection */}
-              <div className="flex-1 p-6 overflow-y-auto">
-                {/* Search */}
-                <div className="mb-4">
-                  <div className="relative">
-                    <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 h-5 w-5" />
-                    <input
-                      type="text"
-                      placeholder="Search tests..."
-                      value={searchQuery}
-                      onChange={(e) => setSearchQuery(e.target.value)}
-                      className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                    />
-                  </div>
-                </div>
-
-                {/* Available Tests */}
-                <div className="space-y-2">
-                  <h4 className="text-sm font-medium text-gray-700 mb-3">Available Tests & Packages</h4>
-                  {isLoadingTests ? (
-                    <div className="flex items-center justify-center py-8">
-                      <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
-                      <span className="ml-2 text-gray-600">Loading tests...</span>
-                    </div>
-                  ) : filteredTests.length === 0 ? (
-                    <div className="text-center py-8 text-gray-500">
-                      No tests found matching your search.
-                    </div>
-                  ) : (
-                    filteredTests.map((test) => (
-                      <div
-                        key={test.id}
-                        className={`border rounded-lg p-3 cursor-pointer transition-all ${selectedTests.some(t => t.id === test.id)
-                          ? 'border-blue-500 bg-blue-50'
-                          : 'border-gray-200 hover:border-gray-300'
-                          }`}
-                        onClick={() => toggleTestSelection(test)}
-                      >
-                        <div className="flex items-center justify-between">
-                          <div className="flex-1">
-                            <div className="flex items-center justify-between">
-                              <div className="flex items-center gap-2">
-                                <h5 className="text-sm font-medium text-gray-900">{test.name}</h5>
-                                {test.type === 'package' && (
-                                  <span className="px-2 py-1 text-xs bg-purple-100 text-purple-800 rounded-full">Package</span>
-                                )}
-                              </div>
-                              <span className="text-sm font-bold text-green-600">₹{test.price}</span>
-                            </div>
-                            <div className="text-xs text-gray-500 mt-1">
-                              {test.category} • {test.sample}
-                            </div>
-                          </div>
-                          <div className="ml-3">
-                            <div className={`w-5 h-5 rounded border-2 flex items-center justify-center ${selectedTests.some(t => t.id === test.id)
-                              ? 'bg-blue-500 border-blue-500'
-                              : 'border-gray-300'
-                              }`}>
-                              {selectedTests.some(t => t.id === test.id) && (
-                                <span className="text-white text-xs">✓</span>
-                              )}
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    ))
-                  )}
-                </div>
-              </div>
-
-              {/* Right Panel - Selected Tests */}
-              <div className="w-80 border-l border-gray-200 p-6 bg-gray-50">
-                <h4 className="text-sm font-medium text-gray-700 mb-3">Selected Tests ({selectedTests.length})</h4>
-
-                {selectedTests.length === 0 ? (
-                  <div className="text-center text-gray-500 py-8">
-                    <TestTube className="h-12 w-12 mx-auto mb-3 text-gray-300" />
-                    <p>No tests selected</p>
-                    <p className="text-sm">Choose tests from the left panel</p>
-                  </div>
-                ) : (
-                  <div className="space-y-3">
-                    {selectedTests.map((test) => (
-                      <div key={test.id} className="bg-white border border-gray-200 rounded-lg p-3">
-                        <div className="flex items-center justify-between">
-                          <div className="flex-1">
-                            <h5 className="text-sm font-medium text-gray-900">{test.name}</h5>
-                            <p className="text-xs text-gray-500">₹{test.price}</p>
-                          </div>
-                          <button
-                            onClick={() => toggleTestSelection(test)}
-                            className="text-red-400 hover:text-red-600"
-                          >
-                            <X className="h-4 w-4" />
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-
-                    <div className="border-t border-gray-200 pt-4 mt-4">
-                      <div className="flex justify-between text-sm font-medium">
-                        <span>Total:</span>
-                        <span>₹{getTotalPrice().toLocaleString()}</span>
-                      </div>
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-
-            {/* Modal Footer */}
-            <div className="flex items-center justify-between p-6 border-t border-gray-200 bg-gray-50">
-              <div className="text-sm text-gray-600">
-                {selectedTests.length > 0
-                  ? `${selectedTests.length} test${selectedTests.length !== 1 ? 's' : ''} selected • Total: ₹${getTotalPrice().toLocaleString()}`
-                  : 'Select tests to add to this order'
-                }
-              </div>
-              <div className="flex space-x-3">
-                <button
-                  onClick={() => {
-                    setShowAddTestModal(false);
-                    setSelectedTests([]);
-                    setSearchQuery('');
-                  }}
-                  className="px-4 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50"
-                >
-                  Cancel
-                </button>
-                <button
-                  onClick={handleAddSelectedTests}
-                  disabled={selectedTests.length === 0}
-                  className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
-                >
-                  Add {selectedTests.length > 0 ? `${selectedTests.length} ` : ''}Test{selectedTests.length !== 1 ? 's' : ''}
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 };

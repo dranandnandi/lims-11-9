@@ -10,91 +10,159 @@ interface SampleTypeIndicatorProps {
     labColors?: Record<string, string>;
 }
 
-// Default vacutainer cap colors (industry standard)
+interface SampleConfig {
+    type: string;
+    cap: string;
+    label: string;
+    gradient: string;
+    bodyFill?: string;
+    contentFill?: string;
+}
+
+// Default vacutainer cap colors (CLSI order-of-draw standard).
+// `lightBlue` (citrate) and `royalBlue` (trace elements) are different tubes —
+// do not collapse them into one "blue".
 const DEFAULT_VACUTAINER_CAPS: Record<string, { cap: string; label: string; gradient: string }> = {
     red: { cap: '#DC2626', label: 'Red Top', gradient: 'from-red-600 to-red-700' },
     purple: { cap: '#9333EA', label: 'Purple Top (EDTA)', gradient: 'from-purple-600 to-purple-700' },
     lavender: { cap: '#9333EA', label: 'Lavender Top (EDTA)', gradient: 'from-purple-600 to-purple-700' },
     green: { cap: '#16A34A', label: 'Green Top (Heparin)', gradient: 'from-green-600 to-green-700' },
-    blue: { cap: '#2563EB', label: 'Blue Top (Citrate)', gradient: 'from-blue-600 to-blue-700' },
-    yellow: { cap: '#EAB308', label: 'Yellow Top (SST)', gradient: 'from-yellow-500 to-yellow-600' },
+    lightBlue: { cap: '#7EC8E3', label: 'Light Blue Top (Citrate)', gradient: 'from-sky-300 to-sky-400' },
+    royalBlue: { cap: '#1D4ED8', label: 'Royal Blue Top (Trace Elements)', gradient: 'from-blue-700 to-blue-800' },
+    yellow: { cap: '#EAB308', label: 'Yellow Top (ACD/SPS)', gradient: 'from-yellow-500 to-yellow-600' },
     gold: { cap: '#F59E0B', label: 'Gold Top (SST)', gradient: 'from-amber-500 to-amber-600' },
     gray: { cap: '#6B7280', label: 'Gray Top (Fluoride)', gradient: 'from-gray-500 to-gray-600' },
 };
 
-// Map sample types to visual representations (Specimen Types)
-const getSampleConfig = (sampleType: string, labColors: Record<string, string> = {}) => {
-    const type = sampleType?.toLowerCase() || '';
-
-    // Check for lab-configured color override first
-    const labColorOverride = findLabColorOverride(type, labColors);
-
-    // Radiology types - not affected by tube colors
-    if (type.includes('x ray') || type.includes('x-ray') || type.includes('xray')) {
-        return {
-            type: 'radiology-xray',
-            cap: '#1D4ED8',
-            label: 'X-Ray',
-            gradient: 'from-blue-600 to-blue-700'
-        };
-    } else if (type.includes('ct')) {
-        return {
-            type: 'radiology-ct',
-            cap: '#0F766E',
-            label: 'CT Scan',
-            gradient: 'from-teal-600 to-teal-700'
-        };
-    } else if (type.includes('usg') || type.includes('ultrasound') || type.includes('sonography')) {
-        return {
-            type: 'radiology-usg',
-            cap: '#7C3AED',
-            label: 'USG',
-            gradient: 'from-violet-600 to-violet-700'
-        };
-    }
-
-    // Container type detection
-    let containerType = 'vacutainer';
-    let defaultCapConfig = DEFAULT_VACUTAINER_CAPS.red;
-
-    if (type.includes('urine')) {
-        containerType = 'urine';
-        defaultCapConfig = { cap: '#EAB308', label: 'Urine Cup', gradient: 'from-yellow-500 to-yellow-600' };
-    } else if (type.includes('stool')) {
-        containerType = 'stool';
-        defaultCapConfig = { cap: '#92400E', label: 'Stool Container', gradient: 'from-amber-800 to-amber-900' };
-    } else if (type.includes('swab')) {
-        containerType = 'swab';
-        defaultCapConfig = { cap: '#9CA3AF', label: 'Swab', gradient: 'from-gray-400 to-gray-500' };
-    } else if (type.includes('edta') || type.includes('purple') || type.includes('lavender') || type.includes('hb1ac') || type.includes('cbc') || type.includes('hematology')) {
-        defaultCapConfig = DEFAULT_VACUTAINER_CAPS.purple;
-    } else if (type.includes('serum') || type.includes('sst') || type.includes('gold') || type.includes('yellow') || type.includes('thyroid') || type.includes('t3') || type.includes('t4') || type.includes('tsh') || type.includes('hormone') || type.includes('biochemistry')) {
-        defaultCapConfig = DEFAULT_VACUTAINER_CAPS.gold;
-    } else if (type.includes('blood') || type.includes('red')) {
-        defaultCapConfig = DEFAULT_VACUTAINER_CAPS.red;
-    } else if (type.includes('plasma') || type.includes('green') || type.includes('heparin')) {
-        defaultCapConfig = DEFAULT_VACUTAINER_CAPS.green;
-    } else if (type.includes('citrate') || type.includes('blue') || type.includes('coagulation')) {
-        defaultCapConfig = DEFAULT_VACUTAINER_CAPS.blue;
-    } else if (type.includes('fluoride') || type.includes('gray') || type.includes('glucose') || type.includes('sugar')) {
-        defaultCapConfig = DEFAULT_VACUTAINER_CAPS.gray;
-    }
-
-    // Apply lab color override if present
-    if (labColorOverride) {
-        return {
-            type: containerType,
-            cap: labColorOverride,
-            label: defaultCapConfig.label,
-            gradient: defaultCapConfig.gradient,
-        };
-    }
-
-    return {
-        type: containerType,
-        ...defaultCapConfig
-    };
+// Test groups store their tube colour as a name ('Red', 'Blue', 'Pink', ...).
+// Painted raw as an SVG fill those CSS colours clash with the palette above, so
+// resolve known names to the vacutainer hexes and let anything else (hex, rgb(),
+// hsl(), an unlisted name) pass through untouched.
+const CAP_COLOR_NAMES: Record<string, string> = {
+    red: DEFAULT_VACUTAINER_CAPS.red.cap,
+    purple: DEFAULT_VACUTAINER_CAPS.purple.cap,
+    lavender: DEFAULT_VACUTAINER_CAPS.lavender.cap,
+    green: DEFAULT_VACUTAINER_CAPS.green.cap,
+    blue: DEFAULT_VACUTAINER_CAPS.royalBlue.cap,
+    'light blue': DEFAULT_VACUTAINER_CAPS.lightBlue.cap,
+    lightblue: DEFAULT_VACUTAINER_CAPS.lightBlue.cap,
+    'royal blue': DEFAULT_VACUTAINER_CAPS.royalBlue.cap,
+    royalblue: DEFAULT_VACUTAINER_CAPS.royalBlue.cap,
+    yellow: DEFAULT_VACUTAINER_CAPS.yellow.cap,
+    gold: DEFAULT_VACUTAINER_CAPS.gold.cap,
+    gray: DEFAULT_VACUTAINER_CAPS.gray.cap,
+    grey: DEFAULT_VACUTAINER_CAPS.gray.cap,
+    pink: '#EC4899',
+    orange: '#F97316',
+    black: '#111827',
+    white: '#F3F4F6',
+    brown: '#92400E',
 };
+
+export const normalizeCapColor = (color?: string | null): string | undefined => {
+    if (!color) return undefined;
+    const key = color.trim().toLowerCase();
+    return CAP_COLOR_NAMES[key] || color;
+};
+
+// Map sample types to visual representations (Specimen Types)
+const getSampleConfig = (sampleType: string, labColors: Record<string, string> = {}): SampleConfig => {
+    const type = sampleType?.toLowerCase().trim() || '';
+    const has = (...keys: string[]) => keys.some(k => type.includes(k));
+    // Whole-word match, for abbreviations short enough to appear inside other
+    // words ('ct' is a substring of 'lactate', 'pet' of 'competitive', ...).
+    const hasWord = (...keys: string[]) =>
+        keys.some(k => new RegExp(`(^|[^a-z])${k}([^a-z]|$)`).test(type));
+
+    // Lab-configured override replaces the cap colour only; the container shape
+    // still follows the sample type.
+    const labColorOverride = findLabColorOverride(type, labColors);
+    const resolve = (config: SampleConfig): SampleConfig =>
+        labColorOverride ? { ...config, cap: labColorOverride } : config;
+
+    // --- Non-specimen: nothing is collected, so draw no container ---
+    if (has('no sample', 'no specimen', 'not required')) {
+        return resolve({ type: 'none', cap: '#9CA3AF', label: 'No Sample Required', gradient: 'from-gray-400 to-gray-500' });
+    }
+
+    // --- Imaging. Must precede the scope checks: 'fluoroscopy' contains 'scopy'. ---
+    if (has('x ray', 'x-ray', 'xray')) {
+        return resolve({ type: 'radiology-xray', cap: '#1D4ED8', label: 'X-Ray', gradient: 'from-blue-600 to-blue-700' });
+    }
+    if (hasWord('ct') || has('computed tomography')) {
+        return resolve({ type: 'radiology-ct', cap: '#0F766E', label: 'CT Scan', gradient: 'from-teal-600 to-teal-700' });
+    }
+    if (has('usg', 'ultrasound', 'sonograph', 'doppler')) {
+        return resolve({ type: 'radiology-usg', cap: '#7C3AED', label: 'USG', gradient: 'from-violet-600 to-violet-700' });
+    }
+    if (hasWord('mri', 'pet') || has('magnetic resonance', 'mammograph', 'dexa', 'bone densit', 'fluoroscop', 'angiograph')) {
+        return resolve({ type: 'radiology-scan', cap: '#4338CA', label: 'Imaging', gradient: 'from-indigo-600 to-indigo-700' });
+    }
+
+    // --- Physiological recordings and scope procedures ---
+    if (hasWord('ecg', 'ekg', 'eeg') || has('electrocardio', 'electroencephalo')) {
+        return resolve({ type: 'procedure-trace', cap: '#BE123C', label: 'Recording', gradient: 'from-rose-600 to-rose-700' });
+    }
+    if (has('scopy', 'endoscop', 'colonoscop', 'bronchoscop')) {
+        return resolve({ type: 'procedure-scope', cap: '#0E7490', label: 'Scope Procedure', gradient: 'from-cyan-700 to-cyan-800' });
+    }
+
+    // --- Non-blood specimen containers ---
+    if (has('urine')) {
+        return resolve({ type: 'urine', cap: '#EAB308', label: 'Urine Cup', gradient: 'from-yellow-500 to-yellow-600' });
+    }
+    if (has('stool', 'faece', 'fece')) {
+        return resolve({ type: 'jar', cap: '#92400E', label: 'Stool Container', gradient: 'from-amber-800 to-amber-900', bodyFill: '#FEF3C7', contentFill: '#92400E' });
+    }
+    if (has('sputum', 'bronchial wash', 'gastric lavage')) {
+        return resolve({ type: 'jar', cap: '#64748B', label: 'Sterile Container', gradient: 'from-slate-500 to-slate-600', bodyFill: '#F1F5F9', contentFill: '#94A3B8' });
+    }
+    if (has('tissue', 'biopsy', 'histopath', 'fnac')) {
+        return resolve({ type: 'jar', cap: '#0E7490', label: 'Formalin Jar', gradient: 'from-cyan-700 to-cyan-800', bodyFill: '#ECFEFF', contentFill: '#FDE68A' });
+    }
+    if (has('swab')) {
+        return resolve({ type: 'swab', cap: '#9CA3AF', label: 'Swab', gradient: 'from-gray-400 to-gray-500' });
+    }
+    // Sterile additive-free tube — CSF and serous fluids are not vacutainer draws
+    if (has('csf', 'cerebrospinal', 'body fluid', 'ascitic', 'pleural', 'synovial', 'peritoneal')) {
+        return resolve({ type: 'vacutainer', cap: '#E2E8F0', label: 'Sterile Plain Tube', gradient: 'from-slate-200 to-slate-300' });
+    }
+
+    // --- Vacutainer caps, most specific additive first.
+    // Order is load-bearing: every '<additive> Plasma' value also contains
+    // 'plasma', so the additive branches MUST be tested before the generic
+    // plasma/heparin branch, or Fluoride and Citrated Plasma silently render as
+    // green heparin tops.
+    let capConfig = DEFAULT_VACUTAINER_CAPS.red;
+
+    if (has('edta', 'purple', 'lavender', 'hba1c', 'hb1ac', 'cbc', 'haematolog', 'hematolog', 'whole blood', 'capillary')) {
+        capConfig = DEFAULT_VACUTAINER_CAPS.purple;
+    } else if (has('fluoride', 'oxalate', 'gray', 'grey', 'glucose', 'sugar', 'lactate')) {
+        capConfig = DEFAULT_VACUTAINER_CAPS.gray;
+    } else if (has('citrate', 'coagulation', 'light blue', 'aptt', 'prothrombin')) {
+        capConfig = DEFAULT_VACUTAINER_CAPS.lightBlue;
+    } else if (has('trace element', 'heavy metal', 'royal blue')) {
+        capConfig = DEFAULT_VACUTAINER_CAPS.royalBlue;
+    } else if (has('acd', 'blood culture')) {
+        capConfig = DEFAULT_VACUTAINER_CAPS.yellow;
+    } else if (has('serum', 'sst', 'gold', 'tiger', 'yellow', 'thyroid', 'tsh', 'hormone', 'biochem')) {
+        capConfig = DEFAULT_VACUTAINER_CAPS.gold;
+    } else if (has('plasma', 'green', 'heparin')) {
+        capConfig = DEFAULT_VACUTAINER_CAPS.green;
+    } else if (has('blood', 'red')) {
+        capConfig = DEFAULT_VACUTAINER_CAPS.red;
+    }
+
+    return resolve({ type: 'vacutainer', ...capConfig });
+};
+
+// Single source of truth for "what colour would this sample type be with no lab
+// override?" — use this instead of re-declaring a defaults map elsewhere.
+export const getDefaultSampleCapColor = (sampleType: string): string =>
+    getSampleConfig(sampleType, {}).cap;
+
+export const getSampleContainerLabel = (sampleType: string): string =>
+    getSampleConfig(sampleType, {}).label;
 
 // Find matching lab color override for a sample type
 function findLabColorOverride(sampleType: string, labColors: Record<string, string>): string | null {
@@ -105,14 +173,15 @@ function findLabColorOverride(sampleType: string, labColors: Record<string, stri
     // Direct match
     if (labColors[type]) return labColors[type];
 
-    // Check if any configured key is contained in the sample type
-    for (const [key, color] of Object.entries(labColors)) {
-        if (type.includes(key.toLowerCase())) {
-            return color;
-        }
-    }
+    // Fall back to substring keys, longest (most specific) first. Object key
+    // order is not meaningful here: a lab that configures both 'plasma' and
+    // 'fluoride plasma' must get the fluoride colour for 'Fluoride Plasma',
+    // not whichever key happened to be inserted first.
+    const match = Object.keys(labColors)
+        .filter(key => type.includes(key.toLowerCase()))
+        .sort((a, b) => b.length - a.length)[0];
 
-    return null;
+    return match ? labColors[match] : null;
 }
 
 const VacutainerTube: React.FC<{ config: any; size: string }> = ({ config, size }) => {
@@ -123,11 +192,13 @@ const VacutainerTube: React.FC<{ config: any; size: string }> = ({ config, size 
     };
 
     const { width, height, capHeight } = sizes[size as keyof typeof sizes];
+    // '#' is not valid inside a url(#id) reference — strip it from the cap hex
+    const gradId = `tube-grad-${String(config.cap).replace(/[^a-zA-Z0-9]/g, '')}`;
 
     return (
         <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} className="inline-block" style={{ overflow: 'visible' }}>
             <defs>
-                <linearGradient id={`tube-grad-${config.cap}`} x1="0%" y1="0%" x2="100%" y2="0%">
+                <linearGradient id={gradId} x1="0%" y1="0%" x2="100%" y2="0%">
                     <stop offset="0%" style={{ stopColor: '#F3F4F6', stopOpacity: 0.9 }} />
                     <stop offset="50%" style={{ stopColor: '#FFFFFF', stopOpacity: 1 }} />
                     <stop offset="100%" style={{ stopColor: '#F3F4F6', stopOpacity: 0.9 }} />
@@ -141,12 +212,12 @@ const VacutainerTube: React.FC<{ config: any; size: string }> = ({ config, size 
                 width={width * 0.7}
                 height={height - capHeight}
                 rx={width * 0.1}
-                fill={`url(#tube-grad-${config.cap})`}
+                fill={`url(#${gradId})`}
                 stroke="#D1D5DB"
                 strokeWidth="0.5"
             />
 
-            {/* Cap */}
+            {/* Cap — stroked so pale caps (sterile plain tube) stay visible */}
             <rect
                 x={0}
                 y={0}
@@ -154,6 +225,8 @@ const VacutainerTube: React.FC<{ config: any; size: string }> = ({ config, size 
                 height={capHeight}
                 rx={2}
                 fill={config.cap}
+                stroke="rgba(0,0,0,0.18)"
+                strokeWidth="0.5"
             />
             {/* Cap highlight */}
             <rect
@@ -231,7 +304,8 @@ const UrineContainer: React.FC<{ config: any; size: string }> = ({ config, size 
     );
 };
 
-const StoolContainer: React.FC<{ config: any; size: string }> = ({ config, size }) => {
+// Wide-mouth screw-cap jar: stool, sputum/sterile containers, formalin jars
+const ScrewCapContainer: React.FC<{ config: any; size: string }> = ({ config, size }) => {
     const sizes = {
         sm: { width: 28, height: 32, capHeight: 6 },
         md: { width: 36, height: 40, capHeight: 8 },
@@ -248,19 +322,19 @@ const StoolContainer: React.FC<{ config: any; size: string }> = ({ config, size 
                    L ${width * 0.2} ${height} 
                    L ${width * 0.8} ${height} 
                    L ${width * 0.9} ${capHeight} Z`}
-                fill="#FEF3C7"
+                fill={config.bodyFill || '#FEF3C7'}
                 fillOpacity="0.5"
                 stroke="#D4D4D8"
                 strokeWidth="1"
             />
 
-            {/* Liquid/Content area for stool */}
+            {/* Specimen content */}
             <path
-                d={`M ${width * 0.22} ${capHeight + (height - capHeight) * 0.5} 
-                   L ${width * 0.3} ${height - 2} 
-                   L ${width * 0.7} ${height - 2} 
+                d={`M ${width * 0.22} ${capHeight + (height - capHeight) * 0.5}
+                   L ${width * 0.3} ${height - 2}
+                   L ${width * 0.7} ${height - 2}
                    L ${width * 0.78} ${capHeight + (height - capHeight) * 0.5} Z`}
-                fill="#92400E"
+                fill={config.contentFill || '#92400E'}
                 fillOpacity="0.6"
             />
 
@@ -335,7 +409,7 @@ const SwabIcon: React.FC<{ config: any; size: string }> = ({ config, size }) => 
     );
 };
 
-const RadiologyIcon: React.FC<{ config: any; size: string; mode: 'xray' | 'ct' | 'usg' }> = ({ config, size, mode }) => {
+const RadiologyIcon: React.FC<{ config: any; size: string; mode: 'xray' | 'ct' | 'usg' | 'scan' }> = ({ config, size, mode }) => {
     const sizes = {
         sm: { width: 26, height: 26 },
         md: { width: 34, height: 34 },
@@ -353,6 +427,17 @@ const RadiologyIcon: React.FC<{ config: any; size: string; mode: 'xray' | 'ct' |
                 <circle cx={cx} cy={cy} r={width * 0.38} fill="white" stroke={stroke} strokeWidth="2" />
                 <circle cx={cx} cy={cy} r={width * 0.18} fill="none" stroke={stroke} strokeWidth="2" strokeDasharray="2 2" />
                 <rect x={width * 0.14} y={height * 0.43} width={width * 0.12} height={height * 0.14} rx="2" fill={stroke} opacity="0.8" />
+            </svg>
+        );
+    }
+
+    // Generic imaging: MRI, PET, mammography, DEXA, fluoroscopy, angiography
+    if (mode === 'scan') {
+        return (
+            <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} className="inline-block">
+                <rect x={width * 0.08} y={height * 0.18} width={width * 0.84} height={height * 0.64} rx={width * 0.22} fill="white" stroke={stroke} strokeWidth="2" />
+                <rect x={width * 0.3} y={height * 0.06} width={width * 0.4} height={height * 0.88} rx="3" fill="white" stroke={stroke} strokeWidth="1.5" />
+                <circle cx={cx} cy={cy} r={width * 0.1} fill={stroke} opacity="0.75" />
             </svg>
         );
     }
@@ -377,6 +462,76 @@ const RadiologyIcon: React.FC<{ config: any; size: string; mode: 'xray' | 'ct' |
     );
 };
 
+const ProcedureIcon: React.FC<{ config: any; size: string; mode: 'trace' | 'scope' }> = ({ config, size, mode }) => {
+    const sizes = {
+        sm: { width: 26, height: 26 },
+        md: { width: 34, height: 34 },
+        lg: { width: 42, height: 42 },
+    };
+
+    const { width, height } = sizes[size as keyof typeof sizes];
+    const stroke = config.cap || '#BE123C';
+
+    // ECG / EEG — a waveform on a monitor, no specimen involved
+    if (mode === 'trace') {
+        return (
+            <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} className="inline-block">
+                <rect x={width * 0.08} y={height * 0.16} width={width * 0.84} height={height * 0.6} rx="4" fill="white" stroke={stroke} strokeWidth="2" />
+                <path
+                    d={`M ${width * 0.18} ${height * 0.48} L ${width * 0.34} ${height * 0.48} L ${width * 0.42} ${height * 0.28} L ${width * 0.52} ${height * 0.66} L ${width * 0.6} ${height * 0.48} L ${width * 0.82} ${height * 0.48}`}
+                    fill="none"
+                    stroke={stroke}
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                />
+                <line x1={width * 0.34} y1={height * 0.88} x2={width * 0.66} y2={height * 0.88} stroke={stroke} strokeWidth="2" strokeLinecap="round" />
+            </svg>
+        );
+    }
+
+    // Endoscopy / colonoscopy / bronchoscopy — flexible scope with a lit tip
+    return (
+        <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} className="inline-block">
+            <path
+                d={`M ${width * 0.18} ${height * 0.82} Q ${width * 0.2} ${height * 0.34} ${width * 0.52} ${height * 0.3} Q ${width * 0.82} ${height * 0.26} ${width * 0.8} ${height * 0.6}`}
+                fill="none"
+                stroke={stroke}
+                strokeWidth="3"
+                strokeLinecap="round"
+            />
+            <circle cx={width * 0.8} cy={height * 0.68} r={width * 0.11} fill={stroke} />
+            <circle cx={width * 0.8} cy={height * 0.68} r={width * 0.04} fill="white" />
+            <rect x={width * 0.08} y={height * 0.78} width={width * 0.22} height={height * 0.16} rx="2" fill={stroke} opacity="0.8" />
+        </svg>
+    );
+};
+
+// Tests that need no specimen at all — draw an explicit "nothing to collect"
+// marker rather than defaulting to a blood tube.
+const NoSpecimenIcon: React.FC<{ config: any; size: string }> = ({ config, size }) => {
+    const sizes = {
+        sm: { width: 24, height: 24 },
+        md: { width: 32, height: 32 },
+        lg: { width: 40, height: 40 },
+    };
+
+    const { width, height } = sizes[size as keyof typeof sizes];
+    const stroke = config.cap || '#9CA3AF';
+    const r = width * 0.38;
+
+    return (
+        <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} className="inline-block">
+            <circle cx={width / 2} cy={height / 2} r={r} fill="white" stroke={stroke} strokeWidth="2" strokeDasharray="3 2.5" />
+            <line
+                x1={width / 2 - r * 0.6} y1={height / 2 + r * 0.6}
+                x2={width / 2 + r * 0.6} y2={height / 2 - r * 0.6}
+                stroke={stroke} strokeWidth="2" strokeLinecap="round"
+            />
+        </svg>
+    );
+};
+
 export const SampleTypeIndicator: React.FC<SampleTypeIndicatorProps> = ({
     sampleType,
     sampleColor,
@@ -387,14 +542,17 @@ export const SampleTypeIndicator: React.FC<SampleTypeIndicatorProps> = ({
 }) => {
     const { colors: contextLabColors } = useSampleTypeColors();
     const labColors = propLabColors ?? contextLabColors;
-    const config = getSampleConfig(sampleType, labColors);
+    const baseConfig = getSampleConfig(sampleType, labColors);
+    // Explicit per-record colour beats both the lab config and the defaults
+    const resolvedColor = normalizeCapColor(sampleColor);
+    const config = resolvedColor ? { ...baseConfig, cap: resolvedColor } : baseConfig;
 
     const renderIcon = () => {
         switch (config.type) {
             case 'urine':
                 return <UrineContainer config={config} size={size} />;
-            case 'stool':
-                return <StoolContainer config={config} size={size} />;
+            case 'jar':
+                return <ScrewCapContainer config={config} size={size} />;
             case 'swab':
                 return <SwabIcon config={config} size={size} />;
             case 'radiology-xray':
@@ -403,6 +561,14 @@ export const SampleTypeIndicator: React.FC<SampleTypeIndicatorProps> = ({
                 return <RadiologyIcon config={config} size={size} mode="ct" />;
             case 'radiology-usg':
                 return <RadiologyIcon config={config} size={size} mode="usg" />;
+            case 'radiology-scan':
+                return <RadiologyIcon config={config} size={size} mode="scan" />;
+            case 'procedure-trace':
+                return <ProcedureIcon config={config} size={size} mode="trace" />;
+            case 'procedure-scope':
+                return <ProcedureIcon config={config} size={size} mode="scope" />;
+            case 'none':
+                return <NoSpecimenIcon config={config} size={size} />;
             case 'vacutainer':
             default:
                 return <VacutainerTube config={config} size={size} />;

@@ -1437,6 +1437,7 @@ CREATE TABLE public.labs (
   loyalty_conversion_rate numeric NOT NULL DEFAULT 0.1,
   loyalty_min_redeem_points integer NOT NULL DEFAULT 100,
   loyalty_point_value numeric NOT NULL DEFAULT 1.0,
+  default_collapsed_order_cards boolean NOT NULL DEFAULT false,
   CONSTRAINT labs_pkey PRIMARY KEY (id),
   CONSTRAINT labs_default_processing_location_id_fkey FOREIGN KEY (default_processing_location_id) REFERENCES public.locations(id)
 );
@@ -1783,6 +1784,7 @@ CREATE TABLE public.package_test_groups (
   package_id uuid NOT NULL,
   test_group_id uuid NOT NULL,
   created_at timestamp with time zone DEFAULT now(),
+  display_order integer NOT NULL DEFAULT 0,
   CONSTRAINT package_test_groups_pkey PRIMARY KEY (id),
   CONSTRAINT package_test_groups_package_id_fkey FOREIGN KEY (package_id) REFERENCES public.packages(id),
   CONSTRAINT package_test_groups_test_group_id_fkey FOREIGN KEY (test_group_id) REFERENCES public.test_groups(id)

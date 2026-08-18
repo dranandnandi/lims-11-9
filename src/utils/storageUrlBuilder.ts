@@ -57,13 +57,16 @@ export function getCustomDomain(bucket: string = 'reports'): string | null {
  */
 export function extractStoragePath(url: string, bucket: string = 'reports'): string | null {
   if (!url) return null;
-  
+
   try {
     // Handle custom domain URLs
     if (CUSTOM_REPORTS_DOMAIN && url.startsWith(CUSTOM_REPORTS_DOMAIN)) {
       return url.replace(CUSTOM_REPORTS_DOMAIN + '/', '');
     }
-    
+
+    // Not an absolute http(s) URL (e.g. '#demo-report-<id>' placeholders, blob:, relative paths)
+    if (!/^https?:\/\//i.test(url)) return null;
+
     // Handle default Supabase storage URLs
     const urlObj = new URL(url);
     const pathMatch = urlObj.pathname.match(/\/storage\/v1\/object\/public\/([^/]+)\/(.+)/);
@@ -99,10 +102,13 @@ export function convertToCustomDomain(url: string, bucket: string = 'reports'): 
   
   // If custom domain not configured, return original URL
   if (!hasCustomDomain(bucket)) return url;
-  
+
   // Already using custom domain? Return as-is
   if (url.startsWith(CUSTOM_REPORTS_DOMAIN)) return url;
-  
+
+  // Nothing to convert for non-http(s) values (placeholders, blob:, relative paths)
+  if (!/^https?:\/\//i.test(url)) return url;
+
   // Extract path and rebuild with custom domain
   const path = extractStoragePath(url, bucket);
   if (path) {

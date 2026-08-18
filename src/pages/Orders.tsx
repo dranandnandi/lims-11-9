@@ -1,8 +1,8 @@
 // src/pages/Orders.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
-  Plus, Search, Clock as ClockIcon, CheckCircle, AlertTriangle,
-  Eye, User, Calendar, TestTube, ChevronDown, ChevronUp, TrendingUp, ToggleLeft, ToggleRight, X, RefreshCcw, Activity, Building2, ArrowDownUp, ClipboardList
+  Clock as ClockIcon, CheckCircle, AlertTriangle,
+  Eye, User, Calendar, TestTube, ChevronDown, ChevronUp, TrendingUp, ToggleLeft, ToggleRight, RefreshCcw, Activity, Building2, ArrowDownUp, ClipboardList, Printer
 } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
 import { database, supabase, formatAge } from "../utils/supabase";
@@ -17,6 +17,12 @@ import { useAnalyzerRealtime } from "../hooks/useAnalyzerRealtime";
 import { SampleTypeGroup } from "../components/Common/SampleTypeIndicator";
 import { TATStatusBadge } from "../components/Orders/TATStatusBadge";
 import { useMobileOptimizations } from "../utils/platformHelper";
+import {
+  generateWorksheetHTML,
+  openWorksheetWindow,
+  pendingPanels,
+  WorksheetOrder,
+} from "../utils/technicianWorksheet";
 
 /* ===========================
    Types
@@ -183,13 +189,6 @@ const Orders: React.FC = () => {
     to: new Date().toISOString().slice(0, 10)    // Today's date
   });
 
-  // Add test modal state
-  const [showAddTestModal, setShowAddTestModal] = useState(false);
-  const [selectedOrderId, setSelectedOrderId] = useState<string | null>(null);
-  const [availableTests, setAvailableTests] = useState<any[]>([]);
-  const [selectedTests, setSelectedTests] = useState<any[]>([]);
-  const [searchQuery, setSearchQuery] = useState('');
-  const [isLoadingTests, setIsLoadingTests] = useState(false);
   const [locations, setLocations] = useState<{ id: string; name: string }[]>([]);
   const [accounts, setAccounts] = useState<{ id: string; name: string }[]>([]);
 
@@ -407,163 +406,6 @@ const Orders: React.FC = () => {
       }
     }
   }, [orders, selectedOrder]);
-
-  // Fetch tests and packages from database
-  const fetchTestsAndPackages = async () => {
-    setIsLoadingTests(true);
-    try {
-      const labId = await database.getCurrentUserLabId();
-      if (!labId) {
-        console.warn('No lab_id found for user - fetching all available tests for demo purposes');
-        // Continue anyway for demo/development purposes
-      }
-
-      // Use the centralized database API following project patterns (same as enhanced view)
-      const { data: testGroups, error: testGroupsError } = await database.testGroups.getAll();
-      if (testGroupsError) {
-        console.error('Error fetching test groups:', testGroupsError);
-        throw testGroupsError;
-      }
-
-      const { data: packages, error: packagesError } = await database.packages.getAll();
-      if (packagesError) {
-        console.error('Error fetching packages:', packagesError);
-        throw packagesError;
-      }
-
-      console.log('Fetched test groups:', testGroups?.length || 0);
-      console.log('Fetched packages:', packages?.length || 0);
-
-      // Transform test groups to match the expected format
-      const transformedTests = (testGroups || []).map(test => ({
-        id: test.id,
-        name: test.name,
-        price: test.price || 0,
-        category: test.category || 'Test',
-        sample: test.sample_type || 'Various',
-        code: test.code || '',
-        type: 'test'
-      }));
-
-      // Transform packages to match the expected format
-      const transformedPackages = (packages || []).map(pkg => ({
-        id: pkg.id,
-        name: pkg.name,
-        price: pkg.price || 0,
-        category: 'Package',
-        sample: 'Various',
-        description: pkg.description || '',
-        type: 'package'
-      }));
-
-      const allTests = [...transformedTests, ...transformedPackages];
-      console.log('Total available tests/packages:', allTests.length);
-      setAvailableTests(allTests);
-    } catch (error) {
-      console.error('Error fetching tests and packages:', error);
-      setAvailableTests([]);
-    } finally {
-      setIsLoadingTests(false);
-    }
-  };
-
-  useEffect(() => {
-    if (user) {
-      fetchTestsAndPackages();
-    }
-  }, [user]);
-
-  const filteredTests = availableTests.filter(test =>
-    test.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    test.category.toLowerCase().includes(searchQuery.toLowerCase())
-  );
-
-  const toggleTestSelection = (test: any) => {
-    setSelectedTests(prev => {
-      const isSelected = prev.some(t => t.id === test.id);
-      if (isSelected) {
-        return prev.filter(t => t.id !== test.id);
-      } else {
-        return [...prev, test];
-      }
-    });
-  };
-
-  const getTotalPrice = () => {
-    return selectedTests.reduce((sum, test) => sum + test.price, 0);
-  };
-
-  const handleAddSelectedTests = async () => {
-    if (selectedTests.length === 0 || !selectedOrderId) return;
-
-    try {
-      console.log('Adding tests to order:', selectedOrderId, selectedTests);
-
-      // Find the current order to get existing data
-      const currentOrder = orders.find(order => order.id === selectedOrderId);
-      if (!currentOrder) {
-        alert('Order not found');
-        return;
-      }
-
-      // Create new test records for the order_tests table
-      const newOrderTests = selectedTests.map(test => ({
-        order_id: selectedOrderId,
-        test_name: test.name,
-        test_group_id: test.type === 'test' ? test.id : null
-      }));
-
-      // Insert new tests into order_tests table
-      const { error: testsError } = await supabase
-        .from('order_tests')
-        .insert(newOrderTests);
-
-      if (testsError) {
-        console.error('Error inserting order tests:', testsError);
-        alert('Failed to add tests. Please try again.');
-        return;
-      }
-
-      // Calculate new total amount and update the order
-      const newTestsTotal = selectedTests.reduce((sum, test) => sum + test.price, 0);
-      const updatedTotalAmount = currentOrder.total_amount + newTestsTotal;
-
-      // Update the order's total amount
-      const { error: updateError } = await supabase
-        .from('orders')
-        .update({ total_amount: updatedTotalAmount })
-        .eq('id', selectedOrderId);
-
-      if (updateError) {
-        console.error('Error updating order total:', updateError);
-        alert('Tests added but failed to update total amount.');
-        return;
-      }
-
-      console.log('Order updated successfully');
-
-      // Reset modal state
-      setSelectedTests([]);
-      setSearchQuery('');
-      setShowAddTestModal(false);
-      setSelectedOrderId(null);
-
-      // Refresh the orders data
-      await fetchOrders();
-
-      // Show success message
-      alert(`Successfully added ${selectedTests.length} tests to the order! Total cost: ₹${newTestsTotal.toLocaleString()}`);
-
-    } catch (error) {
-      console.error('Error adding tests:', error);
-      alert('Failed to add tests. Please try again.');
-    }
-  };
-
-  const handleAddTests = (orderId: string) => {
-    setSelectedOrderId(orderId);
-    setShowAddTestModal(true);
-  };
 
   // Read daily sequence (prefer order_number; fallback to tail of sample_id)
   const getDailySeq = (o: CardOrder) => {
@@ -969,7 +811,6 @@ const Orders: React.FC = () => {
         status: panel.status,
         verified: panel.verified,
       })),
-      can_add_tests: !['Completed', 'Delivered'].includes(order.status),
       visit_group_id: order.sample_id ? `sample - ${order.sample_id} ` : `${order.patient_id} -${order.order_date.slice(0, 10)} `,
       order_type: 'initial' as const
     }));
@@ -999,6 +840,52 @@ const Orders: React.FC = () => {
         orders: v.orders.sort(compareOrders),
       }));
   }, [filtered, orderSortMode]);
+
+  /* ------------- technician worksheet ------------- */
+  const toWorksheetOrder = (o: CardOrder): WorksheetOrder => ({
+    seq: getDailySeq(o),
+    orderId: o.id,
+    sampleId: o.sample_id,
+    barcodes: (o.samples || []).map((s) => s.barcode).filter((b): b is string => !!b),
+    patientName: o.patient?.name || o.patient_name,
+    patientAgeGender: [
+      formatAge(o.patient?.age, (o.patient as any)?.age_unit),
+      o.patient?.gender,
+    ].filter(Boolean).join(" • "),
+    doctor: o.doctor,
+    accountName: o.account_name,
+    priority: o.priority,
+    orderDate: o.order_date,
+    colorName: o.color_name,
+    colorCode: o.color_code,
+    panels: o.panels,
+  });
+
+  const printWorksheet = (g: { label: string; orders: CardOrder[] }) => {
+    const worksheetOrders = g.orders.map(toWorksheetOrder);
+    if (!worksheetOrders.some((o) => pendingPanels(o).length > 0)) {
+      alert("No pending test groups for this date — nothing to put on a worksheet.");
+      return;
+    }
+    const activeFilters = [
+      filters.status && filters.status !== "All" ? filters.status : null,
+      filters.priority && filters.priority !== "All" ? filters.priority : null,
+      filters.account || null,
+      filters.doctor ? `Dr. ${filters.doctor}` : null,
+      filters.locationId ? locations.find((l) => l.id === filters.locationId)?.name || null : null,
+    ].filter(Boolean).join(", ");
+
+    try {
+      openWorksheetWindow(
+        generateWorksheetHTML(worksheetOrders, {
+          dateLabel: g.label,
+          subtitle: activeFilters || undefined,
+        })
+      );
+    } catch (err: any) {
+      alert(err?.message || "Failed to open the worksheet.");
+    }
+  };
 
   const openDetails = (o: CardOrder) => { setOpenOnResults(false); setSelectedOrder(o); };
   const openResultEntry = (o: CardOrder) => { setQuickEntryOrder(o); };
@@ -1529,9 +1416,20 @@ const Orders: React.FC = () => {
           <div className="space-y-4">
             {groups.map((g) => (
               <div key={g.key} className="px-4">
-                <div className="flex items-center justify-between py-3 border-b mb-3 border-gray-200">
+                <div className="flex items-center justify-between gap-2 py-3 border-b mb-3 border-gray-200">
                   <h4 className="text-base font-semibold text-gray-700">{g.label}</h4>
-                  <div className="text-sm text-gray-500">{g.orders.length} order{g.orders.length !== 1 ? "s" : ""}</div>
+                  <div className="flex items-center gap-3">
+                    <div className="text-sm text-gray-500">{g.orders.length} order{g.orders.length !== 1 ? "s" : ""}</div>
+                    <button
+                      type="button"
+                      onClick={() => printWorksheet(g)}
+                      className="inline-flex items-center rounded-lg border border-gray-200 bg-white px-2.5 py-1.5 text-xs font-medium text-gray-700 shadow-sm transition-colors hover:bg-gray-50"
+                      title="Download / print a bench worksheet of pending test groups for this date"
+                    >
+                      <Printer className="h-3.5 w-3.5 mr-1.5" />
+                      Worksheet
+                    </button>
+                  </div>
                 </div>
 
                 <div className="space-y-4">
@@ -1539,7 +1437,6 @@ const Orders: React.FC = () => {
 	                    const pct = o.expectedTotal > 0
 	                      ? Math.min(100, Math.round((o.enteredTotal / o.expectedTotal) * 100))
 	                      : 0;
-                    const canAddTests = !['Completed', 'Delivered'].includes(o.status);
                     const visiblePanels = mobile.isMobile ? o.panels.slice(0, 2) : o.panels;
                     const hiddenPanelCount = Math.max(0, o.panels.length - visiblePanels.length);
                     const visibleTests = mobile.isMobile ? o.tests.slice(0, 2) : o.tests;
@@ -1656,7 +1553,7 @@ const Orders: React.FC = () => {
                                   {o.sample_id ? `#${String(o.sample_id).split("-").pop()} ` : 'No Sample'}
                                 </span>
                                 <SampleTypeGroup
-                                  samples={o.panels.map(p => ({ sampleType: p.sample_type || 'Blood', sampleColor: p.sample_color }))}
+                                  samples={o.panels.map(p => ({ sampleType: p.sample_type || 'Blood' }))}
                                   size="sm"
                                 />
                               </div>
@@ -1837,7 +1734,7 @@ const Orders: React.FC = () => {
                                 ) : null}
                               </div>
 
-                            {/* Updated button section with Add Tests functionality */}
+                            {/* Order card actions */}
                             <div className="mt-3 flex flex-col sm:flex-row gap-2">
                               <button
                                 onClick={(e) => {
@@ -1861,18 +1758,6 @@ const Orders: React.FC = () => {
                                 Enter Results
                               </button>
 
-                              {canAddTests && (
-                                <button
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleAddTests(o.id);
-                                  }}
-                                  className="hidden sm:inline-flex items-center px-3 py-1.5 text-sm bg-green-600 text-white rounded-lg hover:bg-green-700"
-                                >
-                                  <Plus className="h-4 w-4 mr-1" />
-                                  Add Tests
-                                </button>
-                              )}
                             </div>
                           </div>
                         </div>
@@ -2027,147 +1912,6 @@ const Orders: React.FC = () => {
           onClose={() => setQuickEntryOrder(null)}
           onSubmitted={() => { fetchOrders(); setQuickEntryOrder(null); }}
         />
-      )}
-
-      {/* Add Test Selection Modal */}
-      {showAddTestModal && selectedOrderId && (
-        <div className="fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-lg shadow-xl w-full max-w-4xl max-h-[90vh] overflow-hidden">
-            <div className="px-6 py-4 border-b border-gray-200 bg-blue-50">
-              <div className="flex items-center justify-between">
-                <h3 className="text-lg font-semibold text-gray-900">Add Tests to Order</h3>
-                <button
-                  onClick={() => {
-                    setShowAddTestModal(false);
-                    setSelectedOrderId(null);
-                    setSelectedTests([]);
-                    setSearchQuery('');
-                  }}
-                  className="text-gray-400 hover:text-gray-600"
-                >
-                  <X className="h-6 w-6" />
-                </button>
-              </div>
-              <p className="text-sm text-gray-600 mt-1">
-                Order ID: {selectedOrderId?.slice(-6)} • Select tests to add to this order
-              </p>
-            </div>
-
-            <div className="p-6 overflow-y-auto max-h-[60vh]">
-              {/* Search */}
-              <div className="mb-4">
-                <div className="relative">
-                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-400" />
-                  <input
-                    type="text"
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    placeholder="Search tests and packages..."
-                    className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-                  />
-                </div>
-              </div>
-
-              {/* Loading state */}
-              {isLoadingTests ? (
-                <div className="text-center py-8">
-                  <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto"></div>
-                  <p className="text-gray-600 mt-2">Loading tests...</p>
-                </div>
-              ) : (
-                /* Tests grid */
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 max-h-96 overflow-y-auto">
-                  {filteredTests.map((test) => {
-                    const isSelected = selectedTests.some(t => t.id === test.id);
-                    return (
-                      <div
-                        key={test.id}
-                        onClick={() => toggleTestSelection(test)}
-                        className={`p - 3 border - 2 rounded - lg cursor - pointer transition - all ${isSelected
-                          ? 'border-blue-500 bg-blue-50'
-                          : 'border-gray-200 hover:border-gray-300'
-                          } `}
-                      >
-                        <div className="flex items-start justify-between">
-                          <div className="flex-1">
-                            <h4 className="font-medium text-gray-900">{test.name}</h4>
-                            <p className="text-sm text-gray-600">
-                              {test.category} • {test.sample}
-                            </p>
-                            {test.code && (
-                              <p className="text-xs text-gray-500 font-mono">{test.code}</p>
-                            )}
-                          </div>
-                          <div className="text-right ml-3">
-                            <div className="font-bold text-green-600">₹{test.price.toLocaleString()}</div>
-                            {isSelected && (
-                              <div className="text-xs text-blue-600 font-medium">✓ Selected</div>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-
-              {filteredTests.length === 0 && !isLoadingTests && (
-                <div className="text-center py-8">
-                  <TestTube className="h-12 w-12 text-gray-300 mx-auto mb-3" />
-                  <p className="text-gray-600">No tests found matching your search</p>
-                </div>
-              )}
-            </div>
-
-            {/* Selected tests summary and actions */}
-            {selectedTests.length > 0 && (
-              <div className="px-6 py-4 border-t border-gray-200 bg-gray-50">
-                <div className="flex items-center justify-between mb-3">
-                  <div>
-                    <p className="text-sm font-medium text-gray-900">
-                      {selectedTests.length} test{selectedTests.length !== 1 ? 's' : ''} selected
-                    </p>
-                    <p className="text-lg font-bold text-green-600">
-                      Total: ₹{getTotalPrice().toLocaleString()}
-                    </p>
-                  </div>
-                  <div className="flex gap-2">
-                    <button
-                      onClick={() => setSelectedTests([])}
-                      className="px-4 py-2 text-sm text-gray-600 bg-white border border-gray-300 rounded-lg hover:bg-gray-50"
-                    >
-                      Clear All
-                    </button>
-                    <button
-                      onClick={handleAddSelectedTests}
-                      className="px-4 py-2 text-sm bg-primary-600 text-white rounded-lg hover:bg-primary-700"
-                    >
-                      Add Selected Tests
-                    </button>
-                  </div>
-                </div>
-
-                {/* Selected tests list */}
-                <div className="flex flex-wrap gap-2">
-                  {selectedTests.map((test) => (
-                    <span
-                      key={test.id}
-                      className="inline-flex items-center px-2 py-1 text-xs bg-blue-100 text-blue-800 rounded-full"
-                    >
-                      {test.name}
-                      <button
-                        onClick={() => toggleTestSelection(test)}
-                        className="ml-1 text-blue-600 hover:text-blue-800"
-                      >
-                        ×
-                      </button>
-                    </span>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
       )}
 
       {/* Bottom spacer for mobile */}

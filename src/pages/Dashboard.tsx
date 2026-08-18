@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import ReactDOM from "react-dom";
 import { useLocation, useNavigate } from "react-router-dom";
 import { endOfDay, format, isValid, parseISO, startOfDay, subDays } from "date-fns";
@@ -266,6 +266,9 @@ const Dashboard: React.FC = () => {
   const [orders, setOrders] = useState<CardOrder[]>([]);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [isCollapsedView, setIsCollapsedView] = useState(false);
+  // Set once the user works the Collapse/Expand button, so the lab-wide default
+  // arriving late from the settings query cannot overwrite their choice.
+  const cardViewTouchedRef = useRef(false);
   const [isHeaderCollapsed, setIsHeaderCollapsed] = useState(true);
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [search, setSearch] = useState("");
@@ -358,13 +361,18 @@ const Dashboard: React.FC = () => {
       if (!labId) { console.debug('[AutoCollect] No labId found'); return; }
       const { data, error } = await supabase
         .from('labs')
-        .select('auto_open_collection_modal')
+        .select('auto_open_collection_modal, default_collapsed_order_cards')
         .eq('id', labId)
         .single();
       console.debug('[AutoCollect] DB row:', data, 'error:', error);
       const enabled = !!data?.auto_open_collection_modal;
       console.debug('[AutoCollect] Setting autoOpenCollectModal =', enabled);
       if (enabled) setAutoOpenCollectModal(true);
+      // The lab-wide default only decides how the list opens. If someone already
+      // hit Collapse/Expand while this query was in flight, leave their choice be.
+      if (!cardViewTouchedRef.current && (data as any)?.default_collapsed_order_cards) {
+        setIsCollapsedView(true);
+      }
     });
   }, []);
 
@@ -658,20 +666,30 @@ id, patient_id, patient_name, status, priority, order_date, expected_date, total
       // TAT is considered started if view has tat_start_time (tat_hours configured) OR sample was collected
       const tatStarted = hasTatStartTime || !!o.sample_collected_at;
 
-      const panels: Panel[] = rows.map((r) => ({
-        name: r.test_group_name || "Test",
-        expected: r.expected_analytes || 0,
-        entered: r.entered_analytes || 0,
-        verified: !!r.is_verified,
-        status: r.panel_status,
-        sample_type: r.sample_type,
-        sample_color: r.sample_color,
-        order_color: r.color_code,
-        // Section-only fields
-        is_section_only: r.is_section_only,
-        has_section_content: r.has_section_content,
-        section_verification_status: r.section_verification_status,
-      }));
+      const panels: Panel[] = rows.map((r) => {
+        // Fall back to the joined test_groups row when the progress view has no
+        // sample info for this panel — the tube must follow the test group, not
+        // the order's sample-ID colour.
+        const orderTest = (o.order_tests || []).find((t: any) => t.test_group_id === r.test_group_id);
+        const testGroupInfo = Array.isArray((orderTest as any)?.test_groups)
+          ? (orderTest as any).test_groups[0]
+          : (orderTest as any)?.test_groups;
+
+        return {
+          name: r.test_group_name || "Test",
+          expected: r.expected_analytes || 0,
+          entered: r.entered_analytes || 0,
+          verified: !!r.is_verified,
+          status: r.panel_status,
+          sample_type: r.sample_type || testGroupInfo?.sample_type,
+          sample_color: r.sample_color || testGroupInfo?.sample_color,
+          order_color: r.color_code,
+          // Section-only fields
+          is_section_only: r.is_section_only,
+          has_section_content: r.has_section_content,
+          section_verification_status: r.section_verification_status,
+        };
+      });
 
       const expectedTotal = panels.reduce((sum, p) => sum + p.expected, 0);
       const enteredTotal = panels.reduce((sum, p) => sum + Math.min(p.entered, p.expected), 0);
@@ -1927,7 +1945,7 @@ id,
               {/* Right: secondary controls */}
               <div className="flex justify-end">
                 <button
-                  onClick={() => setIsCollapsedView(!isCollapsedView)}
+                  onClick={() => { cardViewTouchedRef.current = true; setIsCollapsedView(!isCollapsedView); }}
                   className={`px-4 py-2 rounded-lg font-medium transition-colors ${isCollapsedView ? "bg-primary-600 text-white" : "bg-gray-100 text-gray-700 hover:bg-gray-200"}`}
                 >
                   {isCollapsedView ? "Expand Cards" : "Collapse Cards"}
@@ -2726,9 +2744,10 @@ id,
                                                     key={`${p.name}-${i}`}
                                                     className={`flex items-center gap-2 border rounded-lg px-3 py-1.5 shadow-sm transition-all duration-300 max-w-[170px] ${panelColor}`}
                                                   >
+                                                    {/* Colour comes from the sample type + Settings colour config,
+                                                        exactly as the Test Groups list renders it. */}
                                                     <SampleTypeIndicator
                                                       sampleType={p.sample_type || "Blood"}
-                                                      sampleColor={o.color_code || undefined}
                                                       size="sm"
                                                     />
                                                     <div className="min-w-0">

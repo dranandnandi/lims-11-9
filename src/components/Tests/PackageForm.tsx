@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { X, Package, DollarSign, Calendar, Settings, Layers, Search, Check, ChevronDown, ChevronUp } from 'lucide-react';
+import { X, Package, DollarSign, Calendar, Settings, Layers, Search, Check, ChevronDown, ChevronUp, ArrowUp, ArrowDown, GripVertical } from 'lucide-react';
 import { database } from '../../utils/supabase';
 
 interface PackageFormProps {
@@ -49,6 +49,7 @@ const PackageForm: React.FC<PackageFormProps> = ({ onClose, onSubmit, package: p
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
   const [showSelected, setShowSelected] = useState(false);
+  const [dragIndex, setDragIndex] = useState<number | null>(null);
 
   // Load test groups from database (already filtered by lab_id in database.testGroups.getAll())
   useEffect(() => {
@@ -103,13 +104,22 @@ const PackageForm: React.FC<PackageFormProps> = ({ onClose, onSubmit, package: p
     });
   }, [testGroups, searchTerm]);
 
+  // Selected groups in the package's own order (selection order), not the
+  // alphabetical catalog order. This order is what gets saved as display_order.
+  const selectedTestGroupDetails = useMemo(() => {
+    const byId = new Map(testGroups.map(g => [g.id, g]));
+    return formData.selectedTestGroups
+      .map((id: string) => byId.get(id))
+      .filter(Boolean) as TestGroup[];
+  }, [testGroups, formData.selectedTestGroups]);
+
   // Display groups - either filtered or only selected
   const displayTestGroups = useMemo(() => {
     if (showSelected) {
-      return testGroups.filter(g => formData.selectedTestGroups.includes(g.id));
+      return selectedTestGroupDetails;
     }
     return filteredTestGroups;
-  }, [filteredTestGroups, testGroups, formData.selectedTestGroups, showSelected]);
+  }, [filteredTestGroups, selectedTestGroupDetails, showSelected]);
 
   const categories = [
     'Preventive Care',
@@ -125,17 +135,14 @@ const PackageForm: React.FC<PackageFormProps> = ({ onClose, onSubmit, package: p
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     
-    const selectedTestGroupDetails = testGroups.filter(group => 
-      formData.selectedTestGroups.includes(group.id)
-    );
-    
-    const originalPrice = selectedTestGroupDetails.reduce((sum, group) => sum + group.price, 0);
-    const discountAmount = originalPrice * (parseFloat(formData.discountPercentage) || 0) / 100;
-    const finalPrice = parseFloat(formData.price) || (originalPrice - discountAmount);
-    
+    const originalTotal = selectedTestGroupDetails.reduce((sum, group) => sum + group.price, 0);
+    const discountAmount = originalTotal * (parseFloat(formData.discountPercentage) || 0) / 100;
+    const finalPrice = parseFloat(formData.price) || (originalTotal - discountAmount);
+
     const packageData = {
       name: formData.name,
       description: formData.description,
+      // Array position is the package-level order the user set below
       testGroupIds: formData.selectedTestGroups,
       price: finalPrice,
       discountPercentage: parseFloat(formData.discountPercentage) || 0,
@@ -160,14 +167,24 @@ const PackageForm: React.FC<PackageFormProps> = ({ onClose, onSubmit, package: p
       ...prev,
       selectedTestGroups: prev.selectedTestGroups.includes(testGroupId)
         ? prev.selectedTestGroups.filter(id => id !== testGroupId)
+        // New picks land at the end so the existing order is never disturbed
         : [...prev.selectedTestGroups, testGroupId]
     }));
   };
 
-  const selectedTestGroupDetails = testGroups.filter(group => 
-    formData.selectedTestGroups.includes(group.id)
-  );
-  
+  // Package-level ordering: position in selectedTestGroups becomes display_order
+  const moveTestGroup = (from: number, to: number) => {
+    setFormData(prev => {
+      const list = [...prev.selectedTestGroups];
+      if (from < 0 || to < 0 || from >= list.length || to >= list.length || from === to) {
+        return prev;
+      }
+      const [moved] = list.splice(from, 1);
+      list.splice(to, 0, moved);
+      return { ...prev, selectedTestGroups: list };
+    });
+  };
+
   const originalPrice = selectedTestGroupDetails.reduce((sum, group) => sum + group.price, 0);
   const discountAmount = originalPrice * (parseFloat(formData.discountPercentage) || 0) / 100;
   const suggestedPrice = originalPrice - discountAmount;
@@ -373,19 +390,58 @@ const PackageForm: React.FC<PackageFormProps> = ({ onClose, onSubmit, package: p
               <div className="bg-purple-50 border border-purple-200 rounded-lg p-4">
                 <div className="flex items-center justify-between mb-2">
                   <h4 className="font-medium text-purple-900">Selected Test Groups ({formData.selectedTestGroups.length})</h4>
-                  <span className="text-sm text-purple-600">Click to remove</span>
+                  <span className="text-xs text-purple-600">Drag or use arrows to set the order for this package</span>
                 </div>
-                <div className="flex flex-wrap gap-2 mb-3">
-                  {selectedTestGroupDetails.map((group) => (
-                    <span
+                <div className="space-y-1.5 mb-3 max-h-64 overflow-y-auto">
+                  {selectedTestGroupDetails.map((group, index) => (
+                    <div
                       key={group.id}
-                      onClick={() => handleTestGroupSelection(group.id)}
-                      className="inline-flex items-center gap-1 px-2 py-1 bg-purple-100 text-purple-800 rounded-full text-xs cursor-pointer hover:bg-purple-200 transition-colors"
+                      draggable
+                      onDragStart={() => setDragIndex(index)}
+                      onDragOver={(e) => e.preventDefault()}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        if (dragIndex !== null) moveTestGroup(dragIndex, index);
+                        setDragIndex(null);
+                      }}
+                      onDragEnd={() => setDragIndex(null)}
+                      className={`flex items-center gap-2 px-2 py-1.5 bg-white border rounded-md text-sm ${
+                        dragIndex === index ? 'border-purple-500 opacity-60' : 'border-purple-200'
+                      }`}
                     >
-                      {group.name}
-                      <span className="font-medium">₹{group.price}</span>
-                      <X className="h-3 w-3 ml-1" />
-                    </span>
+                      <GripVertical className="h-4 w-4 text-purple-300 cursor-grab flex-shrink-0" />
+                      <span className="w-6 h-6 flex items-center justify-center rounded-full bg-purple-100 text-purple-800 text-xs font-semibold flex-shrink-0">
+                        {index + 1}
+                      </span>
+                      <span className="flex-1 truncate text-gray-900">{group.name}</span>
+                      <span className="text-xs font-medium text-green-600 flex-shrink-0">₹{group.price}</span>
+                      <button
+                        type="button"
+                        title="Move up"
+                        disabled={index === 0}
+                        onClick={() => moveTestGroup(index, index - 1)}
+                        className="p-1 rounded text-purple-600 hover:bg-purple-100 disabled:text-gray-300 disabled:hover:bg-transparent"
+                      >
+                        <ArrowUp className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        title="Move down"
+                        disabled={index === selectedTestGroupDetails.length - 1}
+                        onClick={() => moveTestGroup(index, index + 1)}
+                        className="p-1 rounded text-purple-600 hover:bg-purple-100 disabled:text-gray-300 disabled:hover:bg-transparent"
+                      >
+                        <ArrowDown className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        title="Remove from package"
+                        onClick={() => handleTestGroupSelection(group.id)}
+                        className="p-1 rounded text-red-500 hover:bg-red-50"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
                   ))}
                 </div>
                 <div className="border-t border-purple-300 pt-2">

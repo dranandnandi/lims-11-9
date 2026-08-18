@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { Search, DollarSign, FileText, Eye, CreditCard, Calendar, TrendingUp, Clock as ClockIcon, Calculator, Building, RotateCcw, File, Printer, Loader2 } from 'lucide-react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { Search, DollarSign, FileText, Eye, CreditCard, Calendar, TrendingUp, Clock as ClockIcon, Calculator, Building, RotateCcw, File, Printer, Loader2, Receipt } from 'lucide-react';
 import { useSearchParams } from 'react-router-dom';
 
 import { database } from '../utils/supabase';
@@ -11,10 +11,12 @@ import B2BAccountDashboard from '../components/Billing/B2BAccountDashboard';
 import RefundRequestModal from '../components/Billing/RefundRequestModal';
 import RefundApprovalConsole from '../components/Billing/RefundApprovalConsole';
 import InvoiceGenerationModal from '../components/Billing/InvoiceGenerationModal';
+import UnbilledOrders from '../components/Billing/UnbilledOrders';
 import { ThermalPrintButton } from '../components/Invoices/ThermalPrintButton';
 
 type DateRangePreset = 'custom' | 'today' | '7d' | '30d' | '90d' | 'all';
 type PendingScope = 'pending' | 'all';
+type BillToScope = 'all' | 'account' | 'location' | 'self';
 
 interface InvoiceItem {
   id: string;
@@ -78,6 +80,11 @@ const Billing: React.FC = () => {
   const [datePreset, setDatePreset] = useState<DateRangePreset>('today');
   const [pendingScope, setPendingScope] = useState<PendingScope>('all');
 
+  // Bill-to (B2B / location / direct) filtering state
+  const [billToScope, setBillToScope] = useState<BillToScope>('all');
+  const [selectedAccountId, setSelectedAccountId] = useState<string>('all');
+  const [accounts, setAccounts] = useState<{ id: string; name: string }[]>([]);
+
   // Location filtering state
   const [locations, setLocations] = useState<{ id: string; name: string }[]>([]);
   const [selectedLocationId, setSelectedLocationId] = useState<string>('all');
@@ -131,6 +138,10 @@ const Billing: React.FC = () => {
           );
         }
       }
+
+      // Load B2B accounts (used by the Bill To filter and the Bill To column)
+      const { data: allAccounts } = await (database as any).accounts.getAll();
+      setAccounts((allAccounts || []).map((a: any) => ({ id: a.id, name: a.name })));
     };
     loadData();
   }, []);
@@ -321,6 +332,23 @@ const Billing: React.FC = () => {
     return formatISODate(parsed);
   };
 
+  const accountNameById = useMemo(
+    () => new Map(accounts.map(a => [a.id, a.name])),
+    [accounts]
+  );
+  const locationNameById = useMemo(
+    () => new Map(locations.map(l => [l.id, l.name])),
+    [locations]
+  );
+
+  // An invoice is B2B when it was raised against an account, either explicitly
+  // (invoice_type = account) or because the order carried an account_id.
+  const getBillToScope = (invoice: any): Exclude<BillToScope, 'all'> => {
+    if (invoice.invoice_type === 'account' || invoice.account_id) return 'account';
+    if (invoice.location_id) return 'location';
+    return 'self';
+  };
+
   const filteredInvoices = invoices.filter(invoice => {
     const matchesSearch = (invoice.patient_name || invoice.patientName || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
       invoice.id.toLowerCase().includes(searchTerm.toLowerCase());
@@ -335,7 +363,9 @@ const Billing: React.FC = () => {
     })();
     const paymentState = invoice.payment_status || invoice.status;
     const matchesPendingScope = pendingScope === 'all' ? true : paymentState !== 'Paid';
-    return matchesSearch && matchesStatus && matchesDate && matchesPendingScope;
+    const matchesBillTo = billToScope === 'all' || getBillToScope(invoice) === billToScope;
+    const matchesAccount = selectedAccountId === 'all' || (invoice as any).account_id === selectedAccountId;
+    return matchesSearch && matchesStatus && matchesDate && matchesPendingScope && matchesBillTo && matchesAccount;
   });
 
   const toggleInvoiceSelection = (invoiceId: string) => {
@@ -450,6 +480,7 @@ const Billing: React.FC = () => {
     .reduce((sum, i) => sum + (i.paid_amount || 0), 0);
 
   const renderContent = () => {
+    if (view === 'unbilled-orders') return <UnbilledOrders />;
     if (view === 'cash-reconciliation') return <CashReconciliation />;
     if (view === 'b2b-monthly') return <MonthlyAccountBilling />;
     if (view === 'b2b-accounts') return <B2BAccountDashboard />;
@@ -535,6 +566,32 @@ const Billing: React.FC = () => {
               >
                 {statuses.map(status => (
                   <option key={status} value={status}>{status}</option>
+                ))}
+              </select>
+            </div>
+            <div className="w-full lg:w-44">
+              <label className="text-sm font-medium text-gray-600 mb-1 block">Bill To</label>
+              <select
+                value={billToScope}
+                onChange={(e) => setBillToScope(e.target.value as BillToScope)}
+                className="px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent w-full"
+              >
+                <option value="all">All</option>
+                <option value="account">B2B Account</option>
+                <option value="location">Location</option>
+                <option value="self">Direct Pay</option>
+              </select>
+            </div>
+            <div className="w-full lg:w-56">
+              <label className="text-sm font-medium text-gray-600 mb-1 block">Account</label>
+              <select
+                value={selectedAccountId}
+                onChange={(e) => setSelectedAccountId(e.target.value)}
+                className="px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent w-full"
+              >
+                <option value="all">All Accounts</option>
+                {accounts.map(account => (
+                  <option key={account.id} value={account.id}>{account.name}</option>
                 ))}
               </select>
             </div>
@@ -721,10 +778,12 @@ const Billing: React.FC = () => {
                     filteredInvoices.map((invoice) => {
                       // Determine bill-to information
                       const invoiceType = (invoice as any).invoice_type || 'patient';
-                      const billTo = invoiceType === 'account'
-                        ? { type: 'Account', name: (invoice as any).account?.name || 'Account' }
-                        : (invoice as any).location_id
-                          ? { type: 'Location', name: (invoice as any).location?.name || 'Location' }
+                      const accountId = (invoice as any).account_id;
+                      const locationId = (invoice as any).location_id;
+                      const billTo = getBillToScope(invoice) === 'account'
+                        ? { type: 'Account', name: (accountId && accountNameById.get(accountId)) || 'Account' }
+                        : locationId
+                          ? { type: 'Location', name: locationNameById.get(locationId) || 'Location' }
                           : { type: 'Self', name: 'Direct Pay' };
 
                       return (
@@ -912,6 +971,18 @@ const Billing: React.FC = () => {
           >
             <FileText className="w-4 h-4" />
             Invoices
+          </button>
+          <button
+            onClick={() => {
+              const params = new URLSearchParams(searchParams);
+              params.set('view', 'unbilled-orders');
+              setSearchParams(params);
+            }}
+            className={`px-4 py-2 rounded-md text-sm font-medium flex items-center gap-2 ${view === 'unbilled-orders' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+              }`}
+          >
+            <Receipt className="w-4 h-4" />
+            Unbilled Orders
           </button>
           <button
             onClick={() => {

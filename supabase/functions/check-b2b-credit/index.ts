@@ -8,7 +8,8 @@
 // }
 // Response:
 // {
-//   "can_proceed": true/false,
+//   "can_proceed": true/false,          // always true when bypass_credit_check
+//   "bypass_credit_check": true/false,  // accounts.bypass_credit_check, honouring credit_bypass_until
 //   "credit_limit": 50000,
 //   "credit_used": 20000,
 //   "available_credit": 30000,
@@ -32,12 +33,23 @@ interface CreditCheckRequest {
 
 interface CreditCheckResponse {
   can_proceed: boolean;
+  /** True while bypass_credit_check is on and not past credit_bypass_until - the limit never blocks */
+  bypass_credit_check: boolean;
   credit_limit: number;
   credit_used: number;
+  /** Total unreversed ORDER_DEBIT - the work this account has consumed */
+  order_debit_amount: number;
+  /** Ledger debits minus credits. Negative = advance balance. */
+  ledger_credit_used: number;
+  /** Money paid that no order has consumed yet. Zero unless in advance. */
+  advance_balance: number;
+  /** Informational only - already counted via ORDER_DEBIT */
   outstanding_invoice_amount: number;
+  /** Informational only - already counted via ORDER_DEBIT */
   open_order_amount: number;
   pending_booking_amount: number;
   payment_credit_amount: number;
+  manual_credit_amount: number;
   effective_credit_used: number;
   available_credit: number;
   order_amount: number;
@@ -85,7 +97,7 @@ Deno.serve(async (req) => {
     // Get account credit details
     const { data: account, error: accountError } = await supabase
       .from('accounts')
-      .select('id, name, credit_limit, credit_used')
+      .select('id, name, credit_limit, credit_used, bypass_credit_check, credit_bypass_until')
       .eq('id', account_id)
       .eq('lab_id', lab_id)
       .eq('is_active', true)
@@ -102,6 +114,9 @@ Deno.serve(async (req) => {
     const creditLimit = Number(account.credit_limit) || 0;
     const storedCreditUsed = Number(account.credit_used) || 0;
 
+    // Display-only breakdowns. Neither feeds the math: orders are counted
+    // through their ORDER_DEBIT ledger entry, and a consolidated invoice only
+    // groups orders that were already debited, so adding it would double-count.
     const { data: openOrders, error: openOrdersError } = await supabase
       .from('orders')
       .select('id, total_amount, final_amount, status, billing_status, is_billed')
@@ -136,17 +151,15 @@ Deno.serve(async (req) => {
       console.warn('[CHECK-B2B-CREDIT] Outstanding invoice lookup failed:', outstandingInvoicesError);
     }
 
-    const openInvoices = (outstandingInvoices || []).filter((invoice: Record<string, unknown>) => {
-      const status = String(invoice.status || '').toLowerCase();
-      return status !== 'paid' && status !== 'cancelled';
-    });
-
-    const openInvoiceIds = new Set(openInvoices.map((invoice: Record<string, unknown>) => String(invoice.id)));
-
-    const outstandingInvoiceAmount = openInvoices.reduce((sum: number, invoice: Record<string, unknown>) => {
-      const amount = Number(invoice.total_amount);
-      return sum + (Number.isFinite(amount) ? amount : 0);
-    }, 0);
+    const outstandingInvoiceAmount = (outstandingInvoices || [])
+      .filter((invoice: Record<string, unknown>) => {
+        const status = String(invoice.status || '').toLowerCase();
+        return status !== 'paid' && status !== 'cancelled';
+      })
+      .reduce((sum: number, invoice: Record<string, unknown>) => {
+        const amount = Number(invoice.total_amount);
+        return sum + (Number.isFinite(amount) ? amount : 0);
+      }, 0);
 
     const { data: pendingBookings, error: pendingBookingsError } = await supabase
       .from('bookings')
@@ -171,60 +184,68 @@ Deno.serve(async (req) => {
       }, 0);
     }, 0);
 
-    const { data: paymentCredits, error: paymentCreditsError } = await supabase
-      .from('b2b_payment_attempts')
-      .select('amount')
-      .eq('account_id', account_id)
-      .eq('lab_id', lab_id)
-      .eq('status', 'success')
-      .eq('credit_applied', true);
-
-    if (paymentCreditsError) {
-      console.warn('[CHECK-B2B-CREDIT] Payment credit lookup failed:', paymentCreditsError);
-    }
-
-    const paymentCreditAmount = (paymentCredits || []).reduce((sum: number, payment: Record<string, unknown>) => {
-      const amount = Number(payment.amount);
-      return sum + (Number.isFinite(amount) ? amount : 0);
-    }, 0);
-
-    // Cash / cheque / bank money the lab recorded against this account, from
-    // either Account Master or Billing. Kept separate from the gateway payments
-    // summed above by reference_type ('payment_attempt' vs 'manual'/'invoice').
-    //
-    // 'manual'  = advance, not tied to a bill -> always frees credit.
-    // 'invoice' = paid against a consolidated invoice -> frees credit only while
-    //             that invoice is still outstanding. Once it is marked paid it
-    //             drops out of outstandingInvoiceAmount entirely, so continuing
-    //             to subtract its payments would return the same money twice.
-    const { data: manualCredits, error: manualCreditsError } = await supabase
+    // The ledger is the source of truth. Every order on an account carries an
+    // ORDER_DEBIT (trg_orders_credit_debit) and every payment a credit, so the
+    // running position is just debits minus credits. It is deliberately NOT
+    // floored at zero: negative means the partner is in advance, having paid
+    // money no order has consumed yet, and that is real headroom.
+    const { data: ledgerEntries, error: ledgerError } = await supabase
       .from('b2b_credit_ledger')
       .select('amount, entry_type, reference_type, reference_id')
       .eq('account_id', account_id)
       .eq('lab_id', lab_id)
-      .in('reference_type', ['manual', 'invoice'])
       .eq('is_reversed', false);
 
-    if (manualCreditsError) {
-      console.warn('[CHECK-B2B-CREDIT] Manual credit lookup failed:', manualCreditsError);
+    if (ledgerError) {
+      console.warn('[CHECK-B2B-CREDIT] Ledger lookup failed:', ledgerError);
     }
 
-    const manualCreditAmount = (manualCredits || [])
-      .filter((entry: Record<string, unknown>) => {
-        if (!['PAYMENT_CREDIT', 'MANUAL_CREDIT'].includes(String(entry.entry_type))) return false;
-        if (entry.reference_type === 'manual') return true;
-        return !!entry.reference_id && openInvoiceIds.has(String(entry.reference_id));
-      })
-      .reduce((sum: number, entry: Record<string, unknown>) => {
-        const amount = Number(entry.amount);
-        return sum + (Number.isFinite(amount) ? amount : 0);
-      }, 0);
+    const LEDGER_DEBIT_TYPES = ['ORDER_DEBIT', 'MANUAL_DEBIT', 'REFUND_DEBIT', 'EXPIRED_DEBIT', 'TRANSFER_OUT'];
+    const LEDGER_CREDIT_TYPES = ['ORDER_CANCEL_CREDIT', 'PAYMENT_CREDIT', 'MANUAL_CREDIT', 'TRANSFER_IN'];
+    const RECEIPT_ENTRY_TYPES = ['PAYMENT_CREDIT', 'MANUAL_CREDIT'];
 
-    const liveCreditUsed = Math.max(0, outstandingInvoiceAmount + openOrderAmount + pendingBookingAmount - paymentCreditAmount - manualCreditAmount);
-    const effectiveCreditUsed = Math.max(storedCreditUsed, liveCreditUsed);
+    const entryAmount = (entry: Record<string, unknown>) => {
+      const amount = Number(entry.amount);
+      return Number.isFinite(amount) ? amount : 0;
+    };
+
+    const rows = (ledgerEntries || []) as Record<string, unknown>[];
+
+    const ledgerCreditUsed = rows.reduce((sum: number, entry) => {
+      const type = String(entry.entry_type);
+      if (LEDGER_DEBIT_TYPES.includes(type)) return sum + entryAmount(entry);
+      if (LEDGER_CREDIT_TYPES.includes(type)) return sum - entryAmount(entry);
+      return sum;
+    }, 0);
+
+    const orderDebitAmount = rows
+      .filter((entry) => String(entry.entry_type) === 'ORDER_DEBIT')
+      .reduce((sum: number, entry) => sum + entryAmount(entry), 0);
+
+    // Gateway payments (reference_type 'payment_attempt') and money receipted at
+    // the lab ('manual' advances / 'invoice' bill payments) are reported apart
+    // for the UI, but both count in full against the order debits above.
+    const paymentCreditAmount = rows
+      .filter((entry) => entry.reference_type === 'payment_attempt' && RECEIPT_ENTRY_TYPES.includes(String(entry.entry_type)))
+      .reduce((sum: number, entry) => sum + entryAmount(entry), 0);
+
+    const manualCreditAmount = rows
+      .filter((entry) => ['manual', 'invoice'].includes(String(entry.reference_type)) && RECEIPT_ENTRY_TYPES.includes(String(entry.entry_type)))
+      .reduce((sum: number, entry) => sum + entryAmount(entry), 0);
+
+    // Bookings are quotes, not financial events, so they get no ledger entry -
+    // but they still reserve headroom until they become an order or are dropped.
+    const effectiveCreditUsed = ledgerCreditUsed + pendingBookingAmount;
     const availableCredit = creditLimit - effectiveCreditUsed;
-    const shortfall = Math.max(0, order_amount - availableCredit);
-    const canProceed = availableCredit >= order_amount;
+    const advanceBalance = Math.max(0, -ledgerCreditUsed);
+    // Accounts flagged in Account Master skip the gate entirely: the figures are
+    // still reported, but nothing is blocked and no top-up is demanded. A bypass
+    // may carry an expiry (credit_bypass_until) - once it passes the gate is
+    // back on by itself, exactly like the lock's temporary-open window.
+    const bypassExpiry = account.credit_bypass_until ? new Date(account.credit_bypass_until).getTime() : null;
+    const bypassCreditCheck = account.bypass_credit_check === true && (bypassExpiry === null || bypassExpiry > Date.now());
+    const canProceed = bypassCreditCheck || availableCredit >= order_amount;
+    const shortfall = canProceed ? 0 : Math.max(0, order_amount - availableCredit);
     const paymentRequired = !canProceed && shortfall > 0;
 
     // Match initiate-payment: any active gateway for the lab enables checkout.
@@ -271,8 +292,12 @@ Deno.serve(async (req) => {
 
     const response: CreditCheckResponse = {
       can_proceed: canProceed,
+      bypass_credit_check: bypassCreditCheck,
       credit_limit: creditLimit,
       credit_used: effectiveCreditUsed,
+      order_debit_amount: orderDebitAmount,
+      ledger_credit_used: ledgerCreditUsed,
+      advance_balance: advanceBalance,
       outstanding_invoice_amount: outstandingInvoiceAmount,
       open_order_amount: openOrderAmount,
       pending_booking_amount: pendingBookingAmount,
@@ -291,9 +316,15 @@ Deno.serve(async (req) => {
     console.log('[CHECK-B2B-CREDIT] Result:', {
       account_id,
       can_proceed: canProceed,
+      bypass_credit_check: bypassCreditCheck,
       available_credit: availableCredit,
-      outstanding_invoice_amount: outstandingInvoiceAmount,
-      open_order_amount: openOrderAmount,
+      order_debit_amount: orderDebitAmount,
+      ledger_credit_used: ledgerCreditUsed,
+      // accounts.credit_used is a cache of the same sum, maintained by
+      // recalculate_account_credit_used(). A mismatch means the trigger missed
+      // a write and the account needs a resync.
+      stored_credit_used: storedCreditUsed,
+      advance_balance: advanceBalance,
       pending_booking_amount: pendingBookingAmount,
       payment_credit_amount: paymentCreditAmount,
       manual_credit_amount: manualCreditAmount,

@@ -154,6 +154,7 @@ interface TestGroup {
   ref_range_ai_config?: any;
   required_patient_inputs?: string[];
   group_interpretation?: string | null;
+  default_report_remark?: string | null;
   is_outsourced?: boolean;
   default_outsourced_lab_id?: string;
   is_section_only?: boolean;
@@ -302,6 +303,7 @@ const Tests: React.FC = () => {
     ref_range_ai_config: group.ref_range_ai_config,
     required_patient_inputs: group.required_patient_inputs || [],
     group_interpretation: group.group_interpretation || null,
+    default_report_remark: group.default_report_remark || null,
     global_test_catalog_id: group.global_test_catalog_id || null,
     analyzer_connection_id: group.analyzer_connection_id || null,
     is_section_only: group.is_section_only || false,
@@ -675,6 +677,7 @@ const Tests: React.FC = () => {
             ref_range_ai_config: group.ref_range_ai_config,
             required_patient_inputs: group.required_patient_inputs || [],
             group_interpretation: group.group_interpretation || null,
+		            default_report_remark: group.default_report_remark || null,
 		            global_test_catalog_id: group.global_test_catalog_id || null,
 		            analyzer_connection_id: group.analyzer_connection_id || null,
 		            is_section_only: group.is_section_only || false,
@@ -989,9 +992,11 @@ const Tests: React.FC = () => {
 
       // Link test groups to package
       if (formData.testGroupIds && formData.testGroupIds.length > 0) {
-        const packageTestGroups = formData.testGroupIds.map((tgId: string) => ({
+        // Array position is the package-level display order chosen in the editor
+        const packageTestGroups = formData.testGroupIds.map((tgId: string, index: number) => ({
           package_id: newPackage.id,
-          test_group_id: tgId
+          test_group_id: tgId,
+          display_order: index
         }));
 
         const { error: linkError } = await supabase
@@ -1164,9 +1169,10 @@ const Tests: React.FC = () => {
         .eq('package_id', editingPackage.id);
 
       if (formData.testGroupIds && formData.testGroupIds.length > 0) {
-        const packageTestGroups = formData.testGroupIds.map((tgId: string) => ({
+        const packageTestGroups = formData.testGroupIds.map((tgId: string, index: number) => ({
           package_id: editingPackage.id,
-          test_group_id: tgId
+          test_group_id: tgId,
+          display_order: index
         }));
 
         await supabase
@@ -1254,6 +1260,7 @@ const Tests: React.FC = () => {
 	          default_template_style: updatedTestGroup.default_template_style || null,
 	          print_options: updatedTestGroup.print_options ?? null,
 		          group_interpretation: updatedTestGroup.group_interpretation || null,
+		          default_report_remark: updatedTestGroup.default_report_remark || null,
 		          global_test_catalog_id: updatedTestGroup.global_test_catalog_id || null,
 		          analyzer_connection_id: updatedTestGroup.analyzer_connection_id || null,
 		          is_section_only: updatedTestGroup.is_section_only || false,
@@ -1620,6 +1627,7 @@ const Tests: React.FC = () => {
 	          default_template_style: group.default_template_style || null,
           print_options: group.print_options ?? null,
 	          group_interpretation: group.group_interpretation || null,
+	          default_report_remark: group.default_report_remark || null,
 	          global_test_catalog_id: group.global_test_catalog_id || null,
 	          analyzer_connection_id: group.analyzer_connection_id || null,
 	          analytes: group.test_group_analytes ? group.test_group_analytes.map((tga: any) => tga.analyte_id) : [],
@@ -1878,6 +1886,7 @@ const Tests: React.FC = () => {
           required_patient_inputs,
           ref_range_ai_config,
           group_interpretation,
+          default_report_remark,
           global_test_catalog_id,
           analyzer_connection_id,
           is_section_only,
@@ -2842,6 +2851,9 @@ const Tests: React.FC = () => {
                 formula: editingAnalyte.formula,
                 formula_variables: editingAnalyte.formulaVariables,
                 formula_description: editingAnalyte.formulaDescription,
+                // Without this the Result Type picker always reopens on "Numeric formula"
+                // and re-saving silently downgrades a text-rule analyte back to numeric.
+                calculation_result_type: editingAnalyte.calculationResultType === 'text' ? 'text' : 'numeric',
                 display_name: (editingAnalyte as any).display_name || null,
                 value_type: (editingAnalyte as any).value_type ?? undefined,
                 decimal_places: (editingAnalyte as any).decimal_places ?? null,

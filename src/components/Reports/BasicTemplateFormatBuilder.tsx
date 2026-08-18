@@ -11,6 +11,13 @@ export interface BasicPrintOptions {
   boldAbnormalValues?: boolean;    // default true — extra bold (700) for high/low; false = no extra bold
   patientInfoBold?: boolean;       // default false — bold the patient info block values (labels are always bold)
   patientInfoColumnDivider?: boolean; // default false — vertical rule between the left and right patient info columns
+  patientInfoLeftPct?: number;     // 25-75, default 50 — width of the LEFT label+value pair (widen for long patient names)
+  patientInfoLabelPct?: number;    // 15-60, default 30 — label column width inside each pair
+  showReportTitle?: boolean;       // default true — print the "TEST REPORT" heading
+  showHeaderBarcode?: boolean;     // default true — print the sample barcode in the header bar (PDF only)
+  reportTitleBarPadding?: number;  // 0-10, default 4 — vertical padding inside the title bar
+  headerBarcodeWidth?: number;     // 50-160, default 100 — header barcode width in px
+  headerBarcodeHeight?: number;    // 12-48, default 36 — header barcode height in px (drives the bar's thickness)
   underlineAbnormalValues?: boolean; // default false — underline high/low/critical/abnormal values
   calcMarker?: 'asterisk' | 'cal' | 'none'; // default 'cal'
   defaultDecimalPlaces?: number | null; // lab-wide result precision (0-4); undefined = as entered, per-analyte setting overrides
@@ -20,6 +27,8 @@ export interface BasicPrintOptions {
   flagSymbol?: 'none' | 'before' | 'after'; // default 'none'; 'before' = flag prefix inside result; 'after' = inline flag suffix
   showFlagLegend?: boolean;        // show H=High, L=Low legend below each group table
   flagGapPx?: number;              // gap in px between H/L symbol and the value (0-12, default 4)
+  analyteRowSpacing?: number;      // vertical padding per result cell (0-10, default 2) — gap between two analytes is 2x this
+  testGroupSpacing?: number;       // bottom margin of each test group block (0-40, default 14)
   resultColors?: { high?: string; low?: string; enabled?: boolean }; // custom flag colors (matches edge fn)
   testGroupTitlePosition?: 'below_headers' | 'above_headers_center' | 'above_headers_left';
   qrPosition?: 'bottom_left' | 'top_left' | 'top_right' | 'header_right';
@@ -74,8 +83,17 @@ const SAMPLE_ANALYTES_BY_GROUP = new Map([
     { parameter: 'Platelet Count',        value: '420000',unit: '/cmm',   reference_range: '150000 - 450000', flag: '',     method: 'Impedance',  section_heading: 'Platelet', sort_order: 16 },
     { parameter: 'ESR (After 1 hour)',    value: '38',    unit: 'mm/hr',   reference_range: '0 - 13',          flag: 'high', method: 'Westergren', interpretation_high: 'Elevated — Inflammation / Infection', section_heading: 'ESR', sort_order: 17 },
   ]],
+  // Second group so the "Test Group Gap" setting is visible in the preview.
+  ['grp-thyroid', [
+    { parameter: 'Free Triiodothyronine (FT3)', value: '4.68', unit: 'pg/mL', reference_range: '0.55 - 1.75',  flag: 'high', method: 'CLIA', sort_order: 1 },
+    { parameter: 'Free Thyroxine (FT4)',        value: '2.10', unit: 'ng/dL', reference_range: '4.72 - 13.20', flag: 'low',  method: 'CLIA', sort_order: 2 },
+    { parameter: 'Thyroid Stimulating Hormone', value: '4.56', unit: 'mIU/L', reference_range: '0.30 - 4.30',  flag: 'high', method: 'CLIA', sort_order: 3 },
+  ]],
 ]);
-const SAMPLE_GROUP_NAMES = new Map([['grp-cbc', 'Complete Blood Count (CBC)']]);
+const SAMPLE_GROUP_NAMES = new Map([
+  ['grp-cbc', 'Complete Blood Count (CBC)'],
+  ['grp-thyroid', 'Free Thyroid Function Test'],
+]);
 // Keep in sync with DEFAULT_BASIC_REPORT_DISCLAIMER in
 // supabase/functions/generate-pdf-letterhead/index.ts
 const DEFAULT_BASIC_REPORT_DISCLAIMER =
@@ -164,11 +182,33 @@ function buildBasicHtml(
   const boldAbnormal = printOptions.boldAbnormalValues ?? true;
   const patientInfoBold = printOptions.patientInfoBold ?? false;
   const patientInfoColumnDivider = printOptions.patientInfoColumnDivider ?? false;
+  // Patient info header geometry — share of the row given to the LEFT label+value
+  // pair, and the share of each pair taken by its label. Defaults (50 / 30)
+  // reproduce the historical fixed 15% / 35% layout.
+  const patientInfoLeftPct = Math.max(25, Math.min(75, Number(printOptions.patientInfoLeftPct ?? 50)));
+  const patientInfoLabelPct = Math.max(15, Math.min(60, Number(printOptions.patientInfoLabelPct ?? 30)));
+  const patientInfoRightPct = 100 - patientInfoLeftPct;
+  const patientInfoWidths = {
+    label1: Number((patientInfoLeftPct * patientInfoLabelPct / 100).toFixed(2)),
+    value1: Number((patientInfoLeftPct * (100 - patientInfoLabelPct) / 100).toFixed(2)),
+    label2: Number((patientInfoRightPct * patientInfoLabelPct / 100).toFixed(2)),
+    value2: Number((patientInfoRightPct * (100 - patientInfoLabelPct) / 100).toFixed(2)),
+  };
+  const showReportTitle = printOptions.showReportTitle !== false;
+  const showHeaderBarcode = printOptions.showHeaderBarcode !== false;
+  // Title bar thickness — the bar is as tall as its tallest item, so the barcode
+  // height is usually what drives it.
+  const reportTitleBarPadding = Math.max(0, Math.min(10, Number(printOptions.reportTitleBarPadding ?? 4)));
+  const headerBarcodeWidth = Math.max(50, Math.min(160, Number(printOptions.headerBarcodeWidth ?? 100)));
+  const headerBarcodeHeight = Math.max(12, Math.min(48, Number(printOptions.headerBarcodeHeight ?? 36)));
+  const headerBarcodeSlotWidth = headerBarcodeWidth + 8;
   const underlineAbnormal = printOptions.underlineAbnormalValues ?? false;
   const sectionHeaderInline = printOptions.sectionHeaderInline ?? true;
   const flagSymbol = printOptions.flagSymbol ?? 'none';
   const showFlagLegend = printOptions.showFlagLegend ?? false;
   const flagGapPx = Math.max(0, Math.min(12, Number(printOptions.flagGapPx ?? 4)));
+  const analyteRowSpacing = Math.max(0, Math.min(10, Number(printOptions.analyteRowSpacing ?? 2)));
+  const testGroupSpacing = Math.max(0, Math.min(40, Number(printOptions.testGroupSpacing ?? 14)));
   const testGroupTitlePosition = printOptions.testGroupTitlePosition ?? 'above_headers_center';
   const qrPosition = printOptions.qrPosition ?? 'bottom_left';
   const qrHorizontalOffset = Math.max(0, Math.min(80, printOptions.qrHorizontalOffset ?? 0));
@@ -247,7 +287,7 @@ function buildBasicHtml(
   align-items: center !important;
   border-top: 1.5px solid #000 !important;
   border-bottom: 1.5px solid #000 !important;
-  padding: 4px 0 !important;
+  padding: ${reportTitleBarPadding}px 0 !important;
   margin: 6px 0 10px !important;
 }
 
@@ -270,7 +310,6 @@ function buildBasicHtml(
 }
 
 .basic-report-template .patient-header-table th {
-  width: 15% !important;
   font-weight: 700 !important;
   text-align: left !important;
   color: #000 !important;
@@ -279,8 +318,14 @@ function buildBasicHtml(
   border: none !important;
 }
 
+/* Configurable header geometry — cells 1/2 are the left label+value pair,
+   cells 3/4 the right pair (see patientInfoLeftPct / patientInfoLabelPct). */
+.basic-report-template .patient-header-table th:nth-child(1) { width: ${patientInfoWidths.label1}% !important; }
+.basic-report-template .patient-header-table td:nth-child(2) { width: ${patientInfoWidths.value1}% !important; }
+.basic-report-template .patient-header-table th:nth-child(3) { width: ${patientInfoWidths.label2}% !important; }
+.basic-report-template .patient-header-table td:nth-child(4) { width: ${patientInfoWidths.value2}% !important; }
+
 .basic-report-template .patient-header-table td {
-  width: 35% !important;
   padding: 2px 3px !important;
   border: none !important;
   color: #111 !important;
@@ -291,6 +336,24 @@ function buildBasicHtml(
 
 .basic-report-template .patient-header-table th {
   font-size: ${basePx}px !important;
+}
+
+/* Doctor degree/qualification printed on its own line under the doctor name.
+   The inline-block wrapper starts where the name starts (after the ": " prefix),
+   so the degree line indents to match instead of hugging the cell edge. */
+.basic-report-template .patient-header-table .ref-doctor-block {
+  display: inline-block !important;
+  vertical-align: top !important;
+  max-width: 100% !important;
+}
+
+.basic-report-template .patient-header-table .ref-doctor-degree {
+  font-size: ${Math.max(basePx - 1, 6)}px !important;
+  font-weight: normal !important;
+  color: #444 !important;
+  line-height: 1.25 !important;
+  margin-top: 1px !important;
+  white-space: normal !important;
 }
 ${patientInfoColumnDivider ? `
 /* Vertical rule between the left and right patient info columns.
@@ -349,7 +412,7 @@ ${patientInfoColumnDivider ? `
 
 .basic-report-template .tbl-results td {
   border: none !important;
-  padding: 2px 4px !important;
+  padding: ${analyteRowSpacing}px 4px !important;
   line-height: 1.28 !important;
 }
 
@@ -644,9 +707,19 @@ ${patientInfoColumnDivider ? `
 }
 </style>`;
 
+  // Stand-in for the Code-128 sample barcode the PDF engine prints in the header.
+  const barcodePlaceholderHtml = `
+    <div style="width:${headerBarcodeWidth}px;height:${headerBarcodeHeight}px;margin-left:auto;background:
+      repeating-linear-gradient(90deg,#111 0 2px,#fff 2px 4px,#111 4px 5px,#fff 5px 9px,#111 9px 12px,#fff 12px 13px);
+      background-color:#fff;"></div>`;
+  // The bar disappears entirely when it would otherwise be empty.
+  const titleBarHasQrSlot = qrPosition === 'top_left' || qrPosition === 'top_right';
+  // Both side slots share a width so the centred title stays centred.
+  const titleSlotWidth = (showHeaderBarcode && qrPosition !== 'top_right') ? headerBarcodeSlotWidth : 110;
   const patientInfoHtml = `
+    ${(!showReportTitle && !showHeaderBarcode && !titleBarHasQrSlot) ? '' : `
     <div class="report-title-bar">
-      <div class="qr-top-left-slot" style="width:110px;flex-shrink:0;">
+      <div class="qr-top-left-slot" style="width:${titleSlotWidth}px;flex-shrink:0;">
         ${qrPosition === 'top_left' ? `
           <div class="qr-verify" style="text-align:left;">
             <div style="width:46px;height:46px;border:1px solid #9ca3af;background:
@@ -656,8 +729,9 @@ ${patientInfoColumnDivider ? `
             <p style="margin:2px 0 0;font-size:9px;color:#6b7280;">Scan to verify</p>
           </div>` : ''}
       </div>
-      <h2 class="report-main-title" style="flex:1;">TEST REPORT</h2>
-      <div class="qr-top-right-slot" style="width:110px;flex-shrink:0;text-align:right;">
+      ${showReportTitle ? `<h2 class="report-main-title" style="flex:1;">TEST REPORT</h2>` : `<div style="flex:1;"></div>`}
+      <div class="qr-top-right-slot" style="width:${titleSlotWidth}px;flex-shrink:0;text-align:right;">
+        ${showHeaderBarcode && qrPosition !== 'top_right' ? barcodePlaceholderHtml : ''}
         ${qrPosition === 'top_right' ? `
           <div class="qr-verify" style="display:inline-block;text-align:left;">
             <div style="width:46px;height:46px;border:1px solid #9ca3af;background:
@@ -667,7 +741,7 @@ ${patientInfoColumnDivider ? `
             <p style="margin:2px 0 0;font-size:9px;color:#6b7280;">Scan to verify</p>
           </div>` : ''}
       </div>
-    </div>
+    </div>`}
     <figure class="table" style="margin:0;">
       <table class="patient-header-table">
         <tbody>
@@ -680,7 +754,7 @@ ${patientInfoColumnDivider ? `
             <th>Reg. Date</th><td>: 17-Mar-2026</td>
           </tr>
           <tr>
-            <th>Ref. By</th><td>: Dr. A. Sharma</td>
+            <th>Ref. By</th><td>: <span class="ref-doctor-block">Dr. A. Sharma<div class="ref-doctor-degree">MBBS, MD (Pathology)</div></span></td>
             <th>Report Date</th><td>: 17-Mar-2026</td>
           </tr>
         </tbody>
@@ -721,7 +795,7 @@ ${patientInfoColumnDivider ? `
     const effectiveColCount = hasSameRowSibling ? 6 : colCount;
 
     testResultsHtml += `
-      <figure class="table" style="margin: 0 0 14px;">
+      <figure class="table" style="margin: 0 0 ${testGroupSpacing}px;">
         ${!groupTitleBelowHeaders ? `
           <div class="${groupTitleClass}" style="font-size:${basePx + 1}px;">${groupName}</div>
           ${specimenText}
@@ -981,6 +1055,12 @@ export default function BasicTemplateFormatBuilder({ printOptions, showMethodolo
   const standardWidths = withCalculatedLastWidth(editableBasicColumnWidths(printOptions.basicColumnWidths?.standard, DEFAULT_BASIC_STANDARD_WIDTHS, 4));
   const siblingWidths = withCalculatedLastWidth(editableBasicColumnWidths(printOptions.basicColumnWidths?.sibling, DEFAULT_BASIC_SIBLING_WIDTHS, 6));
   const siblingBlockStart = Number(siblingWidths.slice(0, 4).reduce((sum, width) => sum + width, 0).toFixed(2));
+  // Same clamps as buildBasicHtml / the edge function so the sliders never show
+  // a value the renderers would reject.
+  const patientInfoLeftPct = Math.max(25, Math.min(75, Number(printOptions.patientInfoLeftPct ?? 50)));
+  const patientInfoLabelPct = Math.max(15, Math.min(60, Number(printOptions.patientInfoLabelPct ?? 30)));
+  const headerBarcodeWidth = Math.max(50, Math.min(160, Number(printOptions.headerBarcodeWidth ?? 100)));
+  const headerBarcodeHeight = Math.max(12, Math.min(48, Number(printOptions.headerBarcodeHeight ?? 36)));
   const setColumnWidth = (kind: 'standard' | 'sibling', index: number, value: number) => {
     const current = kind === 'standard' ? standardWidths : siblingWidths;
     const lastIndex = current.length - 1;
@@ -1089,6 +1169,92 @@ export default function BasicTemplateFormatBuilder({ printOptions, showMethodolo
           </Row>
           <Row label="Patient Info Column Line" hint="Vertical line between the left and right patient info columns. Off by default.">
             <Toggle checked={printOptions.patientInfoColumnDivider ?? false} onChange={(v) => setPO({ patientInfoColumnDivider: v })} />
+          </Row>
+          <Row label="Print 'TEST REPORT' Title" hint="Heading in the bar above the patient block. Off removes the heading (bar stays if the barcode or a top QR is on).">
+            <Toggle checked={printOptions.showReportTitle !== false} onChange={(v) => setPO({ showReportTitle: v })} />
+          </Row>
+          <Row label="Print Header Barcode" hint="Sample barcode at the right of the title bar (printed by default).">
+            <Toggle checked={printOptions.showHeaderBarcode !== false} onChange={(v) => setPO({ showHeaderBarcode: v })} />
+          </Row>
+          <Row label="Title Bar Padding" hint="Space above & below the title bar contents (0-10 px, default 4)">
+            <div className="flex items-center gap-2">
+              <input
+                type="range" min={0} max={10} step={1}
+                value={printOptions.reportTitleBarPadding ?? 4}
+                onChange={(e) => setPO({ reportTitleBarPadding: Number(e.target.value) })}
+                className="w-24 accent-indigo-600"
+              />
+              <span className="w-10 text-sm font-mono font-semibold text-gray-700">
+                {printOptions.reportTitleBarPadding ?? 4}
+              </span>
+            </div>
+          </Row>
+          <Row label="Barcode Height" hint="Barcode height in px (12-48, default 36). This is what makes the title bar thick.">
+            <div className="flex items-center gap-2">
+              <input
+                type="range" min={12} max={48} step={1}
+                value={headerBarcodeHeight}
+                disabled={printOptions.showHeaderBarcode === false}
+                onChange={(e) => setPO({ headerBarcodeHeight: Number(e.target.value) })}
+                className="w-24 accent-indigo-600 disabled:opacity-40"
+              />
+              <span className="w-10 text-sm font-mono font-semibold text-gray-700">
+                {headerBarcodeHeight}
+              </span>
+            </div>
+          </Row>
+          <Row label="Barcode Width" hint="Barcode width in px (50-160, default 100)">
+            <div className="flex items-center gap-2">
+              <input
+                type="range" min={50} max={160} step={5}
+                value={headerBarcodeWidth}
+                disabled={printOptions.showHeaderBarcode === false}
+                onChange={(e) => setPO({ headerBarcodeWidth: Number(e.target.value) })}
+                className="w-24 accent-indigo-600 disabled:opacity-40"
+              />
+              <span className="w-10 text-sm font-mono font-semibold text-gray-700">
+                {headerBarcodeWidth}
+              </span>
+            </div>
+          </Row>
+          <Row
+            label="Patient Info Split"
+            hint="Width of the left label+value pair. Raise it when patient names are long (50% = equal columns)."
+          >
+            <div className="flex flex-col items-end gap-1.5">
+              <div className="flex items-center gap-2">
+                <input
+                  type="range" min={25} max={75} step={1}
+                  value={patientInfoLeftPct}
+                  onChange={(e) => setPO({ patientInfoLeftPct: Number(e.target.value) })}
+                  className="w-24 accent-indigo-600"
+                />
+                <span className="w-10 text-sm font-mono font-semibold text-gray-700">
+                  {patientInfoLeftPct}%
+                </span>
+              </div>
+              <div className="flex h-4 w-36 overflow-hidden rounded border border-gray-300 text-[9px] leading-4">
+                <div className="bg-gray-100 text-center text-gray-500" style={{ width: `${patientInfoLeftPct}%` }}>
+                  Left
+                </div>
+                <div className="bg-indigo-100 text-center text-indigo-700" style={{ width: `${100 - patientInfoLeftPct}%` }}>
+                  Right
+                </div>
+              </div>
+            </div>
+          </Row>
+          <Row label="Patient Info Label %" hint="Label column width inside each pair (default 30%). Lower gives values more room.">
+            <div className="flex items-center gap-2">
+              <input
+                type="range" min={15} max={60} step={1}
+                value={patientInfoLabelPct}
+                onChange={(e) => setPO({ patientInfoLabelPct: Number(e.target.value) })}
+                className="w-24 accent-indigo-600"
+              />
+              <span className="w-10 text-sm font-mono font-semibold text-gray-700">
+                {patientInfoLabelPct}%
+              </span>
+            </div>
           </Row>
           <Row label="Calculated Marker" hint="How to mark auto-calculated fields">
             <select
@@ -1262,6 +1428,32 @@ export default function BasicTemplateFormatBuilder({ printOptions, showMethodolo
               </button>
             </div>
           )}
+          <Row label="Analyte Row Gap" hint="Space above & below each analyte row (0-10 px, default 2)">
+            <div className="flex items-center gap-2">
+              <input
+                type="range" min={0} max={10} step={1}
+                value={printOptions.analyteRowSpacing ?? 2}
+                onChange={(e) => setPO({ analyteRowSpacing: Number(e.target.value) })}
+                className="w-24 accent-indigo-600"
+              />
+              <span className="w-10 text-sm font-mono font-semibold text-gray-700">
+                {printOptions.analyteRowSpacing ?? 2}
+              </span>
+            </div>
+          </Row>
+          <Row label="Test Group Gap" hint="Space below each test group block (0-40 px, default 14)">
+            <div className="flex items-center gap-2">
+              <input
+                type="range" min={0} max={40} step={1}
+                value={printOptions.testGroupSpacing ?? 14}
+                onChange={(e) => setPO({ testGroupSpacing: Number(e.target.value) })}
+                className="w-24 accent-indigo-600"
+              />
+              <span className="w-10 text-sm font-mono font-semibold text-gray-700">
+                {printOptions.testGroupSpacing ?? 14}
+              </span>
+            </div>
+          </Row>
           <Row label="Section Field %" hint="Field name width for section-only reports (20-70%)">
             <div className="flex items-center gap-2">
               <input

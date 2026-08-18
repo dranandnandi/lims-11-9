@@ -1631,76 +1631,190 @@ body { margin: 0; padding: 0; background: #fff; }
           tax_disclaimer: "This is a tax invoice. GST is applicable as per CGST/SGST/IGST regulations.",
           include_bank_details: true,
           gjs_html: `<div class="b2b-invoice">
-    <div class="letterhead"><div class="company-logo"><h1>{{lab_name}}</h1><p class="company-tagline">Accredited Laboratory Services</p></div><div class="company-details"><p>{{lab_address}}</p><p>Phone: {{lab_phone}} | Email: {{lab_email}}</p><p><strong>GSTIN:</strong> {{lab_license}}</p><p><strong>CIN:</strong> {{lab_registration}}</p></div></div>
-    <div class="document-title"><h2>TAX INVOICE</h2>{{partial_badge}}</div>
-    <div class="invoice-details-grid">
-      <div class="detail-section"><h4>Invoice Information</h4><table class="detail-table"><tr><td>Invoice No:</td><td><strong>{{invoice_number}}</strong></td></tr><tr><td>Invoice Date:</td><td>{{invoice_date}}</td></tr><tr><td>Due Date:</td><td>{{due_date}}</td></tr><tr><td>Payment Type:</td><td>{{payment_type}}</td></tr></table></div>
-      <div class="detail-section"><h4>Bill To</h4><p class="client-name">{{patient_name}}</p><p>{{patient_address}}</p><p>Phone: {{patient_phone}}</p><p>Email: {{patient_email}}</p><p>Ref. Doctor: {{doctor}}</p></div>
+  <div class="inv-head">
+    <div class="inv-head-left">
+      <h1>{{lab_name}}</h1>
+      <p>{{lab_address}}</p>
+      <p>Phone: {{lab_phone}} &nbsp;|&nbsp; Email: {{lab_email}}</p>
+      <p><strong>GSTIN:</strong> {{lab_gst}} &nbsp;&nbsp; <strong>Reg. No:</strong> {{lab_license}}</p>
     </div>
-    <div class="services-section"><h4>Services & Charges</h4><table class="b2b-items-table"><thead><tr><th style="width: 50%;">Description of Services</th><th style="text-align: center; width: 10%;">Qty</th><th style="text-align: right; width: 15%;">Rate (₹)</th><th style="text-align: right; width: 10%;">Discount</th><th style="text-align: right; width: 15%;">Amount (₹)</th></tr></thead><tbody>{{invoice_items}}</tbody><tfoot><tr class="subtotal-row"><td colspan="4" style="text-align: right;"><strong>Subtotal:</strong></td><td style="text-align: right;"><strong>{{subtotal}}</strong></td></tr></tfoot></table></div>
-    <div class="tax-section">
-      <div class="tax-breakdown"><h4>Tax Breakdown</h4><table class="tax-table"><tr><td>Taxable Amount:</td><td>{{subtotal}}</td></tr><tr><td>Less: Discount:</td><td>-{{discount}}</td></tr><tr><td>CGST @ 9%:</td><td>{{tax}}</td></tr><tr><td>SGST @ 9%:</td><td>{{tax}}</td></tr><tr class="tax-total"><td><strong>Total Tax (GST):</strong></td><td><strong>{{tax}}</strong></td></tr></table></div>
-      <div class="amount-summary"><table class="summary-amounts"><tr class="total-amount"><td>Invoice Total:</td><td>{{total}}</td></tr><tr class="paid-amount"><td>Amount Paid:</td><td>{{amount_paid}}</td></tr><tr class="due-amount"><td>Balance Due:</td><td>{{balance_due}}</td></tr></table></div>
+    <div class="inv-head-right">
+      <div class="doc-type">TAX INVOICE</div>
+      <p class="doc-no">{{invoice_number}}</p>
+      <p class="doc-date">Date: {{invoice_date}}</p>
+      {{partial_badge}}
     </div>
-    <div class="terms-bank-section"><div class="terms-box">{{payment_terms}}</div><div class="bank-box">{{bank_details}}</div></div>
-    <div class="notes-section-b2b"><h4>Notes & Remarks</h4><p>{{notes}}</p></div>
-    <div class="declaration"><p><strong>Declaration:</strong> {{tax_disclaimer}}</p><p>We declare that this invoice shows the actual price of the services described and that all particulars are true and correct.</p></div>
-    <div class="signature-section"><div class="signature-box"><p>For <strong>{{lab_name}}</strong></p><div class="signature-line"></div><p>Authorized Signatory</p></div></div>
-    <div class="b2b-footer"><p>This is a system-generated invoice. Generated on {{current_date}}</p><p><em>Thank you for your business partnership!</em></p></div>
-  </div>`,
-          gjs_css: `body { font-family: "Times New Roman", Times, serif; margin: 0; padding: 0; }
-  .b2b-invoice { max-width: 210mm; margin: 0 auto; padding: 15mm; background: white; }
-  .letterhead { border-bottom: 3px double #000; padding-bottom: 15px; margin-bottom: 20px; }
-  .company-logo h1 { font-size: 26px; margin-bottom: 5px; }
-  .company-tagline { font-style: italic; color: #555; font-size: 13px; }
-  .company-details { margin-top: 10px; font-size: 12px; line-height: 1.6; }
-  .document-title { text-align: center; margin: 20px 0; position: relative; }
-  .document-title h2 { font-size: 28px; border: 2px solid #000; display: inline-block; padding: 10px 30px; }
-  .invoice-details-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 30px; }
-  .detail-section { border: 1px solid #ddd; padding: 15px; }
-  .detail-section h4 { margin-bottom: 10px; border-bottom: 2px solid #000; padding-bottom: 5px; }
-  .detail-table { width: 100%; font-size: 14px; }
-  .detail-table td { padding: 5px 0; }
-  .detail-table td:first-child { width: 120px; color: #666; }
-  .client-name { font-size: 16px; font-weight: bold; margin: 10px 0; }
-  .services-section { margin-bottom: 20px; }
-  .services-section h4 { background: #000; color: white; padding: 10px; margin-bottom: 0; }
-  .b2b-items-table { width: 100%; border-collapse: collapse; border: 1px solid #000; }
-  .b2b-items-table th { background: #f0f0f0; padding: 12px 8px; border: 1px solid #000; font-weight: bold; }
-  .b2b-items-table td { padding: 12px 8px; border: 1px solid #ddd; }
-  .subtotal-row { background: #f5f5f5; font-weight: bold; }
-  .tax-section { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
-  .tax-breakdown { border: 1px solid #ddd; padding: 15px; }
-  .tax-breakdown h4 { margin-bottom: 10px; }
-  .tax-table { width: 100%; font-size: 14px; }
-  .tax-table td { padding: 8px; border-bottom: 1px solid #eee; }
-  .tax-table td:last-child { text-align: right; }
-  .tax-total { background: #f0f0f0; font-weight: bold; border-top: 2px solid #000; }
-  .amount-summary { border: 2px solid #000; padding: 15px; }
-  .summary-amounts { width: 100%; font-size: 16px; }
-  .summary-amounts td { padding: 10px; }
-  .summary-amounts td:last-child { text-align: right; font-weight: bold; }
-  .total-amount { font-size: 18px; border-bottom: 2px solid #000; }
-  .paid-amount { color: #28a745; }
-  .due-amount { font-size: 20px; background: #fff3cd; color: #856404; }
-  .terms-bank-section { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
-  .terms-box, .bank-box { border: 1px solid #ddd; padding: 15px; background: #fafafa; }
-  .notes-section-b2b { border: 1px solid #ddd; padding: 15px; margin-bottom: 20px; }
-  .declaration { border: 1px solid #000; padding: 15px; margin-bottom: 20px; font-size: 12px; background: #fffacd; }
-  .signature-section { text-align: right; margin: 30px 0; }
-  .signature-box { display: inline-block; text-align: center; }
-  .signature-line { width: 200px; height: 50px; border-bottom: 1px solid #000; margin: 20px 0; }
-  .b2b-footer { text-align: center; margin-top: 30px; padding-top: 20px; border-top: 1px solid #ddd; font-size: 11px; color: #666; }
-  .partial-invoice-badge { position: absolute; top: -10px; right: 20px; background: #dc3545; color: white; padding: 10px 20px; font-weight: bold; border: 2px solid #000; }`
+  </div>
+
+  <div class="inv-parties">
+    <div class="party-box">
+      <h3>Bill To</h3>
+      <p class="party-name">{{account_name}}</p>
+      <p>{{account_address}}</p>
+      <p>Phone: {{account_phone}}</p>
+      <p>Email: {{account_email}}</p>
+      <p><strong>GSTIN:</strong> {{account_gst}}</p>
+    </div>
+    <div class="party-box">
+      <h3>Invoice Details</h3>
+      <table class="kv-table">
+        <tr><td>Invoice No</td><td><strong>{{invoice_number}}</strong></td></tr>
+        <tr><td>Invoice Date</td><td>{{invoice_date}}</td></tr>
+        <tr><td>Billing Period</td><td>{{billing_period}}</td></tr>
+        <tr><td>Due Date</td><td>{{due_date}}</td></tr>
+        <tr><td>Payment Type</td><td>{{payment_type}}</td></tr>
+        <tr><td>Patients / Bills</td><td>{{patient_count}} / {{invoice_count}}</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="section-title">Patient-wise Tests &amp; Charges</div>
+  <div class="patient-section">
+    {{b2b_patient_blocks}}
+  </div>
+
+  <div class="totals-section">
+    <div class="totals-left">
+      <div class="words-box">
+        <h4>Amount in Words</h4>
+        <p>{{amount_in_words}}</p>
+      </div>
+      <div class="notes-box">
+        <h4>Notes &amp; Remarks</h4>
+        <p>{{notes}}</p>
+      </div>
+    </div>
+    <div class="totals-right">
+      <table class="amount-table">
+        <tr><td>Subtotal</td><td>{{subtotal}}</td></tr>
+        <tr><td>Less: Discount</td><td>-{{discount}}</td></tr>
+        <tr><td>CGST @ 9%</td><td>{{cgst}}</td></tr>
+        <tr><td>SGST @ 9%</td><td>{{sgst}}</td></tr>
+        <tr><td>Total GST</td><td>{{tax}}</td></tr>
+        <tr class="grand-total"><td>Grand Total</td><td>{{grand_total}}</td></tr>
+        <tr class="paid-row"><td>Amount Paid</td><td>{{amount_paid}}</td></tr>
+        <tr class="balance-row"><td>Balance Due</td><td>{{balance_due}}</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="terms-bank-section">
+    <div>{{payment_terms}}</div>
+    <div>{{bank_details}}</div>
+  </div>
+
+  <div class="declaration">
+    <p><strong>Declaration:</strong> {{tax_disclaimer}}</p>
+    <p>We declare that this invoice shows the actual price of the services described and that all particulars are true and correct.</p>
+  </div>
+
+  <div class="signature-section">
+    <div class="signature-box">
+      <p>For <strong>{{lab_name}}</strong></p>
+      <div class="signature-line"></div>
+      <p>Authorized Signatory</p>
+    </div>
+  </div>
+
+  <div class="b2b-footer">
+    <p>This is a system-generated invoice. Generated on {{current_date}}</p>
+    <p><em>Thank you for your business partnership!</em></p>
+  </div>
+</div>`,
+          gjs_css: `* { box-sizing: border-box; }
+body { margin: 0; padding: 0; font-family: Arial, Helvetica, sans-serif; color: #1f2937; background: #fff; }
+.b2b-invoice { max-width: 210mm; margin: 0 auto; padding: 12mm; font-size: 11.5px; line-height: 1.45; }
+
+.inv-head { display: flex; justify-content: space-between; gap: 20px; border-bottom: 2px solid #111827; padding-bottom: 12px; margin-bottom: 14px; }
+.inv-head-left h1 { margin: 0 0 5px; font-size: 22px; }
+.inv-head-left p { margin: 2px 0; color: #374151; }
+.inv-head-right { text-align: right; min-width: 180px; }
+.doc-type { display: inline-block; border: 1.5px solid #111827; padding: 5px 14px; font-size: 15px; font-weight: bold; letter-spacing: 1px; }
+.doc-no { margin: 7px 0 0; font-weight: bold; font-size: 13px; }
+.doc-date { margin: 2px 0 0; color: #4b5563; }
+
+.inv-parties { display: grid; grid-template-columns: 1.15fr 1fr; gap: 14px; margin-bottom: 14px; }
+.party-box { border: 1px solid #d1d5db; padding: 10px 12px; }
+.party-box h3 { margin: 0 0 7px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; color: #111827; border-bottom: 1px solid #e5e7eb; padding-bottom: 4px; }
+.party-box p { margin: 2px 0; }
+.party-name { font-size: 14px; font-weight: bold; margin-bottom: 4px !important; }
+.kv-table { width: 100%; border-collapse: collapse; }
+.kv-table td { padding: 3px 0; vertical-align: top; }
+.kv-table td:first-child { color: #6b7280; width: 42%; }
+
+.section-title { background: #111827; color: #fff; padding: 7px 12px; font-size: 12px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.5px; }
+.patient-section { margin-bottom: 14px; }
+
+.patient-service-block { border: 1px solid #d1d5db; border-top: 0; page-break-inside: avoid; }
+.patient-service-head { display: flex; justify-content: space-between; gap: 14px; align-items: flex-start; background: #f3f4f6; border-bottom: 1px solid #d1d5db; padding: 8px 12px; }
+.patient-service-index { font-size: 9.5px; color: #6b7280; text-transform: uppercase; font-weight: bold; letter-spacing: 0.4px; }
+.patient-service-name { font-size: 14px; font-weight: bold; margin-top: 1px; }
+.patient-service-meta { color: #6b7280; margin-top: 2px; font-size: 10.5px; }
+.patient-service-total { text-align: right; min-width: 130px; }
+.patient-service-total span { display: block; color: #6b7280; font-size: 9.5px; text-transform: uppercase; font-weight: bold; letter-spacing: 0.4px; }
+.patient-service-total strong { display: block; font-size: 15px; margin-top: 2px; }
+.patient-service-items { width: 100%; border-collapse: collapse; }
+.patient-service-items th { background: #fff; border-bottom: 1px solid #d1d5db; padding: 6px 10px; font-size: 10.5px; color: #374151; text-align: left; }
+.patient-service-items td { border-bottom: 1px solid #f0f1f3; padding: 6px 10px; vertical-align: top; }
+.patient-service-items tbody tr:last-child td { border-bottom: 1px solid #e5e7eb; }
+.patient-service-items tfoot td { background: #fafafa; font-weight: bold; padding: 6px 10px; border-bottom: 0; }
+.patient-item-package { margin-top: 1px; font-size: 9.5px; color: #6b7280; }
+.patient-service-words { border-top: 1px solid #f0f1f3; padding: 5px 10px; font-size: 10px; color: #4b5563; font-style: italic; }
+.patient-service-empty { border: 1px solid #d1d5db; border-top: 0; padding: 16px; text-align: center; color: #6b7280; }
+
+.totals-section { display: grid; grid-template-columns: 1fr 250px; gap: 14px; align-items: start; margin-bottom: 14px; }
+.words-box, .notes-box { border: 1px solid #d1d5db; padding: 9px 12px; }
+.notes-box { margin-top: 10px; }
+.words-box h4, .notes-box h4 { margin: 0 0 4px; font-size: 10.5px; text-transform: uppercase; color: #6b7280; letter-spacing: 0.4px; }
+.words-box p { margin: 0; font-weight: bold; }
+.notes-box p { margin: 0; color: #4b5563; }
+.amount-table { width: 100%; border-collapse: collapse; border: 1px solid #111827; }
+.amount-table td { padding: 6px 10px; border-bottom: 1px solid #e5e7eb; }
+.amount-table td:last-child { text-align: right; font-weight: bold; white-space: nowrap; }
+.amount-table td:first-child { color: #4b5563; }
+.grand-total td { background: #111827; color: #fff !important; font-size: 13px; }
+.grand-total td:first-child { color: #fff !important; }
+.paid-row td:last-child { color: #15803d; }
+.balance-row td { background: #fff7ed; font-size: 12.5px; }
+.balance-row td:last-child { color: #b45309; }
+
+.terms-bank-section { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 12px; }
+.payment-terms, .bank-details { border: 1px solid #d1d5db; padding: 9px 12px; height: 100%; }
+.payment-terms h4, .bank-details h4 { margin: 0 0 5px; font-size: 10.5px; text-transform: uppercase; color: #6b7280; letter-spacing: 0.4px; }
+.payment-terms p { margin: 0; }
+.bank-details table { width: 100%; border-collapse: collapse; }
+.bank-details td { padding: 2px 0; }
+
+.declaration { border: 1px solid #111827; padding: 8px 12px; font-size: 10.5px; margin-bottom: 12px; }
+.declaration p { margin: 2px 0; }
+.signature-section { display: flex; justify-content: flex-end; text-align: center; margin-bottom: 10px; }
+.signature-line { width: 180px; height: 38px; border-bottom: 1px solid #111827; margin: 4px 0 6px; }
+.signature-box p { margin: 0; }
+.b2b-footer { text-align: center; border-top: 1px solid #e5e7eb; padding-top: 8px; font-size: 10px; color: #6b7280; }
+.b2b-footer p { margin: 2px 0; }
+.partial-invoice-badge { display: inline-block; margin-top: 7px; border: 1px solid #b91c1c; color: #b91c1c; padding: 3px 8px; font-size: 10px; font-weight: bold; }
+.payment-status-badge { display: inline-block; padding: 4px 10px; font-size: 10px; font-weight: bold; }
+
+@media print {
+  .b2b-invoice { padding: 10mm; }
+  .patient-service-block { page-break-inside: avoid; }
+  .totals-section, .declaration, .signature-section { page-break-inside: avoid; }
+}`
         }
       ];
       
-      const compactDefaultInvoiceTemplates = defaultInvoiceTemplates.map((template) => ({
-        ...template,
-        gjs_html: compactInvoiceHtml,
-        gjs_css: compactInvoiceCss,
-        page_size: 'A4',
-      }));
+      // The compact single-patient layout replaces the B2C designs, but the B2B
+      // template keeps its own patient-wise layout (it renders {{b2b_patient_blocks}}).
+      const compactDefaultInvoiceTemplates = defaultInvoiceTemplates.map((template) => (
+        template.category === 'b2b'
+          ? { ...template, page_size: 'A4' }
+          : {
+              ...template,
+              gjs_html: compactInvoiceHtml,
+              gjs_css: compactInvoiceCss,
+              page_size: 'A4',
+            }
+      ));
 
       // Insert all invoice templates
       const { error: insertInvTmplErr } = await supabaseClient

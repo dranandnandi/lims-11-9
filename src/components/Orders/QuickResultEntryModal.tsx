@@ -5,10 +5,10 @@
 
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import ReactDOM from "react-dom";
-import { X, Save, CheckCircle, ChevronDown, ChevronRight, Loader2, RefreshCw, EyeOff, Link2, Building2, ShieldCheck, Undo2 } from "lucide-react";
+import { X, Save, CheckCircle, ChevronDown, ChevronRight, Loader2, RefreshCw, EyeOff, Link2, Building2, ShieldCheck, Undo2, AlertTriangle } from "lucide-react";
 import { supabase, database } from "../../utils/supabase";
 import { useAuth } from "../../contexts/AuthContext";
-import { calculateFlag, calculateFlagsForResults } from "../../utils/flagCalculation";
+import { calculateFlagsForResults, resolveFlag, detectFlagConflict, getFlagDescription, normalizeFlagCode, type ResolvedFlag } from "../../utils/flagCalculation";
 import { selectPreferredCalculatedDependencies } from "../../utils/calculatedDependencies";
 import { evaluateTextCalculation, normalizeCalculationResultType } from "../../utils/calculationRules";
 import SectionEditor, { SectionEditorRef } from "../Results/SectionEditor";
@@ -29,6 +29,11 @@ import {
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
+// 'manual'  — picked by hand from the flag dropdown
+// 'rule'    — derived from expected_value_flag_map for a qualitative selection
+// undefined — computed from value + reference range
+type FlagOrigin = "manual" | "rule";
+
 interface AnalyteRow {
   test_group_id: string;
   analyte_id: string;
@@ -38,6 +43,10 @@ interface AnalyteRow {
   unit: string;
   reference: string;
   flag: string;
+  // Where the flag on this row came from. Only 'manual' — a human picking from
+  // the flag dropdown — survives recalculation; everything else is recomputed
+  // from the current value so a corrected entry cannot keep a stale flag.
+  flag_origin?: FlagOrigin;
   is_calculated: boolean;
   is_existing: boolean;
   expected_normal_values: string[];
@@ -70,6 +79,13 @@ interface TestGroup {
   order_test_id: string | null;
   is_section_only?: boolean;
   ref_range_ai_config?: { enabled?: boolean; consider_age?: boolean } | null;
+  // Collection/sample condition configured on the test group (e.g. Fasting Blood
+  // Serum, Random Blood Serum) plus the value already chosen for this order.
+  sample_condition_options?: string[];
+  default_sample_condition?: string | null;
+  sample_condition?: string | null;
+  // Lab-level default remark configured on the test group master.
+  default_report_remark?: string | null;
 	  analytes: {
 	    id: string;
 	    lab_analyte_id?: string | null;
@@ -146,6 +162,15 @@ const hasMeaningfulTextValue = (value: unknown): value is string =>
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+// A decided verdict replaces whatever the row was carrying, so correcting a
+// mistyped value clears the flag it produced. Only an explicit human pick is
+// kept; an undecidable verdict leaves the existing flag alone.
+const applyAutoFlag = (
+  row: { flag: string; flag_origin?: FlagOrigin },
+  resolved: ResolvedFlag | null,
+): string =>
+  row.flag_origin === "manual" || !resolved?.determined ? row.flag : resolved.flag;
+
 const toNumber = (raw: string | number | null | undefined): number | null => {
   if (raw === null || raw === undefined || raw === "") return null;
   const n = Number(String(raw).replace(/,/g, '').trim());
@@ -213,6 +238,23 @@ const toVariableSlug = (name: string): string => {
     new Set(valueLookup.keys()),
   );
 
+  // Temporary diagnostics for calculated-parameter setup issues.
+  const calcDebug = (stage: string, extra: Record<string, unknown>) =>
+    console.info('[QuickEntry calc]', stage, {
+      analyteId,
+      labAnalyteId,
+      formula,
+      formula_variables: vars,
+      calculation_result_type_raw: calculationResultType,
+      calculation_result_type_normalized: normalizeCalculationResultType(calculationResultType),
+      dependencies: analyteSliceDeps.map(d => ({
+        variable: d.variable_name,
+        source_analyte_id: d.source_analyte_id,
+        source_lab_analyte_id: d.source_lab_analyte_id,
+      })),
+      ...extra,
+    });
+
   // Phase 1: replace variables listed in formula_variables.
   // Does NOT return early on a missing var — formula text may use different token names (e.g. analyte codes)
   // that are resolved in Phase 2 below.
@@ -231,7 +273,9 @@ const toVariableSlug = (name: string): string => {
   }
 
   if (normalizeCalculationResultType(calculationResultType) === 'text') {
-    return evaluateTextCalculation(formula, scope).value;
+    const outcome = evaluateTextCalculation(formula, scope);
+    calcDebug('text-rules', { scope, outcome });
+    return outcome.value;
   }
 
   // Phase 2: resolve any remaining alphabetic tokens in the formula.
@@ -245,7 +289,15 @@ const toVariableSlug = (name: string): string => {
     let val: number | undefined = dep?.source_lab_analyte_id ? valueLookup.get(dep.source_lab_analyte_id) : undefined;
     if (val === undefined && dep) val = valueLookup.get(dep.source_analyte_id);
     if (val === undefined) val = valueLookup.get(tokenKey);
-    if (val === undefined) return "";
+    if (val === undefined) {
+      calcDebug('numeric-unresolved-token', {
+        token,
+        resolvedSoFar: resolved,
+        availableLookupKeys: Array.from(valueLookup.keys()),
+        hint: 'If this formula is a JSON text rule, calculation_result_type is still "numeric" in lab_analytes.',
+      });
+      return "";
+    }
     scope[token] = val;
     scope[token.toUpperCase()] = val;
     scope[token.toLowerCase()] = val;
@@ -275,6 +327,13 @@ const uuidProp = (key: string, value: string | null | undefined) => {
 // sent it back for a re-run. Everything else is shown in the saved panel.
 const isEditableRow = (r: AnalyteRow) => !r.is_existing || !!r.is_rerun;
 
+// test_groups.sample_condition_options is a free-form JSONB array — keep only
+// non-empty strings so a stray null never renders as a blank dropdown entry.
+const normalizeConditionOptions = (raw: unknown): string[] =>
+  Array.isArray(raw)
+    ? raw.map((v) => String(v ?? "").trim()).filter(Boolean)
+    : [];
+
 const getGroupKey = (tg: Pick<TestGroup, "test_group_id" | "order_test_group_id" | "order_test_id">) => {
   const orderTestGroupId = safeUuid(tg.order_test_group_id);
   const orderTestId = safeUuid(tg.order_test_id);
@@ -302,6 +361,14 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
   const [message, setMessage] = useState<{ text: string; type: "success" | "error" } | null>(null);
   const [groupRemarks, setGroupRemarks] = useState<Record<string, string>>({});
   const [initialGroupRemarks, setInitialGroupRemarks] = useState<Record<string, string>>({});
+  // Whether the remark above is printed on the report, keyed by test_group_id.
+  // Unticking keeps the text on screen but leaves it off the PDF.
+  const [remarkEnabled, setRemarkEnabled] = useState<Record<string, boolean>>({});
+  const [initialRemarkEnabled, setInitialRemarkEnabled] = useState<Record<string, boolean>>({});
+  // Sample condition chosen per test group (keyed by test_group_id). Mirrors the
+  // selection made during sample collection so it can still be set/corrected here.
+  const [sampleConditions, setSampleConditions] = useState<Record<string, string>>({});
+  const [initialSampleConditions, setInitialSampleConditions] = useState<Record<string, string>>({});
   const [activeGroupId, setActiveGroupId] = useState<string | null>(null);
   // Saved analytes render collapsed by default — a group is only expanded once
   // the user explicitly opens it to review or edit.
@@ -375,9 +442,9 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
         .select(`
           id, lab_id, patient_id, patient_name,
           order_test_groups(
-            id, test_group_id, test_name,
+            id, test_group_id, test_name, sample_condition,
             test_groups(
-              id, name, is_section_only, ref_range_ai_config,
+              id, name, is_section_only, ref_range_ai_config, sample_condition_options, default_sample_condition, default_report_remark,
               test_group_analytes(
                 analyte_id, lab_analyte_id, sort_order, display_order,
                 analytes(id, name, code, unit, reference_range, is_calculated, formula, formula_variables, calculation_result_type, decimal_places, expected_normal_values, expected_value_flag_map, value_type, expected_value_codes),
@@ -386,10 +453,10 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
             )
           ),
           order_tests(
-            id, test_name, test_group_id, is_canceled, outsourced_lab_id,
+            id, test_name, test_group_id, is_canceled, outsourced_lab_id, sample_condition,
             outsourced_labs(name),
             test_groups(
-              id, name, is_section_only, ref_range_ai_config,
+              id, name, is_section_only, ref_range_ai_config, sample_condition_options, default_sample_condition, default_report_remark,
               test_group_analytes(
                 analyte_id, lab_analyte_id, sort_order, display_order,
                 analytes(id, name, code, unit, reference_range, is_calculated, formula, formula_variables, calculation_result_type, decimal_places, expected_normal_values, expected_value_flag_map, value_type, expected_value_codes),
@@ -398,7 +465,7 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
             )
           ),
           results(
-            id, order_test_group_id, order_test_id, test_group_id, notes,
+            id, order_test_group_id, order_test_id, test_group_id, notes, report_remark_enabled,
 		            result_values(id, analyte_id, lab_analyte_id, analyte_name, parameter, value, unit, reference_range, flag, verify_note, verify_status, is_hidden_from_report, hidden_reason)
           )
         `)
@@ -458,6 +525,10 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
           order_test_id: null,
           is_section_only: !!otg.test_groups.is_section_only,
           ref_range_ai_config: otg.test_groups.ref_range_ai_config || null,
+          sample_condition_options: normalizeConditionOptions(otg.test_groups.sample_condition_options),
+          default_sample_condition: otg.test_groups.default_sample_condition || null,
+          default_report_remark: otg.test_groups.default_report_remark || null,
+          sample_condition: otg.sample_condition || null,
           analytes: mapAnalytes(otg.test_groups.test_group_analytes, data.results, otg.id, null),
         }));
 
@@ -470,6 +541,10 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
           order_test_id: ot.id,
           is_section_only: !!ot.test_groups.is_section_only,
           ref_range_ai_config: ot.test_groups.ref_range_ai_config || null,
+          sample_condition_options: normalizeConditionOptions(ot.test_groups.sample_condition_options),
+          default_sample_condition: ot.test_groups.default_sample_condition || null,
+          default_report_remark: ot.test_groups.default_report_remark || null,
+          sample_condition: ot.sample_condition || null,
           analytes: mapAnalytes(ot.test_groups.test_group_analytes, data.results, null, ot.id),
         }));
 
@@ -505,6 +580,12 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
             order_test_group_id: m.order_test_group_id || cur.order_test_group_id,
             order_test_id: m.order_test_id || cur.order_test_id,
             is_section_only: m.is_section_only || cur.is_section_only,
+            sample_condition_options: m.sample_condition_options?.length
+              ? m.sample_condition_options
+              : cur.sample_condition_options,
+            default_sample_condition: m.default_sample_condition || cur.default_sample_condition,
+            default_report_remark: m.default_report_remark || cur.default_report_remark,
+            sample_condition: m.sample_condition || cur.sample_condition,
           };
         }
         return acc;
@@ -534,18 +615,54 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
       // A group that also arrives via order_test_groups already has an entry
       // panel — don't give it a second, attach-only one.
       setOutsourcedGroups(outsourced.filter((og) => !merged.some((tg) => tg.test_group_id === og.test_group_id)));
+      const findResultRow = (tg: TestGroup) => (data.results || []).find((r: any) =>
+        (tg.order_test_group_id && r.order_test_group_id === tg.order_test_group_id) ||
+        (tg.order_test_id && r.order_test_id === tg.order_test_id) ||
+        r.test_group_id === tg.test_group_id
+      );
+      // The test group's default remark wins whenever one is configured, so a
+      // change to the master text reaches orders that were entered earlier.
+      // Groups without a default keep whatever was typed for this order.
+      const storedRemarks = Object.fromEntries(
+        merged.map((tg) => [tg.test_group_id, findResultRow(tg)?.notes || ""])
+      );
       const loadedRemarks = Object.fromEntries(
-        merged.map((tg) => {
-          const resultRow = (data.results || []).find((r: any) =>
-            (tg.order_test_group_id && r.order_test_group_id === tg.order_test_group_id) ||
-            (tg.order_test_id && r.order_test_id === tg.order_test_id) ||
-            r.test_group_id === tg.test_group_id
-          );
-          return [tg.test_group_id, resultRow?.notes || ""];
-        })
+        merged.map((tg) => [
+          tg.test_group_id,
+          (tg.default_report_remark || "").trim() || storedRemarks[tg.test_group_id],
+        ])
       );
       setGroupRemarks(loadedRemarks);
-      setInitialGroupRemarks(loadedRemarks);
+      // Compare against what is actually stored, so a group whose default differs
+      // from its saved note is treated as dirty and gets rewritten on submit.
+      setInitialGroupRemarks(storedRemarks);
+
+      // A saved row carries its own toggle; an untouched group starts ticked so a
+      // remark prints unless the technician says otherwise.
+      const loadedRemarkEnabled = Object.fromEntries(
+        merged.map((tg) => {
+          const resultRow = findResultRow(tg);
+          return [tg.test_group_id, resultRow ? resultRow.report_remark_enabled !== false : true];
+        })
+      );
+      setRemarkEnabled(loadedRemarkEnabled);
+      setInitialRemarkEnabled(loadedRemarkEnabled);
+
+      // Prefill from the value stored at collection; fall back to the group default
+      // when it is still one of the configured options. Never invent a value.
+      const loadedConditions = Object.fromEntries(
+        merged
+          .filter((tg) => (tg.sample_condition_options?.length || 0) > 0)
+          .map((tg) => {
+            const options = tg.sample_condition_options || [];
+            const stored = (tg.sample_condition || "").trim();
+            const fallback = (tg.default_sample_condition || "").trim();
+            const selected = stored || (options.includes(fallback) ? fallback : "");
+            return [tg.test_group_id, selected];
+          })
+      );
+      setSampleConditions(loadedConditions);
+      setInitialSampleConditions(loadedConditions);
 
       // Build result ID map from existing result rows
       const resultIdMap = new Map<string, string>();
@@ -647,6 +764,11 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
             unit: a.existing_result?.unit || a.units || "",
             reference: a.existing_result?.reference_range ?? (la != null ? (la.lab_specific_reference_range ?? la.reference_range ?? a.reference_range) : a.reference_range) ?? "",
             flag: a.existing_result?.flag || defaultFlag,
+            // A flag already in the database is not treated as a human override:
+            // rows saved before flag_source was tracked honestly all read
+            // 'manual', so re-entering a value is allowed to correct them. A
+            // deliberate override is re-applied from the flag dropdown.
+            flag_origin: (!a.existing_result?.flag && defaultFlag ? "rule" : undefined) as FlagOrigin | undefined,
             // lab_analytes overrides win for calculated-param fields
             is_calculated: la?.is_calculated != null ? !!la.is_calculated : !!a.is_calculated,
             is_existing: hasExisting,
@@ -721,15 +843,28 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
           if (num !== null) lookup.set(String((a as any).code).toLowerCase(), num);
         }
       }
+      // Temporary diagnostics: what the DB actually returned for each calculated row.
+      console.info('[QuickEntry calc] rows loaded', flat
+        .filter(r => r.is_calculated)
+        .map(r => ({
+          parameter: r.parameter,
+          analyte_id: r.analyte_id,
+          lab_analyte_id: r.lab_analyte_id,
+          calculation_result_type: r.calculation_result_type,
+          formula: r.formula,
+          formula_variables: r.formula_variables,
+          is_existing: r.is_existing,
+        })));
+
       const flatWithCalc = flat.map(r => {
         if (!r.is_calculated || !r.formula || r.is_existing) return r;
         const vars = parseFormulaVars(r.formula_variables);
         const calcVal = evalFormula(r.formula, vars, lookup, loadedDeps, r.analyte_id, r.lab_analyte_id, r.calculation_result_type, r.decimal_places);
         if (!calcVal) return r;
-        const autoFlag = normalizeCalculationResultType(r.calculation_result_type) === 'text'
-          ? ''
-          : calculateFlag(calcVal, r.reference, undefined, undefined, undefined, undefined, undefined, undefined, r.value_type);
-        return { ...r, value: formatIndianNumber(calcVal), flag: autoFlag || r.flag };
+        const resolved = normalizeCalculationResultType(r.calculation_result_type) === 'text'
+          ? null
+          : resolveFlag(calcVal, r.reference, undefined, undefined, undefined, undefined, undefined, undefined, r.value_type);
+        return { ...r, value: formatIndianNumber(calcVal), flag: applyAutoFlag(r, resolved) };
       });
       setRows(flatWithCalc);
     } catch (err) {
@@ -744,10 +879,6 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
   };
 
   // ── Row mutations ───────────────────────────────────────────────────────────
-
-  const setRowField = useCallback((idx: number, field: keyof AnalyteRow, value: string) => {
-    setRows(prev => prev.map((r, i) => i !== idx ? r : { ...r, [field]: value }));
-  }, []);
 
   const toggleHiddenFromReport = useCallback((idx: number) => {
     setRows(prev => prev.map((r, i) => {
@@ -771,7 +902,7 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
           ? applyAnalyteInterfaceConversion(rawValue, r.interface_config, "quick")
           : rawValue;
         const displayValue = formatIndianNumber(convertedValue);
-        const auto = calculateFlag(convertedValue, r.reference, undefined, undefined, undefined, undefined, undefined, undefined, r.value_type);
+        const resolved = resolveFlag(convertedValue, r.reference, undefined, undefined, undefined, undefined, undefined, undefined, r.value_type);
         return {
           ...r,
           value: displayValue,
@@ -779,7 +910,7 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
             isAnalyteInterfaceConversionEnabled(r.interface_config, "quick")
             ? r.interface_config.lims_unit || r.unit
             : r.unit,
-          flag: auto || r.flag,
+          flag: applyAutoFlag(r, resolved),
           interface_conversion_pending: false,
         };
       });
@@ -834,10 +965,10 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
         const vars = parseFormulaVars(r.formula_variables);
         const calcVal = evalFormula(r.formula, vars, lookup, calcDeps, r.analyte_id, r.lab_analyte_id, r.calculation_result_type, r.decimal_places);
         if (!calcVal) return r;
-        const autoFlag = normalizeCalculationResultType(r.calculation_result_type) === 'text'
-          ? ''
-          : calculateFlag(calcVal, r.reference, undefined, undefined, undefined, undefined, undefined, undefined, r.value_type);
-        return { ...r, value: formatIndianNumber(calcVal), flag: autoFlag || r.flag };
+        const resolved = normalizeCalculationResultType(r.calculation_result_type) === 'text'
+          ? null
+          : resolveFlag(calcVal, r.reference, undefined, undefined, undefined, undefined, undefined, undefined, r.value_type);
+        return { ...r, value: formatIndianNumber(calcVal), flag: applyAutoFlag(r, resolved) };
       });
     });
   }, [calcDeps, testGroups]);
@@ -885,10 +1016,10 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
         const vars = parseFormulaVars(r.formula_variables);
         const calcVal = evalFormula(r.formula, vars, lookup, calcDeps, r.analyte_id, r.lab_analyte_id, r.calculation_result_type, r.decimal_places);
         if (!calcVal) return r;
-        const autoFlag = normalizeCalculationResultType(r.calculation_result_type) === 'text'
-          ? ''
-          : calculateFlag(calcVal, r.reference, undefined, undefined, undefined, undefined, undefined, undefined, r.value_type);
-        return { ...r, value: formatIndianNumber(calcVal), flag: autoFlag || r.flag };
+        const resolved = normalizeCalculationResultType(r.calculation_result_type) === 'text'
+          ? null
+          : resolveFlag(calcVal, r.reference, undefined, undefined, undefined, undefined, undefined, undefined, r.value_type);
+        return { ...r, value: formatIndianNumber(calcVal), flag: applyAutoFlag(r, resolved) };
       });
     });
   }, [calcDeps, testGroups, order.patient]);
@@ -1132,6 +1263,7 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
     setSaving(true);
     setMessage(null);
     try {
+      await persistSampleConditions();
 	      const resultValues = valid.map(r => ({
 		        analyte_id: r.analyte_id || null,
 		        lab_analyte_id: r.lab_analyte_id || null,
@@ -1174,6 +1306,55 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
     }
   };
 
+  // ── Sample condition ────────────────────────────────────────────────────────
+
+  // Persists the condition on whichever order row carries this test group.
+  // order_test_groups is the column sample collection writes and
+  // generate-pdf-letterhead reads first; orders booked through the order form
+  // only get order_tests rows, which mirror the same column.
+  const persistSampleConditions = async () => {
+    const changed = testGroups.filter((tg) =>
+      (tg.order_test_group_id || tg.order_test_id) &&
+      (tg.sample_condition_options?.length || 0) > 0 &&
+      (sampleConditions[tg.test_group_id] || "") !== (initialSampleConditions[tg.test_group_id] || "")
+    );
+    if (!changed.length) return;
+
+    const updates = changed.flatMap((tg) => {
+      const value = (sampleConditions[tg.test_group_id] || "").trim() || null;
+      const targets: Promise<any>[] = [];
+      if (tg.order_test_group_id) {
+        targets.push(supabase
+          .from("order_test_groups")
+          .update({ sample_condition: value })
+          .eq("id", tg.order_test_group_id));
+      }
+      // Keep both rows in step when the order has them, so the report picks up
+      // the same value whichever table it reads.
+      if (tg.order_test_id) {
+        targets.push(supabase
+          .from("order_tests")
+          .update({ sample_condition: value })
+          .eq("id", tg.order_test_id));
+      }
+      return targets;
+    });
+
+    const responses = await Promise.all(updates);
+    const failed = responses.find((r) => r?.error);
+    if (failed?.error) throw failed.error;
+
+    setInitialSampleConditions((current) => ({
+      ...current,
+      ...Object.fromEntries(changed.map((tg) => [tg.test_group_id, sampleConditions[tg.test_group_id] || ""])),
+    }));
+    setTestGroups((current) => current.map((tg) =>
+      changed.some((c) => c.test_group_id === tg.test_group_id)
+        ? { ...tg, sample_condition: (sampleConditions[tg.test_group_id] || "").trim() || null }
+        : tg
+    ));
+  };
+
   // ── Submit ──────────────────────────────────────────────────────────────────
 
   // Runs the whole save pipeline and reports whether it succeeded. Kept separate
@@ -1187,7 +1368,13 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
       (groupRemarks[tg.test_group_id] || "").trim() !==
       (initialGroupRemarks[tg.test_group_id] || "").trim()
     );
-    if (!valid.length && !hasSections && !hasRemarks && !remarksChanged) { setMessage({ text: "Enter at least one value or report remark before submitting.", type: "error" }); return false; }
+    const remarkTogglesChanged = testGroups.some((tg) =>
+      (remarkEnabled[tg.test_group_id] !== false) !== (initialRemarkEnabled[tg.test_group_id] !== false)
+    );
+    const conditionsChanged = testGroups.some((tg) =>
+      (sampleConditions[tg.test_group_id] || "") !== (initialSampleConditions[tg.test_group_id] || "")
+    );
+    if (!valid.length && !hasSections && !hasRemarks && !remarksChanged && !remarkTogglesChanged && !conditionsChanged) { setMessage({ text: "Enter at least one value or report remark before submitting.", type: "error" }); return false; }
 
     setSubmitting(true);
     setMessage({ text: "Saving results...", type: "success" });
@@ -1203,9 +1390,15 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
       const existingByKey = new Map<string, string>();
       const verifiedAt = new Date().toISOString();
       const bulkGroups: any[] = [];
+      // Rows whose flag disagrees with their own value + reference range. These
+      // are held back from auto-verification and reported to the operator.
+      const flagConflicts: string[] = [];
 
       // Use pre-loaded analyte_dependencies (loaded at initial data fetch)
       const deps = calcDeps;
+
+      // Report heading depends on this, so write it before the results land.
+      await persistSampleConditions();
 
       // Work with a local mutable copy so AI ref range updates are visible to the save loop below
       let workingRows = [...rows];
@@ -1236,8 +1429,10 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
                 const hit = findResolvedReferenceRange(resolved, r);
                 if (!hit?.used_reference_range) return r;
                 const newRef = hit.used_reference_range;
-                const autoFlag = calculateFlag(r.value, newRef, order.patient?.gender ?? undefined, undefined, undefined, undefined, undefined, undefined, r.value_type);
-                return { ...r, reference: newRef, flag: r.flag || autoFlag || "" };
+                // The range just changed, so the previous verdict is stale by
+                // definition — recompute against the new one.
+                const resolved = resolveFlag(r.value.replace(/,/g, ''), newRef, order.patient?.gender ?? undefined, undefined, undefined, undefined, undefined, undefined, r.value_type);
+                return { ...r, reference: newRef, flag: applyAutoFlag(r, resolved) };
               });
             }
           } catch (aiErr) {
@@ -1251,7 +1446,8 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
       for (const tg of testGroups) {
         const groupRemark = groupRemarks[tg.test_group_id]?.trim() || "";
         const groupRemarkChanged =
-          groupRemark !== (initialGroupRemarks[tg.test_group_id] || "").trim();
+          groupRemark !== (initialGroupRemarks[tg.test_group_id] || "").trim() ||
+          (remarkEnabled[tg.test_group_id] !== false) !== (initialRemarkEnabled[tg.test_group_id] !== false);
         // Build value lookup map for formula evaluation
         const valueLookup = new Map<string, number>();
         for (const a of tg.analytes) {
@@ -1315,7 +1511,7 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
         // The bulk RPC preserves locked rows and inserts only missing analytes.
         const valueRows = toPersist.map(r => {
           const rawVal = r.value.replace(/,/g, '');
-          const autoFlag = r.flag || calculateFlag(
+          const resolved = resolveFlag(
             rawVal,
             r.reference,
             order.patient?.gender ?? undefined,
@@ -1326,11 +1522,27 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
             undefined,
             r.value_type,
           );
+          const finalFlag = applyAutoFlag(r, resolved);
+          // flag_source records how this flag was actually decided. Labelling an
+          // auto flag 'manual' would tell the downstream rule pass to leave a
+          // wrong flag alone (see aiFlagAnalysis skip on manual).
+          const flagSource = r.flag_origin === "manual" && finalFlag === r.flag
+            ? "manual"
+            : r.flag_origin === "rule" && finalFlag === r.flag
+              ? "auto_rule"
+              : resolved.numeric ? "auto_numeric" : "auto_rule";
+          // Last line of defence: a flag that contradicts the value it is saved
+          // with never auto-verifies, it goes to the verification desk instead.
+          const conflict = detectFlagConflict(rawVal, r.reference, finalFlag, {
+            valueType: r.value_type,
+            patientGender: order.patient?.gender ?? undefined,
+          });
+          if (conflict.conflict) flagConflicts.push(`${r.parameter}: ${conflict.message}`);
           // A panel that is not yet locked is rewritten wholesale by the RPC, so
           // an analyte approved earlier in this modal has to carry its approval
           // into the payload or the resave would silently reset it to pending.
           const keepApproved = r.verify_status === "approved";
-          const approve = keepApproved || r.is_hidden_from_report || autoVerifyOnSubmit;
+          const approve = keepApproved || r.is_hidden_from_report || (autoVerifyOnSubmit && !conflict.conflict);
           return {
           analyte_id: r.analyte_id || null,
           lab_analyte_id: r.lab_analyte_id || null,
@@ -1339,14 +1551,18 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
           value: rawVal || null,
           unit: r.unit || "",
           reference_range: r.reference || "",
-	          flag: normalizeResultFlagForSave(autoFlag, rawVal),
-	          flag_source: r.flag ? "manual" : "auto_numeric",
+	          flag: normalizeResultFlagForSave(finalFlag, rawVal),
+	          flag_source: flagSource,
 	          is_auto_calculated: r.is_calculated,
           verify_status: approve ? "approved" : "pending",
           verified: approve,
 	          verified_by: approve ? safeUuid(currentUser?.id) : null,
           verified_at: approve ? verifiedAt : null,
-          verify_note: r.is_hidden_from_report ? (r.hidden_reason || "Hidden from report") : (autoVerifyOnSubmit ? "Auto-verified during result entry." : null),
+          verify_note: r.is_hidden_from_report
+            ? (r.hidden_reason || "Hidden from report")
+            : conflict.conflict
+              ? `Flag needs review — ${conflict.message}`
+              : (autoVerifyOnSubmit ? "Auto-verified during result entry." : null),
           is_hidden_from_report: !!r.is_hidden_from_report,
           hidden_reason: r.is_hidden_from_report ? (r.hidden_reason || "Hidden from report") : null,
           };
@@ -1388,6 +1604,20 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
         }).catch(e => console.warn("Inventory auto-consume skipped:", e));
       }
 
+      // The bulk RPC owns the remark text; the print toggle is written here so
+      // the SQL function stays untouched. Two statements at most.
+      const remarkOn: string[] = [];
+      const remarkOff: string[] = [];
+      for (const saved of (bulkSave as any)?.result_ids || []) {
+        if (!saved.result_id) continue;
+        (remarkEnabled[saved.test_group_id] !== false ? remarkOn : remarkOff).push(saved.result_id);
+      }
+      await Promise.all([
+        ...(remarkOn.length ? [supabase.from("results").update({ report_remark_enabled: true }).in("id", remarkOn)] : []),
+        ...(remarkOff.length ? [supabase.from("results").update({ report_remark_enabled: false }).in("id", remarkOff)] : []),
+      ]);
+      setInitialRemarkEnabled({ ...remarkEnabled });
+
       try {
         setMessage({ text: "Finalizing flags and reference details...", type: "success" });
         const { runAIFlagAnalysis } = await import("../../utils/aiFlagAnalysis");
@@ -1410,6 +1640,13 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
         .map(r => r.current?.save());
       await Promise.all(sectionSaves);
 
+      if (flagConflicts.length) {
+        setMessage({
+          text: `Results saved. ${flagConflicts.length} flag${flagConflicts.length > 1 ? "s" : ""} left pending for verification — ${flagConflicts.join("; ")}`,
+          type: "error",
+        });
+        return true;
+      }
       setMessage({ text: autoVerifyOnSubmit ? "Results saved and auto-verified!" : "Results saved!", type: "success" });
       return true;
     } catch (err: any) {
@@ -1432,7 +1669,23 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
   // one pass. Section-only panels have no analytes, so they are verified on the
   // results row directly.
   const handleApproveWholeOrder = async () => {
-    if (!window.confirm(`Approve every result on this order for ${order.patient_name}? Saved values will be verified and the report becomes releasable.`)) return;
+    // Blanket approval bypasses the per-row auto-verify gate, so any flag that
+    // contradicts its reference range is named in the confirmation instead.
+    const conflicts = rows
+      .filter(r => r.value.trim())
+      .map(r => ({
+        row: r,
+        conflict: detectFlagConflict(r.value.replace(/,/g, ''), r.reference, r.flag, {
+          valueType: r.value_type,
+          patientGender: order.patient?.gender ?? undefined,
+        }),
+      }))
+      .filter(x => x.conflict.conflict)
+      .map(x => `• ${x.row.parameter}: ${x.conflict.message}`);
+    const conflictWarning = conflicts.length
+      ? `\n\nThese flags disagree with their reference range:\n${conflicts.join("\n")}\n`
+      : "";
+    if (!window.confirm(`Approve every result on this order for ${order.patient_name}? Saved values will be verified and the report becomes releasable.${conflictWarning}`)) return;
 
     const hasPendingEntry = rows.some(r => !r.is_calculated && isEditableRow(r) && (r.value.trim() || r.is_hidden_from_report));
     if (hasPendingEntry) {
@@ -1636,8 +1889,21 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
     const hasDropdown = row.expected_normal_values.length > 0;
     const hasDraftValue = row.value.trim() !== "";
     const isDefault = !!row.is_default;
-    const flagLabel = flagOptions.find(f => f.value === row.flag);
+    // The engine can decide a flag the lab never configured (typically 'A' on a
+    // Positive qualitative result). Reports suppress that letter, but the entry
+    // screen must still show what is actually stored — a <select> whose value is
+    // missing from its options silently displays the wrong flag.
+    const rowFlagOptions = row.flag && !flagOptions.some(f => f.value === row.flag)
+      ? [...flagOptions, { value: row.flag, label: getFlagDescription(normalizeFlagCode(row.flag)) }]
+      : flagOptions;
+    const flagLabel = rowFlagOptions.find(f => f.value === row.flag);
     const flagColor = row.flag === "" ? "text-green-700" : row.flag?.includes("critical") ? "text-red-700 font-semibold" : row.flag === "H" || row.flag === "L" ? "text-orange-600 font-medium" : "text-gray-700";
+    // Warn in place when the flag on screen disagrees with the value and range
+    // on the same row — the operator can fix it before it ever reaches a report.
+    const flagConflict = detectFlagConflict(row.value.replace(/,/g, ''), row.reference, row.flag, {
+      valueType: row.value_type,
+      patientGender: order.patient?.gender ?? undefined,
+    });
     const isApproved = row.verify_status === "approved";
     const busy = approvingKey === row.result_value_id;
     // Row bg: default-prefilled = amber tint, manually entered = green tint, blank = plain
@@ -1722,7 +1988,7 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
               onChange={e => {
                 const val = e.target.value;
                 const autoFlag = row.expected_value_flag_map[val] ?? "";
-                setRows(prev => prev.map((r, i) => i !== globalIdx ? r : { ...r, value: val, flag: autoFlag, is_default: false }));
+                setRows(prev => prev.map((r, i) => i !== globalIdx ? r : { ...r, value: val, flag: autoFlag, flag_origin: "rule", is_default: false }));
               }}
               onKeyDown={e => {
                 // Quick code resolution: e.g. pressing "1" selects "Non-Reactive"
@@ -1732,7 +1998,7 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
                   if (resolved) {
                     e.preventDefault();
                     const autoFlag = row.expected_value_flag_map[resolved] ?? "";
-                    setRows(prev => prev.map((r, i) => i !== globalIdx ? r : { ...r, value: resolved, flag: autoFlag, is_default: false }));
+                    setRows(prev => prev.map((r, i) => i !== globalIdx ? r : { ...r, value: resolved, flag: autoFlag, flag_origin: "rule", is_default: false }));
                     focusNext(globalIdx);
                     return;
                   }
@@ -1832,13 +2098,26 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
           ) : (
             <select
               value={row.flag}
-              onChange={e => setRowField(globalIdx, "flag", e.target.value)}
+              onChange={e => {
+                // An explicit pick is the one flag the recalculation respects.
+                const picked = e.target.value;
+                setRows(prev => prev.map((r, i) => i !== globalIdx ? r : { ...r, flag: picked, flag_origin: "manual" }));
+              }}
               className={`w-full px-1.5 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-1 focus:ring-green-400 ${flagColor}`}
             >
-              {flagOptions.map(opt => (
+              {rowFlagOptions.map(opt => (
                 <option key={opt.value} value={opt.value}>{opt.label}</option>
               ))}
             </select>
+          )}
+          {flagConflict.conflict && (
+            <div
+              className="mt-1 flex items-start gap-1 text-[11px] leading-tight text-amber-700"
+              title={flagConflict.message}
+            >
+              <AlertTriangle className="h-3 w-3 mt-px shrink-0" />
+              <span>{flagConflict.expected ? `Range says ${flagConflict.expected}` : "Range says normal"} — will not auto-verify</span>
+            </div>
           )}
         </td>
         <td className="px-4 py-2">
@@ -2028,6 +2307,36 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
                   </div>
                 )}
 
+                {/* Sample condition — the choice made at collection, editable here
+                    and printed above the group's results when the test group's
+                    print options enable "Show Sample Condition". */}
+                {(tg.sample_condition_options?.length || 0) > 0 && (
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-blue-100 bg-blue-50/60 px-5 py-2">
+                    <label className="text-xs font-semibold uppercase tracking-wide text-blue-800">
+                      Sample Condition
+                    </label>
+                    <select
+                      value={sampleConditions[tg.test_group_id] || ""}
+                      onChange={(event) => setSampleConditions((current) => ({
+                        ...current,
+                        [tg.test_group_id]: event.target.value,
+                      }))}
+                      disabled={!tg.order_test_group_id && !tg.order_test_id}
+                      className="min-w-[200px] rounded border border-blue-200 bg-white px-2 py-1 text-sm text-gray-800 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100 disabled:bg-gray-100 disabled:text-gray-500"
+                    >
+                      <option value="">Not specified</option>
+                      {(tg.sample_condition_options || []).map((option) => (
+                        <option key={option} value={option}>{option}</option>
+                      ))}
+                    </select>
+                    <span className="text-xs text-blue-700">
+                      {tg.order_test_group_id || tg.order_test_id
+                        ? "Saved with the results and printed above this test group."
+                        : "Read-only — this test is not linked to a row on the order."}
+                    </span>
+                  </div>
+                )}
+
                 {groupRows.length > 0 && (
                   <table className="w-full text-sm table-fixed">
                     {renderTableHead(false)}
@@ -2099,9 +2408,23 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
                 )}
 
                 <div className="border-t border-amber-100 bg-amber-50/40 px-4 py-3">
-                  <label className="mb-1 block text-xs font-semibold uppercase tracking-wide text-amber-800">
-                    Report Remarks
-                  </label>
+                  <div className="mb-1 flex flex-wrap items-center gap-x-3 gap-y-1">
+                    <span className="text-xs font-semibold uppercase tracking-wide text-amber-800">
+                      Report Remarks
+                    </span>
+                    <label className="flex cursor-pointer items-center gap-1.5 text-xs text-amber-800">
+                      <input
+                        type="checkbox"
+                        checked={remarkEnabled[tg.test_group_id] !== false}
+                        onChange={(event) => setRemarkEnabled((current) => ({
+                          ...current,
+                          [tg.test_group_id]: event.target.checked,
+                        }))}
+                        className="h-3.5 w-3.5 cursor-pointer accent-amber-600"
+                      />
+                      Print on report
+                    </label>
+                  </div>
                   <textarea
                     value={groupRemarks[tg.test_group_id] || ""}
                     onChange={(event) => setGroupRemarks((current) => ({
@@ -2111,10 +2434,14 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
                     rows={2}
                     maxLength={2000}
                     placeholder="Optional remark printed below this test group in the final report"
-                    className="w-full resize-y rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm text-gray-800 outline-none focus:border-amber-400 focus:ring-2 focus:ring-amber-100"
+                    className={`w-full resize-y rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm outline-none focus:border-amber-400 focus:ring-2 focus:ring-amber-100 ${
+                      remarkEnabled[tg.test_group_id] === false ? "text-gray-400 line-through" : "text-gray-800"
+                    }`}
                   />
                   <p className="mt-1 text-xs text-amber-700">
-                    This is report-visible and is separate from analyte and verification notes.
+                    {remarkEnabled[tg.test_group_id] === false
+                      ? "Kept for reference only — this remark will not appear on the report."
+                      : "This is report-visible and is separate from analyte and verification notes."}
                   </p>
                 </div>
 

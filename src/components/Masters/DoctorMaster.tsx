@@ -8,6 +8,7 @@ interface DoctorFormData {
   name: string;
   license_number: string;
   specialization: string;
+  qualification: string;
   phone: string;
   hospital_phone: string;
   email: string;
@@ -21,6 +22,7 @@ const initialFormData: DoctorFormData = {
   name: '',
   license_number: '',
   specialization: '',
+  qualification: '',
   phone: '',
   hospital_phone: '',
   email: '',
@@ -103,6 +105,7 @@ const DoctorMaster: React.FC = () => {
       name: doctor.name,
       license_number: doctor.license_number || '',
       specialization: doctor.specialization || '',
+      qualification: doctor.qualification || '',
       phone: doctor.phone || '',
       hospital_phone: doctor.hospital_phone || '',
       email: doctor.email || '',
@@ -260,6 +263,23 @@ const DoctorMaster: React.FC = () => {
                     className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                     placeholder="Dr. John Smith"
                   />
+                </div>
+
+                {/* Degree / Qualification — printed under the doctor name on reports */}
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    Degree / Qualification
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.qualification}
+                    onChange={(e) => setFormData({ ...formData, qualification: e.target.value })}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    placeholder="MBBS, MD (Pathology)"
+                  />
+                  <p className="mt-1 text-xs text-gray-500">
+                    Shown below the doctor name in the report patient info block.
+                  </p>
                 </div>
 
                 {/* License Number */}
@@ -472,6 +492,9 @@ const DoctorMaster: React.FC = () => {
                           </div>
                           <div className="ml-4">
                             <div className="text-sm font-medium text-gray-900">{doctor.name}</div>
+                            {doctor.qualification && (
+                              <div className="text-xs text-gray-600">{doctor.qualification}</div>
+                            )}
                             {doctor.license_number && (
                               <div className="text-sm text-gray-500">License: {doctor.license_number}</div>
                             )}

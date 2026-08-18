@@ -55,6 +55,8 @@ interface Analyte {
   formulaVariables?: string[];
   formulaDescription?: string;
   calculation_result_type?: 'numeric' | 'text';
+  /** camelCase shape used by the Tests page analyte list */
+  calculationResultType?: 'numeric' | 'text';
   // Value type and identification
   value_type?: string;
   code?: string;
@@ -103,7 +105,9 @@ const AnalyteForm: React.FC<AnalyteFormProps> = ({ onClose, onSubmit, analyte, a
     formula: analyte?.formula || '',
     formulaVariables: analyte?.formulaVariables?.join(', ') || '',
     formulaDescription: analyte?.formulaDescription || '',
-    calculationResultType: analyte?.calculation_result_type || 'numeric',
+    // Accept either shape — the Tests page passes camelCase, so reading only the
+    // snake_case key silently reset text-rule analytes back to numeric on save.
+    calculationResultType: analyte?.calculation_result_type || analyte?.calculationResultType || 'numeric',
     // Value type and identification
     value_type: analyte?.value_type || 'numeric',
     code: analyte?.code || '',

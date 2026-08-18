@@ -1,37 +1,24 @@
 import React, { useState } from 'react';
 import { Droplet, Plus, Trash2, RotateCcw } from 'lucide-react';
+import { getDefaultSampleCapColor, getSampleContainerLabel } from '../Common/SampleTypeIndicator';
 
-// Default sample type colors - same as in SampleTypeIndicator
-export const DEFAULT_SAMPLE_TYPE_COLORS: Record<string, { color: string; label: string }> = {
-  'red': { color: '#DC2626', label: 'Red Top (Plain)' },
-  'purple': { color: '#9333EA', label: 'Purple/Lavender (EDTA)' },
-  'edta': { color: '#9333EA', label: 'EDTA Blood' },
-  'green': { color: '#16A34A', label: 'Green Top (Heparin)' },
-  'blue': { color: '#2563EB', label: 'Blue Top (Citrate)' },
-  'yellow': { color: '#EAB308', label: 'Yellow Top (SST)' },
-  'gold': { color: '#F59E0B', label: 'Gold Top (SST)' },
-  'serum': { color: '#F59E0B', label: 'Serum' },
-  'gray': { color: '#6B7280', label: 'Gray Top (Fluoride)' },
-  'urine': { color: '#EAB308', label: 'Urine' },
-  'stool': { color: '#92400E', label: 'Stool' },
-  'plasma': { color: '#16A34A', label: 'Plasma' },
-  'blood': { color: '#DC2626', label: 'Whole Blood' },
-  'swab': { color: '#9CA3AF', label: 'Swab' },
-  'csf': { color: '#6B7280', label: 'CSF' },
-};
-
-// Common sample types that labs typically use
+// Exact `sample_type` enum values that carry a physical container. Using the
+// full value (not a keyword like 'plasma') means the override is matched
+// exactly, so colouring 'Plasma' cannot bleed onto 'Fluoride Plasma'.
 const COMMON_SAMPLE_TYPES = [
-  'Serum',
   'EDTA Blood',
   'Whole Blood',
+  'Capillary Blood',
+  'Serum',
   'Plasma',
+  'Fluoride Plasma',
+  'Citrated Plasma',
   'Urine',
   'Stool',
   'CSF',
+  'Sputum',
   'Swab',
-  'Citrate',
-  'Fluoride',
+  'Tissue',
 ];
 
 interface SampleTypeColorsConfigProps {
@@ -73,10 +60,7 @@ export const SampleTypeColorsConfig: React.FC<SampleTypeColorsConfigProps> = ({
     onChange({});
   };
 
-  const getDefaultColor = (sampleType: string): string => {
-    const key = sampleType.toLowerCase();
-    return DEFAULT_SAMPLE_TYPE_COLORS[key]?.color || '#DC2626';
-  };
+  const getDefaultColor = (sampleType: string): string => getDefaultSampleCapColor(sampleType);
 
   const configuredTypes = Object.keys(value);
 
@@ -147,7 +131,7 @@ export const SampleTypeColorsConfig: React.FC<SampleTypeColorsConfigProps> = ({
               (t) => !configuredTypes.includes(t.toLowerCase())
             ).map((type) => (
               <option key={type} value={type}>
-                {type} (default: {getDefaultColor(type)})
+                {type} (default: {getSampleContainerLabel(type)} {getDefaultColor(type)})
               </option>
             ))}
             <option value="__custom">-- Custom type --</option>

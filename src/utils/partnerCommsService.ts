@@ -293,6 +293,77 @@ export async function fetchAccountUnreadCount(accountId: string): Promise<number
     return count || 0;
 }
 
+/** One row of the lab-side unified partner inbox. */
+export interface PartnerThreadSummary {
+    accountId: string;
+    lastMessageAt: string | null;
+    lastMessagePreview: string;
+    lastMessageFrom: PartnerSide | null;
+    unreadCount: number;
+}
+
+const previewOf = (row: any): string => {
+    const body = String(row?.body || '').trim();
+    if (body) return body.replace(/\s+/g, ' ').slice(0, 140);
+    const attachments = normalizeAttachments(row?.attachments);
+    if (attachments.length === 1) return attachments[0].name;
+    if (attachments.length > 1) return `${attachments.length} attachments`;
+    return '';
+};
+
+/**
+ * Last message + unread count per account, for the unified inbox in Account
+ * Master. The preview comes from a recent window of messages (enough to cover
+ * every account that has talked lately); unread counts come from the exact
+ * count query so a long backlog is never under-reported.
+ */
+export async function fetchLabThreadSummaries(
+    labId: string,
+    recentWindow = 500
+): Promise<Record<string, PartnerThreadSummary>> {
+    const [recent, unreadCounts] = await Promise.all([
+        supabase
+            .from('account_messages')
+            .select('account_id, sender_type, body, attachments, created_at')
+            .eq('lab_id', labId)
+            .order('created_at', { ascending: false })
+            .limit(recentWindow),
+        fetchLabUnreadCounts(labId),
+    ]);
+
+    if (recent.error) {
+        console.warn('Could not load partner threads:', recent.error.message);
+    }
+
+    const summaries: Record<string, PartnerThreadSummary> = {};
+
+    // Newest first, so the first row seen for an account is its latest message
+    (recent.data || []).forEach((row: any) => {
+        if (summaries[row.account_id]) return;
+        summaries[row.account_id] = {
+            accountId: row.account_id,
+            lastMessageAt: row.created_at,
+            lastMessagePreview: previewOf(row),
+            lastMessageFrom: row.sender_type === 'account' ? 'account' : 'lab',
+            unreadCount: unreadCounts[row.account_id] || 0,
+        };
+    });
+
+    // An account whose only unread messages fall outside the window still belongs in the inbox
+    Object.entries(unreadCounts).forEach(([accountId, count]) => {
+        if (summaries[accountId]) return;
+        summaries[accountId] = {
+            accountId,
+            lastMessageAt: null,
+            lastMessagePreview: '',
+            lastMessageFrom: 'account',
+            unreadCount: count,
+        };
+    });
+
+    return summaries;
+}
+
 /** Live updates for one thread. Returns an unsubscribe function. */
 export function subscribeToAccountThread(accountId: string, onChange: () => void): () => void {
     const channel = supabase
@@ -305,6 +376,35 @@ export function subscribeToAccountThread(accountId: string, onChange: () => void
                 table: 'account_messages',
                 filter: `account_id=eq.${accountId}`,
             },
+            () => onChange()
+        )
+        .subscribe();
+
+    return () => {
+        supabase.removeChannel(channel);
+    };
+}
+
+// Two screens can watch the same lab at once (the inbox on top of Account
+// Master), and one socket cannot join the same topic twice
+let labActivityChannelSeq = 0;
+
+/**
+ * Live updates across every partner thread and material request of a lab, for
+ * the unified inbox badges. Returns an unsubscribe function.
+ */
+export function subscribeToLabPartnerActivity(labId: string, onChange: () => void): () => void {
+    labActivityChannelSeq += 1;
+    const channel = supabase
+        .channel(`lab-partner-activity-${labId}-${labActivityChannelSeq}`)
+        .on(
+            'postgres_changes',
+            { event: '*', schema: 'public', table: 'account_messages', filter: `lab_id=eq.${labId}` },
+            () => onChange()
+        )
+        .on(
+            'postgres_changes',
+            { event: '*', schema: 'public', table: 'account_material_requests', filter: `lab_id=eq.${labId}` },
             () => onChange()
         )
         .subscribe();

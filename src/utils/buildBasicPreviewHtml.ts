@@ -10,6 +10,12 @@
  */
 
 import { formatAnalyteDisplayValue } from './resultValueFormat';
+import {
+  flagLegendText,
+  flagSymbolForReport,
+  resolveConfiguredFlagCodes,
+  type LabFlagOption,
+} from './reportFlagDisplay';
 
 export interface PreviewAnalyte {
   parameter: string;
@@ -50,6 +56,10 @@ export interface PreviewTestGroup {
   groupInterpretation?: string | null;
   /** Per-group print_options overrides (test_groups.print_options); wins over the top-level printOptions. */
   printOptions?: Record<string, unknown> | null;
+  /** test_groups.sample_type — printed as "Specimen: …" when showSampleType is on. */
+  sampleType?: string | null;
+  /** order_test_groups.sample_condition — printed as "Condition: …" when showSampleCondition is on. */
+  sampleCondition?: string | null;
 }
 
 export interface PreviewSection {
@@ -79,6 +89,13 @@ export interface BuildBasicPreviewParams {
   signatoryImageUrl?: string;
   verificationUrl?: string;
   printOptions?: Record<string, unknown>;
+  /**
+   * The lab's Result Flag Options exactly as configured (labs.flag_options) —
+   * not merged with defaults. Only these letters get printed beside a value; a
+   * verdict the lab has not configured still styles the value, it just prints
+   * no letter. Omit to print the engine's full vocabulary.
+   */
+  labFlagOptions?: LabFlagOption[] | null;
   pdfLayoutSettings?: Record<string, unknown>;
   printLayoutMode?: "standard" | "compact";
   compactPlan?: {
@@ -113,16 +130,6 @@ function normalizeFlag(flag?: string | null): string {
     return "critical_low";
   if (["c", "critical", "crit"].includes(raw)) return "critical";
   if (["a", "abnormal", "abn", "pos", "positive"].includes(raw)) return "abnormal";
-  return "";
-}
-
-function getFlagSymbolText(canonical: string): string {
-  if (!canonical || canonical === "normal") return "";
-  if (canonical === "high") return "H";
-  if (canonical === "low") return "L";
-  if (canonical === "critical_high") return "H*";
-  if (canonical === "critical_low") return "L*";
-  if (canonical === "abnormal") return "A";
   return "";
 }
 
@@ -274,6 +281,37 @@ function formatNarrativeHtml(rawContent: string): string {
 }
 
 /** Group-level forceTableLayout wins over the lab-level value; null means auto-detect. */
+function resolveBooleanOption(
+  key: string,
+  groupOptions: Record<string, unknown> | null | undefined,
+  labOptions: Record<string, unknown> | null | undefined,
+): boolean {
+  for (const opts of [groupOptions, labOptions]) {
+    if (opts && typeof opts[key] === "boolean") return opts[key] as boolean;
+  }
+  return false;
+}
+
+/**
+ * "Specimen: …" / "Condition: …" subtitle lines under a group title.
+ * Mirrors generateBasicDefaultTemplateHtml() in generate-pdf-letterhead, which
+ * gates them on the showSampleType / showSampleCondition print options.
+ */
+function buildGroupSubtitleHtml(
+  group: PreviewTestGroup,
+  labOptions: Record<string, unknown> | null | undefined,
+): string {
+  const sampleType = String(group.sampleType || "").trim();
+  const sampleCondition = String(group.sampleCondition || "").trim();
+  const specimen = sampleType && resolveBooleanOption("showSampleType", group.printOptions, labOptions)
+    ? `<div class="center-subtitle">Specimen: ${escapeHtml(sampleType)}</div>`
+    : "";
+  const condition = sampleCondition && resolveBooleanOption("showSampleCondition", group.printOptions, labOptions)
+    ? `<div class="center-subtitle">Condition: ${escapeHtml(sampleCondition)}</div>`
+    : "";
+  return `${specimen}${condition}`;
+}
+
 function resolveForceTableLayout(
   groupOptions: Record<string, unknown> | null | undefined,
   labOptions: Record<string, unknown> | null | undefined,
@@ -345,6 +383,180 @@ function formatBasicWidth(value: number): string {
   return `${Number(value.toFixed(2))}%`;
 }
 
+/**
+ * Client-side paginator injected into the preview document.
+ *
+ * The preview emits one `.preview-page` box per group (plus one for report
+ * sections). A box is `min-height: 297mm`, so content longer than a page simply
+ * made the box taller: the patient header stayed at the very top and the footer
+ * trailed after all the content instead of sitting at a page bottom. The PDF does
+ * not have this problem because PDF.co paginates natively.
+ *
+ * After load (images included, so heights are final) this walks each overflowing
+ * page and reflows its content into real page boxes, cloning the patient header
+ * onto each one. Block-level text (p, li, headings, table rows) is never split
+ * mid-element — an element that does not fit moves to the next page whole.
+ */
+const PAGINATOR_SCRIPT = `<script>
+(function () {
+  // Never broken across a page boundary — moved whole to the next page instead.
+  var ATOMIC = "tr,td,th,img,svg,p,li,h1,h2,h3,h4,h5,h6,.center-title,.narrative-kv-row,.report-footer,.report-disclaimer";
+  var MAX_PAGES = 80; // runaway guard
+  // Printing maps A4 to 1122.5px while the on-screen probe reports 1123px, so a box
+  // packed flush to the screen height spills a fraction onto the next sheet and the
+  // trailing "break-after: page" then emits a blank one. Pack a little short of the
+  // page so the printed box always clears the boundary.
+  var SAFETY = 12;
+
+  function pageHeightPx() {
+    var probe = document.createElement("div");
+    probe.style.cssText = "position:absolute;visibility:hidden;top:0;left:0;height:297mm;";
+    document.body.appendChild(probe);
+    var h = probe.offsetHeight;
+    probe.parentNode.removeChild(probe);
+    return h;
+  }
+
+  function isAtomic(node) {
+    return node.nodeType !== 1 || !node.matches || node.matches(ATOMIC);
+  }
+
+  function isTitle(node) {
+    if (!node || node.nodeType !== 1) return false;
+    if (node.classList && node.classList.contains("center-title")) return true;
+    return /^H[1-6]$/.test(node.tagName);
+  }
+
+  function paginate(srcPage, H) {
+    var LIMIT = H - SAFETY;
+    var touched = [srcPage];
+
+    // The page box is min-height:297mm, so offsetHeight is pinned at a full page and
+    // cannot reveal how much room is left. Suppress it while measuring so heights
+    // report actual content, and restore it once the reflow is done.
+    function unpin(page) { page.style.minHeight = "0"; }
+    function repin(page) { page.style.minHeight = ""; }
+
+    unpin(srcPage);
+    if (srcPage.offsetHeight <= LIMIT) { repin(srcPage); return; } // already fits
+
+    var kids = Array.prototype.slice.call(srcPage.children);
+    var header = kids.filter(function (n) {
+      return n.classList && n.classList.contains("preview-page-header");
+    })[0] || null;
+    var headerHtml = header ? header.outerHTML : "";
+    var tail = kids.filter(function (n) {
+      return n.classList &&
+        (n.classList.contains("report-footer") || n.classList.contains("report-disclaimer"));
+    });
+    var content = kids.filter(function (n) {
+      return n !== header && tail.indexOf(n) === -1;
+    });
+
+    // Detach everything but the header; the footer is re-attached to the last page.
+    tail.concat(content).forEach(function (n) { srcPage.removeChild(n); });
+
+    var cur = srcPage;
+    var made = 0;
+
+    function overflows() { return cur.offsetHeight > LIMIT; }
+
+    // Start a fresh page and rebuild the wrapper chain (e.g. .test-results,
+    // .narrative-body) so a split container continues with the same styling.
+    function newPage(host) {
+      var np = document.createElement("div");
+      np.className = srcPage.className;
+      unpin(np);
+      touched.push(np);
+      if (headerHtml) np.insertAdjacentHTML("beforeend", headerHtml);
+      cur.parentNode.insertBefore(np, cur.nextSibling);
+      cur = np;
+      made++;
+
+      var chain = [];
+      var n = host;
+      while (n && n.classList && !n.classList.contains("preview-page")) {
+        chain.unshift(n);
+        n = n.parentNode;
+      }
+      var parent = np;
+      chain.forEach(function (w) {
+        var clone = w.cloneNode(false);
+        parent.appendChild(clone);
+        parent = clone;
+      });
+      return parent;
+    }
+
+    // Places nodes into host, breaking to new pages as needed. Returns the host
+    // at this nesting level on whichever page we ended up on.
+    function flow(nodes, host) {
+      for (var i = 0; i < nodes.length; i++) {
+        var n = nodes[i];
+        host.appendChild(n);
+        if (!overflows() || made >= MAX_PAGES) continue;
+
+        if (!isAtomic(n) && n.children.length > 0) {
+          // Split the container: keep it as the opening fragment, reflow its children.
+          var inner = Array.prototype.slice.call(n.childNodes);
+          while (n.firstChild) n.removeChild(n.firstChild);
+          var endHost = flow(inner, n);
+          host = endHost.parentNode || host;
+          continue;
+        }
+
+        // Unsplittable — move it to a new page, dragging any heading that would
+        // otherwise be stranded alone at the bottom of the page we are leaving.
+        host.removeChild(n);
+        var orphan = isTitle(host.lastElementChild) ? host.lastElementChild : null;
+        if (orphan) host.removeChild(orphan);
+        host = newPage(host);
+        if (orphan) host.appendChild(orphan);
+        host.appendChild(n);
+      }
+      return host;
+    }
+
+    flow(content, srcPage);
+
+    // The disclaimer + signature footer go on the last page, but only if they still
+    // fit there — appending them blind was pushing the footer onto an extra sheet.
+    tail.forEach(function (n) { cur.appendChild(n); });
+    if (tail.length && overflows() && made < MAX_PAGES) {
+      tail.forEach(function (n) { n.parentNode.removeChild(n); });
+      var footHost = newPage(cur);
+      tail.forEach(function (n) { footHost.appendChild(n); });
+    }
+
+    touched.forEach(function (page) {
+      repin(page);
+      // Marks a box whose content is known to fit inside SAFETY of a page, which
+      // lets the print stylesheet pin it to an exact sheet (see .preview-paged).
+      page.classList.add("preview-paged");
+    });
+  }
+
+  function paginateAll() {
+    var H = pageHeightPx();
+    if (!H) return;
+    Array.prototype.slice.call(document.querySelectorAll(".preview-page"))
+      .forEach(function (page) {
+        try { paginate(page, H); } catch (e) { /* leave the page unpaginated */ }
+      });
+    // Safety net: never leave a page with measurement min-height still suppressed.
+    Array.prototype.slice.call(document.querySelectorAll(".preview-page"))
+      .forEach(function (page) {
+        if (page.style.minHeight === "0" || page.style.minHeight === "0px") {
+          page.style.minHeight = "";
+        }
+      });
+  }
+
+  if (document.readyState === "complete") paginateAll();
+  else window.addEventListener("load", paginateAll);
+})();
+<\/script>`;
+
 export function buildBasicPreviewHtml(params: BuildBasicPreviewParams): string {
   const {
     orderId = "",
@@ -365,6 +577,7 @@ export function buildBasicPreviewHtml(params: BuildBasicPreviewParams): string {
     signatoryImageUrl = "",
     verificationUrl = "",
     printOptions = {},
+    labFlagOptions = null,
     pdfLayoutSettings = {},
     printLayoutMode = "standard",
     compactPlan = {},
@@ -382,6 +595,21 @@ export function buildBasicPreviewHtml(params: BuildBasicPreviewParams): string {
   const patientInfoBold = (printOptions.patientInfoBold as boolean) ?? false;
   // Draws a vertical rule between the two patient-info column pairs.
   const patientInfoColumnDivider = (printOptions.patientInfoColumnDivider as boolean) ?? false;
+  // Patient info header geometry — share of the row given to the LEFT label+value
+  // pair, and the share of each pair taken by its label. Defaults (50 / 30)
+  // reproduce the historical fixed 15% / 35% layout.
+  const patientInfoLeftPct = Math.max(25, Math.min(75, Number(printOptions.patientInfoLeftPct ?? 50)));
+  const patientInfoLabelPct = Math.max(15, Math.min(60, Number(printOptions.patientInfoLabelPct ?? 30)));
+  const patientInfoRightPct = 100 - patientInfoLeftPct;
+  const patientInfoWidths = {
+    label1: Number((patientInfoLeftPct * patientInfoLabelPct / 100).toFixed(2)),
+    value1: Number((patientInfoLeftPct * (100 - patientInfoLabelPct) / 100).toFixed(2)),
+    label2: Number((patientInfoRightPct * patientInfoLabelPct / 100).toFixed(2)),
+    value2: Number((patientInfoRightPct * (100 - patientInfoLabelPct) / 100).toFixed(2)),
+  };
+  // "TEST REPORT" heading in the header bar (the barcode itself is PDF-only).
+  const showReportTitle = printOptions.showReportTitle !== false;
+  const reportTitleBarPadding = Math.max(0, Math.min(10, Number(printOptions.reportTitleBarPadding ?? 4)));
   const underlineAbnormal = (printOptions.underlineAbnormalValues as boolean) ?? false;
   const abnormalDecoration = underlineAbnormal
     ? "text-decoration: underline !important; text-underline-offset: 2px !important;"
@@ -389,8 +617,16 @@ export function buildBasicPreviewHtml(params: BuildBasicPreviewParams): string {
   const sectionHeaderInline = (printOptions.sectionHeaderInline as boolean) ?? true;
   const flagSymbol = (printOptions.flagSymbol as string) ?? "none";
   const showFlagLegend = (printOptions.showFlagLegend as boolean) ?? false;
+  // Letters this lab prints. A verdict outside the list (typically 'A' on a lab
+  // that only configured High/Low) still styles the value — it just has no letter.
+  const allowedFlagCodes = resolveConfiguredFlagCodes(labFlagOptions);
   // Exact gap in px between the H/L symbol and the value (0-12, default 4)
   const flagGapPx = Math.max(0, Math.min(12, Number(printOptions.flagGapPx ?? 4)));
+  // Vertical padding on every result cell — the gap between two analyte rows is twice
+  // this value (0-10, default 2 = the historical basic-template spacing).
+  const analyteRowSpacing = Math.max(0, Math.min(10, Number(printOptions.analyteRowSpacing ?? 2)));
+  // Bottom margin of each test-group block — the gap before the next group (0-40, default 14).
+  const testGroupSpacing = Math.max(0, Math.min(40, Number(printOptions.testGroupSpacing ?? 14)));
   const calcMarker = (printOptions.calcMarker as string) ?? "cal";
   const flagAsterisk = (printOptions.flagAsterisk as boolean) ?? false;
   const flagAsteriskCritical = (printOptions.flagAsteriskCritical as boolean) ?? false;
@@ -461,6 +697,8 @@ export function buildBasicPreviewHtml(params: BuildBasicPreviewParams): string {
 		  break-after: page; page-break-after: always;
 		}
 	.preview-page:last-child { margin-bottom: 0; break-after: auto; page-break-after: auto; }
+	/* Repeated on every paginated page — must never be squeezed by the flex page box. */
+	.preview-page-header { flex-shrink: 0; }
 	.preview-mode-badge {
 	  float: right; font-size: ${smallPx}px; color: #475569; border: 1px solid #cbd5e1;
 	  padding: 2px 6px; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.04em;
@@ -472,7 +710,7 @@ th { padding: 3px 4px !important; }
 	.report-title-bar {
 	  display: flex; align-items: center;
 	  border-top: 1.5px solid #000; border-bottom: 1.5px solid #000;
-	  padding: 4px 0; margin: 6px 0 10px;
+	  padding: ${reportTitleBarPadding}px 0; margin: 6px 0 10px;
 	}
 	.report-main-title {
 	  text-align: center; font-size: ${basePx + 3}px;
@@ -482,14 +720,36 @@ th { padding: 3px 4px !important; }
 		.report-id-line strong { color: #111827; }
 .patient-header-table { width: 100%; table-layout: fixed; margin-bottom: 0; border: none !important; }
 .patient-header-table th {
-  width: 15%; font-weight: 700; text-align: left; color: #000;
+  font-weight: 700; text-align: left; color: #000;
   padding: 2px 3px !important; white-space: nowrap; border: none !important;
   font-size: ${basePx}px;
 }
+/* Configurable header geometry — cells 1/2 are the left label+value pair,
+   cells 3/4 the right pair (see patientInfoLeftPct / patientInfoLabelPct). */
+.patient-header-table th:nth-child(1) { width: ${patientInfoWidths.label1}%; }
+.patient-header-table td:nth-child(2) { width: ${patientInfoWidths.value1}%; }
+.patient-header-table th:nth-child(3) { width: ${patientInfoWidths.label2}%; }
+.patient-header-table td:nth-child(4) { width: ${patientInfoWidths.value2}%; }
 .patient-header-table td {
-  width: 35%; padding: 2px 3px !important; border: none !important;
+  padding: 2px 3px !important; border: none !important;
   color: #111 !important; word-break: break-word; font-size: ${basePx}px;
   font-weight: ${patientInfoBold ? "700" : "normal"};
+}
+/* Doctor degree/qualification printed on its own line under the doctor name.
+   The inline-block wrapper starts where the name starts (after the ": " prefix),
+   so the degree line indents to match instead of hugging the cell edge. */
+.patient-header-table .ref-doctor-block {
+  display: inline-block;
+  vertical-align: top;
+  max-width: 100%;
+}
+.patient-header-table .ref-doctor-degree {
+  font-size: ${Math.max(basePx - 1, 6)}px;
+  font-weight: normal;
+  color: #444;
+  line-height: 1.25;
+  margin-top: 1px;
+  white-space: normal;
 }
 ${patientInfoColumnDivider ? `
 /* Vertical rule between the left and right patient info columns.
@@ -545,7 +805,7 @@ ${patientInfoColumnDivider ? `
 		  background-color: ${resultTableBackground} !important;
 		  color: #333 !important;
 		}
-	.tbl-results td, .tbl-results th { border: none !important; padding: 2px 4px !important; line-height: 1.28; font-size: ${basePx}px !important; }
+	.tbl-results td, .tbl-results th { border: none !important; padding: ${analyteRowSpacing}px 4px !important; line-height: 1.28; font-size: ${basePx}px !important; }
 .tbl-results tbody tr:not(.main-group-row):not(.sub-section-header):not(.descriptive-row) td {
   border-bottom: 0.5px dotted #e5e5e5 !important;
 }
@@ -564,6 +824,10 @@ ${patientInfoColumnDivider ? `
   text-align: left;
   text-decoration: none;
   margin: 0 0 6px;
+}
+.center-subtitle {
+  text-align: center; font-size: ${smallPx + 1}px; margin: 2px 0 6px;
+  color: #444; font-weight: 600;
 }
 .sub-section-header td {
   font-weight: 700 !important;
@@ -642,8 +906,13 @@ ${patientInfoColumnDivider ? `
   background-color: inherit !important;
   vertical-align: middle !important;
 }
+/* Rich section content must flow across pages — see the matching note in the PDF
+   template. Holding the block together blanked page 1 on narrative reports. */
+.section-rich-content { page-break-inside: auto; break-inside: auto; }
+.section-rich-content > .center-title { page-break-after: avoid; break-after: avoid; }
+.section-rich-content table tr { page-break-inside: avoid; break-inside: avoid; }
 .narrative-panel {
-  margin: 0 0 14px;
+  margin: 0 0 ${testGroupSpacing}px;
   border-top: 1.5px solid #000;
   border-bottom: 1px solid #d1d5db;
   padding: 8px 0 10px;
@@ -692,8 +961,8 @@ ${patientInfoColumnDivider ? `
 		.compact-page .patient-header-table th,
 		.compact-page .patient-header-table td,
 		.compact-page .tbl-results td,
-		.compact-page .tbl-results th { font-size: ${basePx}px !important; padding-top: 2px !important; padding-bottom: 2px !important; }
-		.compact-page figure { margin-bottom: 7px !important; page-break-inside: avoid; break-inside: avoid; }
+		.compact-page .tbl-results th { font-size: ${basePx}px !important; padding-top: ${analyteRowSpacing}px !important; padding-bottom: ${analyteRowSpacing}px !important; }
+		.compact-page figure { margin-bottom: ${Math.round(testGroupSpacing / 2)}px !important; page-break-inside: avoid; break-inside: avoid; }
 		.compact-page .center-title { font-size: ${basePx + 1}px; margin-top: 8px; }
 		@media print {
 		  body { margin: 0; background: #fff; }
@@ -701,6 +970,13 @@ ${patientInfoColumnDivider ? `
 		  .preview-shell { width: auto; margin: 0; }
 			  .preview-page { width: auto; min-height: auto; margin: 0; padding: ${previewMargins.top}px ${previewMargins.right}px ${previewMargins.bottom}px ${previewMargins.left}px; box-shadow: none; }
 			  @page { size: A4; margin: 0; }
+			  /* Boxes the paginator packed are pinned to a hair under a sheet. Letting
+			     them size to content made a box land a fraction over the printable
+			     height, so it spilled and the trailing break-after emitted a blank
+			     sheet. Only boxes carrying .preview-paged are pinned — if pagination
+			     never ran, layout falls back to content height rather than clipping. */
+			  .preview-page.preview-paged { height: 296mm; min-height: 0; overflow: hidden; }
+			  .preview-page.preview-paged:last-child { height: auto; overflow: visible; }
 		}
 	</style>`;
 
@@ -722,6 +998,8 @@ ${patientInfoColumnDivider ? `
     receivedAt: "Received Date/Time",
     collectionCenter: "Collection Center",
     b2bAccountName: "B2B / Account Name",
+    refCenter: "Ref. Center",
+    processingCenter: "Proc. Center",
   };
   const patientValueFor = (key: string): string => {
     if (patientFieldValues && Object.prototype.hasOwnProperty.call(patientFieldValues, key)) {
@@ -735,6 +1013,21 @@ ${patientInfoColumnDivider ? `
       default: return "";
     }
   };
+  // Referring doctor's degree from Doctor Master — a second line inside the
+  // "Ref. Doctor" cell (mirrors buildRefDoctorBlock in generate-pdf-letterhead).
+  // The cell text is ": <value>", so the inline-block wrapper is what makes the
+  // degree line up under the name rather than under the colon.
+  const refDoctorQualification = String(
+    patientFieldValues?.referringDoctorQualification ?? "",
+  ).trim();
+  const refDoctorBlock = (name: string): string =>
+    refDoctorQualification
+      ? `<span class="ref-doctor-block">${escapeHtml(name)}` +
+        `<div class="ref-doctor-degree">${escapeHtml(refDoctorQualification)}</div></span>`
+      : escapeHtml(name);
+  const patientCellHtml = (key: string, value: string): string =>
+    key === "referringDoctorName" ? refDoctorBlock(value) : escapeHtml(value);
+
   const buildPatientHeaderRows = (): string => {
     const configFields = (patientInfoConfig && Array.isArray(patientInfoConfig.fields) && patientInfoConfig.fields.length > 0)
       ? patientInfoConfig.fields
@@ -770,8 +1063,8 @@ ${patientInfoColumnDivider ? `
         const f1 = configFields[i];
         const f2 = configFields[i + 1];
         rows.push(`<tr>
-          <th>${escapeHtml(f1.label)}</th><td>: ${escapeHtml(valueFor(f1.key))}</td>
-          ${f2 ? `<th>${escapeHtml(f2.label)}</th><td>: ${escapeHtml(valueFor(f2.key))}</td>` : `<th></th><td></td>`}
+          <th>${escapeHtml(f1.label)}</th><td>: ${patientCellHtml(f1.key, valueFor(f1.key))}</td>
+          ${f2 ? `<th>${escapeHtml(f2.label)}</th><td>: ${patientCellHtml(f2.key, valueFor(f2.key))}</td>` : `<th></th><td></td>`}
         </tr>`);
       }
       return rows.join("");
@@ -787,29 +1080,34 @@ ${patientInfoColumnDivider ? `
           <th>Reg. Date</th><td>: ${escapeHtml(orderDate || "")}</td>
         </tr>
         <tr>
-          <th>Ref. By</th><td>: ${escapeHtml(referredBy || "")}</td>
+          <th>Ref. By</th><td>: ${refDoctorBlock(referredBy || "")}</td>
           <th>Report Date</th><td>: ${escapeHtml(reportDate || "")}</td>
         </tr>`;
   };
 
+  // Wrapped in .preview-page-header so the client-side paginator can clone it onto
+  // every page it creates (see the paginator script at the foot of this document).
   const patientHtml = `
+  <div class="preview-page-header">
 	  <div>
 	    <div class="report-id-line">
 	      <span>${orderId ? `Order ID: <strong>${escapeHtml(orderId)}</strong>` : ""}</span>
 	      <span class="preview-mode-badge">${isCompact ? "Compact Preview" : "Basic Preview"}</span>
 	    </div>
+	    ${(!showReportTitle && qrPosition !== "top_left" && qrPosition !== "top_right") ? "" : `
 	    <div class="report-title-bar">
 	      <div class="qr-top-left-slot" style="width:110px;flex-shrink:0;"></div>
-	      <h2 class="report-main-title" style="flex:1;">TEST REPORT</h2>
+	      ${showReportTitle ? `<h2 class="report-main-title" style="flex:1;">TEST REPORT</h2>` : `<div style="flex:1;"></div>`}
 	      <div class="qr-top-right-slot" style="width:110px;flex-shrink:0;text-align:right;"></div>
-	    </div>
+	    </div>`}
 	  </div>
   <figure style="margin:0;">
     <table class="patient-header-table">
       <tbody>${buildPatientHeaderRows()}</tbody>
 	    </table>
 	  </figure>
-    <div class="patient-test-separator"></div>`;
+    <div class="patient-test-separator"></div>
+  </div>`;
 
   // Test results (all groups)
     // Report sections — mirror the PDF's reportSectionsHtml: rich HTML (content with a
@@ -823,7 +1121,7 @@ ${patientInfoColumnDivider ? `
         const isRichHtml = /<table\b/i.test(rawContent);
         if (isRichHtml) {
           return `
-        <div class="section-rich-content" style="margin: 8px 0 14px; page-break-inside: avoid; break-inside: avoid;">
+        <div class="section-rich-content" style="margin: 8px 0 14px;">
           <div class="center-title">${escapeHtml(sec.sectionName)}</div>
           <div style="font-size:${basePx}px;">${rawContent}</div>
         </div>`;
@@ -907,6 +1205,7 @@ ${patientInfoColumnDivider ? `
 	    }
 
     const groupForceTableLayout = resolveForceTableLayout(group.printOptions, printOptions);
+    const groupSubtitleHtml = buildGroupSubtitleHtml(group, printOptions);
 
     if (isNarrativeGroup(group.analytes, groupForceTableLayout)) {
       const titleClass = testGroupTitlePosition === "above_headers_left" ? "center-title left" : "center-title";
@@ -945,6 +1244,7 @@ ${patientInfoColumnDivider ? `
 	      testResultsHtml += `
 	      <section class="narrative-panel">
 	        <div class="${titleClass}">${group.testGroupName}</div>
+	        ${groupSubtitleHtml}
 	        <div class="narrative-body">${rowsHtml}</div>
 	        ${group.groupInterpretation ? `<div class="limsv2-report group-interpretation">${group.groupInterpretation}</div>` : ""}
 	      </section>`;
@@ -985,8 +1285,8 @@ ${patientInfoColumnDivider ? `
     const groupTitleClass = testGroupTitlePosition === "above_headers_left" ? "center-title left" : "center-title";
 
 	    testResultsHtml += `
-	  <figure style="margin: 0 0 14px;">
-		    ${!groupTitleBelowHeaders ? `<div class="${groupTitleClass}">${group.testGroupName}</div>` : ""}
+	  <figure style="margin: 0 0 ${testGroupSpacing}px;">
+		    ${!groupTitleBelowHeaders ? `<div class="${groupTitleClass}">${group.testGroupName}</div>${groupSubtitleHtml}` : ""}
 			    <table class="tbl-results${hasSameRowSibling ? " has-sibling" : ""}">
 			      ${hasSameRowSibling ? `<colgroup>
 			        <col style="width:${formatBasicWidth(siblingColumnWidths[0])}">
@@ -1010,6 +1310,7 @@ ${patientInfoColumnDivider ? `
 		        <tr class="main-group-row">
 	          <td colspan="${effectiveColCount}">
 	            <div class="center-title">${group.testGroupName}</div>
+	            ${groupSubtitleHtml}
 	          </td>
         </tr>` : ""}`;
 
@@ -1125,7 +1426,7 @@ ${patientInfoColumnDivider ? `
           continue;
         }
 
-        const sym = flagSymbol !== "none" ? getFlagSymbolText(canonical) : "";
+        const sym = flagSymbol !== "none" ? flagSymbolForReport(canonical, allowedFlagCodes) : "";
         const formattedValue = formatAnalyteDisplayValue(
           analyte,
           printOptions,
@@ -1216,10 +1517,11 @@ ${patientInfoColumnDivider ? `
     if (hasCalcInGroup && calcMarker === "asterisk") groupLegendParts.push("* Calculated parameter");
     if (flagAsterisk) groupLegendParts.push("** Abnormal value");
     if (flagAsterisk && flagAsteriskCritical) groupLegendParts.push("*** Critical value");
-    if (showFlagLegend && flagSymbol !== "none")
-      groupLegendParts.push(
-        "H&nbsp;=&nbsp;High &nbsp; L&nbsp;=&nbsp;Low &nbsp; A&nbsp;=&nbsp;Abnormal &nbsp; H*&nbsp;=&nbsp;Critical High &nbsp; L*&nbsp;=&nbsp;Critical Low"
-      );
+    if (showFlagLegend && flagSymbol !== "none") {
+      // The legend lists only what the report can actually print.
+      const legend = flagLegendText(allowedFlagCodes);
+      if (legend) groupLegendParts.push(legend);
+    }
 
     testResultsHtml += `
       </tbody>
@@ -1248,6 +1550,7 @@ ${css}
 <div class="preview-shell" style="font-family: Arial, Helvetica, sans-serif; font-size: ${basePx}px; color: #000;">
   ${testResultsHtml}
 </div>
+${PAGINATOR_SCRIPT}
 </body>
 </html>`;
 }

@@ -443,6 +443,12 @@ enabled = true
 verify_jwt = false
 entrypoint = "./functions/patient-forgot-pin/index.ts"
 
+# Public booking page backend (/book/:slug) - no JWT, the lab's public slug is the only identifier
+[functions.public-booking]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/public-booking/index.ts"
+
 # Patient portal login - picks the right lab account when one mobile number has several
 [functions.patient-portal-login]
 enabled = true

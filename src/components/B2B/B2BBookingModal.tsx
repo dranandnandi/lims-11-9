@@ -13,7 +13,9 @@ interface B2BBookingModalProps {
 interface CatalogItem {
     id: string;
     name: string;
-    price: number;
+    price: number; // Effective price for this account (contracted rate when one exists)
+    listPrice: number; // Standard/MRP rate, kept so a discounted rate can be shown against it
+    isContracted: boolean;
     type: 'test' | 'package';
     category?: string;
     code?: string;
@@ -25,6 +27,7 @@ const B2BBookingModal: React.FC<B2BBookingModalProps> = ({ accountId, labId, onC
     const [searchTerm, setSearchTerm] = useState('');
     const [catalogItems, setCatalogItems] = useState<CatalogItem[]>([]);
     const [searching, setSearching] = useState(false);
+    const [hasContractedRates, setHasContractedRates] = useState(false);
     const [selectedItems, setSelectedItems] = useState<CatalogItem[]>([]);
 
     // Credit check state
@@ -44,7 +47,7 @@ const B2BBookingModal: React.FC<B2BBookingModalProps> = ({ accountId, labId, onC
         const loadCatalog = async () => {
             setSearching(true);
             try {
-                const [testsResult, packagesResult] = await Promise.all([
+                const [testsResult, packagesResult, pricesResult] = await Promise.all([
                     supabase
                         .from('test_groups')
                         .select('id, name, price, category, code')
@@ -56,21 +59,40 @@ const B2BBookingModal: React.FC<B2BBookingModalProps> = ({ accountId, labId, onC
                         .select(`
                             id, name, price, category,
                             package_test_groups(
+                                display_order,
                                 test_groups(id, name, is_active)
                             )
                         `)
                         .eq('is_active', true)
                         .eq('lab_id', labId)
-                        .order('name')
+                        .order('name'),
+                    // Contracted rates set for this account in Account Master (direct override or
+                    // inherited price master). Returns only the items that differ from MRP.
+                    supabase.rpc('get_b2b_effective_prices')
                 ]);
 
                 if (testsResult.error) throw testsResult.error;
                 if (packagesResult.error) throw packagesResult.error;
 
+                const testRates: Record<string, number> = {};
+                const packageRates: Record<string, number> = {};
+                if (pricesResult.error) {
+                    // Never block booking on the rate lookup - fall back to standard rates
+                    console.error('Error loading account rates, showing standard rates:', pricesResult.error);
+                } else {
+                    (pricesResult.data || []).forEach((row: any) => {
+                        if (row?.price === null || row?.price === undefined) return;
+                        const target = row.item_type === 'package' ? packageRates : testRates;
+                        target[row.item_id] = Number(row.price);
+                    });
+                }
+
                 const tests: CatalogItem[] = (testsResult.data || []).map((t: any) => ({
                     id: t.id,
                     name: t.name,
-                    price: t.price || 0,
+                    price: testRates[t.id] ?? (t.price || 0),
+                    listPrice: t.price || 0,
+                    isContracted: testRates[t.id] !== undefined,
                     type: 'test',
                     category: t.category,
                     code: t.code,
@@ -79,20 +101,29 @@ const B2BBookingModal: React.FC<B2BBookingModalProps> = ({ accountId, labId, onC
                 const packages: CatalogItem[] = (packagesResult.data || []).map((p: any) => ({
                     id: p.id,
                     name: p.name,
-                    price: p.price || 0,
+                    price: packageRates[p.id] ?? (p.price || 0),
+                    listPrice: p.price || 0,
+                    isContracted: packageRates[p.id] !== undefined,
                     type: 'package',
                     category: p.category,
                     includedTests: (p.package_test_groups || [])
                         // Skip test groups deactivated after they were linked
                         .filter((ptg: any) => ptg.test_groups?.is_active !== false)
+                        // Show them in the package's own order, not insert order
+                        .slice()
+                        .sort((a: any, b: any) => (a.display_order ?? 0) - (b.display_order ?? 0))
                         .map((ptg: any) => ptg.test_groups?.name)
                         .filter(Boolean),
                 }));
 
                 setCatalogItems([...packages, ...tests]);
+                setHasContractedRates(
+                    Object.keys(testRates).length > 0 || Object.keys(packageRates).length > 0
+                );
             } catch (error) {
                 console.error('Error loading B2B test catalog:', error);
                 setCatalogItems([]);
+                setHasContractedRates(false);
             } finally {
                 setSearching(false);
             }
@@ -327,7 +358,11 @@ const B2BBookingModal: React.FC<B2BBookingModalProps> = ({ accountId, labId, onC
 
                         <div className="flex items-start gap-1.5 text-xs text-blue-600 bg-blue-50 rounded-lg px-3 py-2">
                             <Info className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
-                            <span>Prices shown are standard rates. Final pricing may vary per your account agreement.</span>
+                            <span>
+                                {hasContractedRates
+                                    ? 'Prices shown are your agreed account rates. Standard rates are struck through where a special rate applies.'
+                                    : 'Prices shown are standard rates. Final pricing may vary per your account agreement.'}
+                            </span>
                         </div>
 
                         <div className="relative">
@@ -375,7 +410,12 @@ const B2BBookingModal: React.FC<B2BBookingModalProps> = ({ accountId, labId, onC
                                                         </p>
                                                     )}
                                                 </div>
-                                                <span className="text-sm font-semibold text-gray-700 flex-shrink-0">
+                                                <span className="text-sm font-semibold text-gray-700 flex-shrink-0 flex items-baseline gap-1.5">
+                                                    {item.isContracted && item.listPrice > item.price && (
+                                                        <span className="text-xs font-normal text-gray-400 line-through">
+                                                            ₹{item.listPrice.toLocaleString('en-IN')}
+                                                        </span>
+                                                    )}
                                                     ₹{item.price.toLocaleString('en-IN')}
                                                 </span>
                                             </div>
@@ -419,7 +459,12 @@ const B2BBookingModal: React.FC<B2BBookingModalProps> = ({ accountId, labId, onC
                                             </div>
                                         </div>
                                         <div className="flex items-center gap-3 flex-shrink-0">
-                                            <span className="text-sm font-semibold text-gray-700">
+                                            <span className="text-sm font-semibold text-gray-700 flex items-baseline gap-1.5">
+                                                {item.isContracted && item.listPrice > item.price && (
+                                                    <span className="text-xs font-normal text-gray-400 line-through">
+                                                        ₹{item.listPrice.toLocaleString('en-IN')}
+                                                    </span>
+                                                )}
                                                 ₹{item.price.toLocaleString('en-IN')}
                                             </span>
                                             <button

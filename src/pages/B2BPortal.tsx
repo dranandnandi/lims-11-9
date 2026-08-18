@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { LogOut, Download, Filter, Search, Calendar, RefreshCw, PlusCircle, X, Clock, User, Phone, Trash2, Printer, FileText, Wallet, CreditCard, Receipt, Loader2, CheckCircle, AlertCircle, BarChart3, Building2, ChevronLeft, ChevronRight, ChevronDown, Megaphone, MessageSquare, Package, Image as ImageIcon } from 'lucide-react';
+import { LogOut, Download, Filter, Search, Calendar, RefreshCw, PlusCircle, X, Clock, User, Users, Phone, Trash2, Printer, FileText, Wallet, CreditCard, Receipt, Loader2, CheckCircle, AlertCircle, BarChart3, Building2, ChevronLeft, ChevronRight, Megaphone, MessageSquare, Package, LayoutDashboard, ClipboardList, FileSpreadsheet, Image as ImageIcon } from 'lucide-react';
 import { supabase } from '../utils/supabase';
 import { getCurrentB2BAccount } from '../utils/b2bAuth';
 import B2BBookingModal from '../components/B2B/B2BBookingModal';
@@ -9,8 +9,16 @@ import AccountInfoCard from '../components/B2B/AccountInfoCard';
 import PartnerChatPanel from '../components/B2B/PartnerChatPanel';
 import MaterialRequestPanel from '../components/B2B/MaterialRequestPanel';
 import { fetchAccountUnreadCount } from '../utils/partnerCommsService';
-import { computeAvailableCredit, fetchReceiptCreditTotal } from '../utils/accountCredit';
+import {
+    AccountCreditSummary,
+    computeAvailableCredit,
+    fetchAccountCreditSummary,
+    fetchReceiptCreditTotal,
+    isCreditCheckBypassed,
+} from '../utils/accountCredit';
+import { downloadB2BTrfPdf, type TrfOptions, type TrfOrder, type TrfTest } from '../utils/b2bTrfPdf';
 import { format } from 'date-fns';
+import * as XLSX from 'xlsx';
 import type { InitiatePaymentResponse } from '../types/payment';
 
 const PAYMENT_FUNCTIONS_BASE_URL =
@@ -77,6 +85,35 @@ interface SampleSummary {
 }
 
 type OrderSortMode = 'sample_desc' | 'sample_asc' | 'order_id_asc' | 'order_id_desc' | 'date_desc' | 'patient_az';
+
+/** Shape returned by the get_b2b_trf_bookings RPC */
+interface BookingTrfRow {
+    booking_id: string;
+    booking_ref: string;
+    patient_name: string;
+    patient_meta: string | null;
+    scheduled_at: string | null;
+    created_at: string;
+    collection_type: string | null;
+    status: string | null;
+    tests: TrfTest[];
+}
+
+/** One row per distinct patient, as returned by the get_b2b_patients RPC */
+interface B2BPatientRow {
+    patient_id: string;
+    patient_code: string;
+    name: string;
+    age: number | null;
+    age_unit: string | null;
+    gender: string | null;
+    phone: string | null;
+    email: string | null;
+    first_visit: string | null;
+    last_visit: string | null;
+    total_orders: number;
+    total_amount: number;
+}
 
 interface PaymentAttempt {
     id: string;
@@ -160,6 +197,17 @@ const normalizePortalSettings = (raw: any): PortalSettings => {
     };
 };
 
+type PortalSection = 'home' | 'orders' | 'patients' | 'billing' | 'chat' | 'materials';
+
+const PORTAL_SECTIONS: { key: PortalSection; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
+    { key: 'home', label: 'Home', icon: LayoutDashboard },
+    { key: 'orders', label: 'Samples & Reports', icon: ClipboardList },
+    { key: 'patients', label: 'Patient List', icon: Users },
+    { key: 'billing', label: 'Billing & Payments', icon: Wallet },
+    { key: 'chat', label: 'Chat with Lab', icon: MessageSquare },
+    { key: 'materials', label: 'Material Requests', icon: Package },
+];
+
 const B2BPortal: React.FC = () => {
     const navigate = useNavigate();
     const [account, setAccount] = useState<any>(null);
@@ -176,8 +224,10 @@ const B2BPortal: React.FC = () => {
     const [paymentCreditTotal, setPaymentCreditTotal] = useState(0);
     // Cash / cheque / bank payments recorded by the lab from Account Master
     const [manualCreditTotal, setManualCreditTotal] = useState(0);
+    // The shared ledger position, so the portal can never disagree with Account
+    // Master, the order form or the check-b2b-credit gate about this account.
+    const [creditSummary, setCreditSummary] = useState<AccountCreditSummary | null>(null);
     const [invoices, setInvoices] = useState<ConsolidatedInvoice[]>([]);
-    const [outstandingInvoiceAmount, setOutstandingInvoiceAmount] = useState(0);
     const [topUpAmount, setTopUpAmount] = useState('');
     const [topUpAmountEdited, setTopUpAmountEdited] = useState(false);
     const [paymentLoading, setPaymentLoading] = useState(false);
@@ -187,12 +237,25 @@ const B2BPortal: React.FC = () => {
     );
     const [selectedOrderIds, setSelectedOrderIds] = useState<Set<string>>(new Set());
     const [showResultAnalysis, setShowResultAnalysis] = useState(false);
+    const [trfLoading, setTrfLoading] = useState(false);
+    const [trfError, setTrfError] = useState<string | null>(null);
+    const [selectedBookingIds, setSelectedBookingIds] = useState<Set<string>>(new Set());
+    const [bookingTrfLoading, setBookingTrfLoading] = useState(false);
+    const [bookingTrfError, setBookingTrfError] = useState<string | null>(null);
     const [labInfo, setLabInfo] = useState<{ name: string; logo: string | null; portalSettings: PortalSettings } | null>(null);
     const [activeUpdateIndex, setActiveUpdateIndex] = useState(0);
     const [activeAnnouncementIndex, setActiveAnnouncementIndex] = useState(0);
-    // Support sections stay collapsed so reports and billing keep the top of the page
-    const [showChatSection, setShowChatSection] = useState(false);
-    const [showMaterialSection, setShowMaterialSection] = useState(false);
+    // Sidebar navigation keeps each area on its own screen instead of one long page
+    const [patients, setPatients] = useState<B2BPatientRow[]>([]);
+    const [patientsLoading, setPatientsLoading] = useState(false);
+    const [patientsError, setPatientsError] = useState<string | null>(null);
+    const [patientsLoaded, setPatientsLoaded] = useState(false);
+    const [patientSearch, setPatientSearch] = useState('');
+    const [patientRange, setPatientRange] = useState({ from: '', to: '' });
+    const [activeSection, setActiveSection] = useState<PortalSection>(() => {
+        const stored = localStorage.getItem('b2b-portal-section') as PortalSection | null;
+        return stored && PORTAL_SECTIONS.some((section) => section.key === stored) ? stored : 'home';
+    });
     const [chatUnreadCount, setChatUnreadCount] = useState(0);
 
     // Load account and orders
@@ -339,6 +402,7 @@ const B2BPortal: React.FC = () => {
             }
 
             setManualCreditTotal(await fetchReceiptCreditTotal(accountData.id));
+            setCreditSummary(await fetchAccountCreditSummary(accountData.id));
 
             const { data: invoicesData, error: invoicesError } = await supabase
                 .from('consolidated_invoices')
@@ -351,27 +415,6 @@ const B2BPortal: React.FC = () => {
                 console.error('Error fetching bills:', invoicesError);
             } else {
                 setInvoices(invoicesData || []);
-            }
-
-            const { data: allInvoiceData, error: allInvoiceError } = await supabase
-                .from('consolidated_invoices')
-                .select('total_amount, status')
-                .eq('account_id', accountData.id)
-                .eq('lab_id', accountData.lab_id);
-
-            if (allInvoiceError) {
-                console.error('Error fetching outstanding bill total:', allInvoiceError);
-            } else {
-                const totalOutstanding = (allInvoiceData || [])
-                    .filter((invoice) => {
-                        const status = String(invoice.status || '').toLowerCase();
-                        return status !== 'paid' && status !== 'cancelled';
-                    })
-                    .reduce((sum, invoice) => {
-                        const amount = Number(invoice.total_amount);
-                        return sum + (Number.isFinite(amount) ? amount : 0);
-                    }, 0);
-                setOutstandingInvoiceAmount(totalOutstanding);
             }
 
             setChatUnreadCount(await fetchAccountUnreadCount(accountData.id));
@@ -461,6 +504,100 @@ const B2BPortal: React.FC = () => {
         setFilteredOrders(filtered);
     };
 
+    // Patient demographics live behind RLS, so the directory comes from an
+    // account-scoped RPC rather than a direct patients query
+    const loadPatients = async () => {
+        try {
+            setPatientsLoading(true);
+            setPatientsError(null);
+
+            const { data, error } = await supabase.rpc('get_b2b_patients', {
+                p_from: patientRange.from || null,
+                p_to: patientRange.to || null,
+            });
+
+            if (error) throw error;
+
+            setPatients((data || []).map((row: any) => ({
+                ...row,
+                total_orders: Number(row.total_orders) || 0,
+                total_amount: Number(row.total_amount) || 0,
+            })));
+        } catch (error: any) {
+            console.error('Error loading patient list:', error);
+            setPatients([]);
+            setPatientsError(error?.message || 'Failed to load the patient list');
+        } finally {
+            // Marked loaded even on failure, otherwise the auto-load effect retries forever
+            setPatientsLoaded(true);
+            setPatientsLoading(false);
+        }
+    };
+
+    // Load on first visit to the section; date filters reload on demand
+    useEffect(() => {
+        if (activeSection === 'patients' && !patientsLoaded && !patientsLoading) {
+            loadPatients();
+        }
+    }, [activeSection, patientsLoaded, patientsLoading]);
+
+    const patientQuery = patientSearch.trim().toLowerCase();
+    const filteredPatients = patientQuery
+        ? patients.filter((patient) =>
+            (patient.name || '').toLowerCase().includes(patientQuery) ||
+            (patient.patient_code || '').toLowerCase().includes(patientQuery) ||
+            (patient.phone || '').toLowerCase().includes(patientQuery)
+        )
+        : patients;
+
+    // Visit dates arrive as plain yyyy-MM-dd; parsing them as Date would shift the day
+    const formatVisitDate = (value: string | null) => {
+        if (!value) return '';
+        const [year, month, day] = value.slice(0, 10).split('-');
+        return year && month && day ? `${day}/${month}/${year}` : value;
+    };
+
+    const formatPatientAge = (patient: B2BPatientRow) => {
+        if (patient.age === null || patient.age === undefined) return '';
+        const unit = patient.age_unit === 'months' ? 'M' : patient.age_unit === 'days' ? 'D' : 'Y';
+        return `${patient.age}${unit}`;
+    };
+
+    const handleExportPatients = () => {
+        const rows = filteredPatients.map((patient) => ({
+            'Patient ID': patient.patient_code,
+            'Patient Name': patient.name,
+            'Age': formatPatientAge(patient),
+            'Gender': patient.gender || '',
+            'Phone': patient.phone || '',
+            'Email': patient.email || '',
+            'First Visit': formatVisitDate(patient.first_visit),
+            'Last Visit': formatVisitDate(patient.last_visit),
+            'Total Orders': patient.total_orders,
+            'Total Amount': patient.total_amount,
+        }));
+
+        const worksheet = XLSX.utils.json_to_sheet(rows);
+        worksheet['!cols'] = [
+            { wch: 16 }, { wch: 28 }, { wch: 8 }, { wch: 10 }, { wch: 16 },
+            { wch: 26 }, { wch: 13 }, { wch: 13 }, { wch: 13 }, { wch: 14 },
+        ];
+        const workbook = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(workbook, worksheet, 'Patients');
+
+        const accountSlug = String(account?.name || 'partner')
+            .replace(/[^a-z0-9]+/gi, '_')
+            .replace(/^_+|_+$/g, '')
+            .slice(0, 40) || 'partner';
+        XLSX.writeFile(workbook, `patients_${accountSlug}_${new Date().toISOString().slice(0, 10)}.xlsx`);
+    };
+
+    const openSection = (section: PortalSection) => {
+        setActiveSection(section);
+        localStorage.setItem('b2b-portal-section', section);
+        if (section === 'chat') setChatUnreadCount(0);
+    };
+
     const updateSortMode = (value: OrderSortMode) => {
         setSortMode(value);
         localStorage.setItem('b2b-order-sort', value);
@@ -485,6 +622,22 @@ const B2BPortal: React.FC = () => {
         });
     };
 
+    const toggleBookingSelection = (bookingId: string) => {
+        setSelectedBookingIds((current) => {
+            const next = new Set(current);
+            if (next.has(bookingId)) next.delete(bookingId);
+            else next.add(bookingId);
+            return next;
+        });
+    };
+
+    const allBookingsSelected =
+        pendingBookings.length > 0 && pendingBookings.every((booking) => selectedBookingIds.has(booking.id));
+
+    const toggleAllBookings = () => {
+        setSelectedBookingIds(allBookingsSelected ? new Set() : new Set(pendingBookings.map((booking) => booking.id)));
+    };
+
     const handleLogout = async () => {
         await supabase.auth.signOut();
         navigate('/b2b');
@@ -492,6 +645,140 @@ const B2BPortal: React.FC = () => {
 
     const handleDownloadReport = (reportUrl: string) => {
         window.open(reportUrl, '_blank');
+    };
+
+    // Logos live in Supabase storage, so inline them before jsPDF renders the sheet
+    const loadLogoDataUrl = async (url: string | null): Promise<string | null> => {
+        if (!url) return null;
+        try {
+            const response = await fetch(url);
+            if (!response.ok) return null;
+            const blob = await response.blob();
+            return await new Promise<string | null>((resolve) => {
+                const reader = new FileReader();
+                reader.onloadend = () => resolve(typeof reader.result === 'string' ? reader.result : null);
+                reader.onerror = () => resolve(null);
+                reader.readAsDataURL(blob);
+            });
+        } catch {
+            return null;
+        }
+    };
+
+    const buildTrfOptions = async (refPrefix: 'TRF' | 'TRF-B', note?: string): Promise<TrfOptions> => {
+        const generatedAt = new Date();
+        const partnerRef = String(account?.code || account?.name || 'PARTNER')
+            .toUpperCase()
+            .replace(/[^A-Z0-9]+/g, '-')
+            .replace(/^-|-$/g, '')
+            .slice(0, 16) || 'PARTNER';
+
+        const addressLine = [
+            account?.address_line1,
+            account?.address_line2,
+            account?.city,
+            account?.state,
+            account?.pincode,
+        ]
+            .map((part: unknown) => String(part || '').trim())
+            .filter(Boolean)
+            .join(', ');
+
+        return {
+            labName: labInfo?.name || 'Laboratory',
+            labLogoDataUrl: await loadLogoDataUrl(labInfo?.logo || null),
+            partner: {
+                name: account?.name || 'Partner',
+                code: account?.code || null,
+                contact_person: account?.contact_person || null,
+                phone: account?.billing_phone || null,
+                address: addressLine || null,
+            },
+            generatedAt,
+            reference: `${refPrefix}-${partnerRef}-${format(generatedAt, 'yyyyMMdd-HHmm')}`,
+            note: note || null,
+        };
+    };
+
+    const handleGenerateTrf = async () => {
+        if (selectedOrderIds.size === 0) return;
+
+        setTrfLoading(true);
+        setTrfError(null);
+
+        try {
+            const { data, error } = await supabase.rpc('get_b2b_trf_orders', {
+                p_order_ids: Array.from(selectedOrderIds),
+            });
+
+            if (error) throw error;
+
+            const trfOrders = (data || []) as TrfOrder[];
+            if (trfOrders.length === 0) {
+                setTrfError('No order details available for the selected orders.');
+                return;
+            }
+
+            downloadB2BTrfPdf(trfOrders, await buildTrfOptions('TRF'));
+        } catch (err: any) {
+            console.error('Error generating TRF:', err);
+            setTrfError(err?.message || 'Failed to generate the TRF PDF');
+        } finally {
+            setTrfLoading(false);
+        }
+    };
+
+    const handleGenerateBookingTrf = async () => {
+        if (selectedBookingIds.size === 0) return;
+
+        setBookingTrfLoading(true);
+        setBookingTrfError(null);
+
+        try {
+            const { data, error } = await supabase.rpc('get_b2b_trf_bookings', {
+                p_booking_ids: Array.from(selectedBookingIds),
+            });
+
+            if (error) throw error;
+
+            const rows = (data || []) as BookingTrfRow[];
+            if (rows.length === 0) {
+                setBookingTrfError('No booking details available for the selected bookings.');
+                return;
+            }
+
+            // Bookings have no samples yet - the lab labels tubes on receipt
+            const trfOrders: TrfOrder[] = rows.map((row) => ({
+                order_id: row.booking_id,
+                order_display: row.booking_ref,
+                patient_name: row.patient_name,
+                order_date: row.scheduled_at || row.created_at,
+                date_label: row.scheduled_at ? 'Scheduled' : 'Booked',
+                patient_meta: [row.patient_meta, row.collection_type?.replace(/_/g, ' ')]
+                    .filter(Boolean)
+                    .join('   |   ') || null,
+                priority: null,
+                doctor: null,
+                notes: null,
+                status: row.status,
+                sample_id: null,
+                tests: row.tests || [],
+                samples: [],
+            }));
+
+            downloadB2BTrfPdf(
+                trfOrders,
+                await buildTrfOptions(
+                    'TRF-B',
+                    'Pre-order booking sheet: the lab has not accessioned these bookings yet, so barcodes are written on collection.',
+                ),
+            );
+        } catch (err: any) {
+            console.error('Error generating booking TRF:', err);
+            setBookingTrfError(err?.message || 'Failed to generate the TRF PDF');
+        } finally {
+            setBookingTrfLoading(false);
+        }
     };
 
     const handlePayNow = async () => {
@@ -688,17 +975,26 @@ const B2BPortal: React.FC = () => {
         .reduce((sum, order) => sum + getOrderAmount(order), 0);
     const pendingBookingAmount = pendingBookings.reduce((sum, booking) => sum + getBookingAmount(booking), 0);
     const creditLimit = Number(account?.credit_limit || 0);
-    const storedCreditUsed = Number(account?.credit_used || 0);
-    const { effectiveCreditUsed, availableCredit } = computeAvailableCredit({
+    // accounts.credit_used is the cached ledger position, so it stands in until
+    // the full summary lands. Both may be negative - that is an advance balance,
+    // not an error, and clamping it here is exactly what used to swallow top-ups.
+    const ledgerCreditUsed = creditSummary?.ledgerCreditUsed ?? Number(account?.credit_used || 0);
+    const { effectiveCreditUsed, availableCredit, advanceBalance } = computeAvailableCredit({
         creditLimit,
-        storedCreditUsed,
-        openOrderAmount,
-        outstandingInvoiceAmount,
+        ledgerCreditUsed,
         pendingBookingAmount,
-        gatewayPaymentCredit: paymentCreditTotal,
-        manualPaymentCredit: manualCreditTotal,
     });
-    const isCreditBlocked = availableCredit < 0;
+    const orderDebitAmount = creditSummary?.orderDebitAmount ?? openOrderAmount;
+    // Display the same figures the total was computed from. The standalone
+    // b2b_payment_attempts / receipt queries below are the pre-ledger source and
+    // only stand in until the summary lands - if a payment is ever marked
+    // credit_applied without its ledger row landing, the two disagree and the
+    // card visibly stops adding up.
+    const shownGatewayCredit = creditSummary?.gatewayPaymentCredit ?? paymentCreditTotal;
+    const shownManualCredit = creditSummary?.manualPaymentCredit ?? manualCreditTotal;
+    // Accounts flagged for credit bypass in Account Master are never blocked here
+    const bypassCreditCheck = isCreditCheckBypassed(account);
+    const isCreditBlocked = !bypassCreditCheck && availableCredit < 0;
     const suggestedTopUpAmount = Math.max(1, Math.ceil(creditLimit > 0 ? creditLimit * 2 : effectiveCreditUsed));
 
     useEffect(() => {
@@ -764,8 +1060,68 @@ const B2BPortal: React.FC = () => {
             </header>
 
             {/* Main Content */}
-            <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-                <div className="mb-8 grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_360px] lg:items-start">
+            <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 lg:flex lg:items-start lg:gap-6">
+                {/* Section navigation - vertical sidebar on desktop, scrollable tabs on mobile */}
+                <aside className="lg:w-60 lg:shrink-0">
+                    <nav className="-mx-4 flex gap-2 overflow-x-auto px-4 pb-3 lg:mx-0 lg:sticky lg:top-6 lg:flex-col lg:gap-1 lg:overflow-visible lg:rounded-lg lg:border lg:border-gray-200 lg:bg-white lg:p-2 lg:shadow-sm">
+                        {PORTAL_SECTIONS.map((section) => {
+                            const Icon = section.icon;
+                            const isActive = activeSection === section.key;
+                            const badge = section.key === 'chat' && chatUnreadCount > 0
+                                ? String(chatUnreadCount)
+                                : section.key === 'orders' && orders.length > 0
+                                    ? String(orders.length)
+                                    : null;
+
+                            return (
+                                <button
+                                    key={section.key}
+                                    type="button"
+                                    onClick={() => openSection(section.key)}
+                                    className={`flex shrink-0 items-center gap-2 rounded-lg border px-3 py-2 text-sm font-medium transition-colors lg:w-full lg:border-transparent ${
+                                        isActive
+                                            ? 'border-blue-200 bg-blue-50 text-blue-700'
+                                            : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50 hover:text-gray-900'
+                                    }`}
+                                >
+                                    <Icon className="h-4 w-4 shrink-0" />
+                                    <span className="whitespace-nowrap lg:flex-1 lg:text-left">{section.label}</span>
+                                    {badge && (
+                                        <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${
+                                            section.key === 'chat' ? 'bg-red-500 text-white' : 'bg-gray-100 text-gray-600'
+                                        }`}>
+                                            {badge}
+                                        </span>
+                                    )}
+                                </button>
+                            );
+                        })}
+                    </nav>
+
+                    <div className="mt-4 hidden rounded-lg border border-gray-200 bg-white p-4 shadow-sm lg:block">
+                        <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Available Credit</p>
+                        <p className={`mt-1 text-xl font-bold ${availableCredit >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                            {formatCurrency(availableCredit)}
+                        </p>
+                        <button
+                            onClick={() => setShowBookingModal(true)}
+                            disabled={isCreditBlocked}
+                            className="mt-4 flex w-full items-center justify-center gap-2 rounded-lg bg-blue-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-gray-300 disabled:text-gray-500"
+                        >
+                            <PlusCircle className="h-4 w-4" />
+                            New Booking
+                        </button>
+                    </div>
+                </aside>
+
+                <main className="min-w-0 flex-1 space-y-6">
+                    {isCreditBlocked && (
+                        <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                            Account credit is overdue. New bookings and report downloads are disabled until payment is received.
+                        </div>
+                    )}
+
+                    {activeSection === 'home' && (
                     <div className="space-y-6">
                         <div className="rounded-lg border border-blue-100 bg-blue-50 p-5">
                             <div className="text-xs font-semibold uppercase tracking-wide text-blue-700 mb-2">
@@ -827,40 +1183,85 @@ const B2BPortal: React.FC = () => {
                             </div>
                         )}
 
-                        {isCreditBlocked && (
-                            <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-                                Account credit is overdue. New bookings and report downloads are disabled until payment is received.
-                            </div>
-                        )}
                     </div>
+                    )}
 
-                    {/* Full-width row: bookings + orders table */}
-                    <div className="space-y-6 min-w-0 lg:col-span-2 lg:row-start-2">
+                    {activeSection === 'orders' && (
+                    <div className="space-y-6 min-w-0">
                         {/* Pending Bookings Section */}
                 {pendingBookings.length > 0 && (
                     <div className="bg-yellow-50 rounded-lg shadow-md border border-yellow-200">
                         <div className="p-4 border-b border-yellow-200">
-                            <h2 className="text-lg font-bold text-yellow-800 flex items-center gap-2">
-                                <Clock className="h-5 w-5" />
-                                Booked Samples ({pendingBookings.length})
-                            </h2>
-                            <p className="text-sm text-yellow-700 mt-1">
-                                These bookings are waiting to be processed by the lab.
-                            </p>
+                            <div className="flex flex-wrap items-start justify-between gap-3">
+                                <div>
+                                    <h2 className="text-lg font-bold text-yellow-800 flex items-center gap-2">
+                                        <Clock className="h-5 w-5" />
+                                        Booked Samples ({pendingBookings.length})
+                                    </h2>
+                                    <p className="text-sm text-yellow-700 mt-1">
+                                        These bookings are waiting to be processed by the lab.
+                                        {selectedBookingIds.size > 0 && (
+                                            <span className="ml-1 font-medium text-yellow-900">
+                                                {selectedBookingIds.size} selected
+                                            </span>
+                                        )}
+                                    </p>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    <button
+                                        type="button"
+                                        onClick={toggleAllBookings}
+                                        className="rounded-lg border border-yellow-300 bg-white px-3 py-2 text-sm font-medium text-yellow-800 hover:bg-yellow-100"
+                                    >
+                                        {allBookingsSelected ? 'Clear all' : 'Select all'}
+                                    </button>
+                                    <button
+                                        onClick={handleGenerateBookingTrf}
+                                        disabled={selectedBookingIds.size === 0 || bookingTrfLoading}
+                                        title="Print a requisition / handover sheet for the selected bookings"
+                                        className="inline-flex items-center gap-2 rounded-lg bg-amber-600 px-3 py-2 text-sm font-medium text-white hover:bg-amber-700 disabled:cursor-not-allowed disabled:bg-gray-300"
+                                    >
+                                        {bookingTrfLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <ClipboardList className="h-4 w-4" />}
+                                        {bookingTrfLoading ? 'Preparing TRF...' : 'Generate TRF'}
+                                    </button>
+                                </div>
+                            </div>
+                            {bookingTrfError && (
+                                <div className="mt-3 flex items-start gap-2 rounded-lg border border-red-100 bg-red-50 p-2 text-sm text-red-600">
+                                    <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                                    <span>{bookingTrfError}</span>
+                                </div>
+                            )}
                         </div>
                         <div className="p-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                             {pendingBookings.map((booking) => (
-                                <div key={booking.id} className="bg-white rounded-lg border border-yellow-200 p-4">
+                                <div
+                                    key={booking.id}
+                                    className={`rounded-lg border p-4 ${
+                                        selectedBookingIds.has(booking.id)
+                                            ? 'border-amber-400 bg-amber-50 ring-1 ring-amber-300'
+                                            : 'border-yellow-200 bg-white'
+                                    }`}
+                                >
                                     <div className="flex justify-between items-start mb-2">
-                                        <div>
-                                            <p className="font-medium text-gray-900 flex items-center gap-1">
-                                                <User className="h-3 w-3" />
-                                                {booking.patient_info?.name || 'N/A'}
-                                            </p>
-                                            <p className="text-sm text-gray-500 flex items-center gap-1">
-                                                <Phone className="h-3 w-3" />
-                                                {booking.patient_info?.phone || 'N/A'}
-                                            </p>
+                                        <div className="flex items-start gap-2">
+                                            <input
+                                                type="checkbox"
+                                                checked={selectedBookingIds.has(booking.id)}
+                                                onChange={() => toggleBookingSelection(booking.id)}
+                                                className="mt-1 rounded border-gray-300 text-amber-600 focus:ring-amber-500"
+                                                aria-label={`Select booking for ${booking.patient_info?.name || 'patient'}`}
+                                            />
+                                            <div>
+                                                <p className="font-medium text-gray-900 flex items-center gap-1">
+                                                    <User className="h-3 w-3" />
+                                                    {booking.patient_info?.name || 'N/A'}
+                                                </p>
+                                                <p className="text-sm text-gray-500 flex items-center gap-1">
+                                                    <Phone className="h-3 w-3" />
+                                                    {booking.patient_info?.phone || 'N/A'}
+                                                </p>
+                                            </div>
                                         </div>
                                         <span className="text-xs font-semibold px-2 py-1 rounded-full bg-yellow-100 text-yellow-800 uppercase">
                                             {booking.status}
@@ -987,15 +1388,32 @@ const B2BPortal: React.FC = () => {
                                 Showing {filteredOrders.length} of {orders.length} orders
                                 {selectedOrderIds.size > 0 && <span className="ml-2 font-medium text-indigo-600"> - {selectedOrderIds.size} selected</span>}
                             </div>
-                            <button
-                                onClick={() => setShowResultAnalysis(true)}
-                                disabled={selectedOrderIds.size === 0}
-                                className="inline-flex items-center gap-2 rounded-lg bg-indigo-600 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:bg-gray-300"
-                            >
-                                <BarChart3 className="h-4 w-4" />
-                                Analyze selected
-                            </button>
+                            <div className="flex flex-wrap items-center gap-2">
+                                <button
+                                    onClick={handleGenerateTrf}
+                                    disabled={selectedOrderIds.size === 0 || trfLoading}
+                                    title="Print a requisition / handover sheet for the selected orders"
+                                    className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-gray-300"
+                                >
+                                    {trfLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <ClipboardList className="h-4 w-4" />}
+                                    {trfLoading ? 'Preparing TRF...' : 'Generate TRF'}
+                                </button>
+                                <button
+                                    onClick={() => setShowResultAnalysis(true)}
+                                    disabled={selectedOrderIds.size === 0}
+                                    className="inline-flex items-center gap-2 rounded-lg bg-indigo-600 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:bg-gray-300"
+                                >
+                                    <BarChart3 className="h-4 w-4" />
+                                    Analyze selected
+                                </button>
+                            </div>
                         </div>
+                        {trfError && (
+                            <div className="mt-3 flex items-start gap-2 rounded-lg border border-red-100 bg-red-50 p-2 text-sm text-red-600">
+                                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                                <span>{trfError}</span>
+                            </div>
+                        )}
                     </div>
                     {/* Orders Table */}
                     <div className="overflow-x-auto">
@@ -1150,8 +1568,175 @@ const B2BPortal: React.FC = () => {
                     </div>
                 </div>
                     </div>
+                    )}
 
-                    <div className="space-y-6 min-w-0 lg:col-start-2 lg:row-start-1">
+                    {activeSection === 'patients' && (
+                    <div className="space-y-6 min-w-0">
+                        <div className="bg-white rounded-lg shadow-md border border-gray-200">
+                            <div className="p-6 border-b border-gray-200">
+                                <div className="flex flex-wrap items-start justify-between gap-3">
+                                    <div>
+                                        <h2 className="text-xl font-bold text-gray-900">Patient List</h2>
+                                        <p className="mt-1 text-sm text-gray-500">
+                                            Every patient booked under your account, with visit history.
+                                        </p>
+                                    </div>
+                                    <div className="flex flex-wrap items-center gap-2">
+                                        <button
+                                            onClick={loadPatients}
+                                            disabled={patientsLoading}
+                                            className="flex items-center px-3 py-2 text-sm bg-blue-50 text-blue-600 rounded-lg hover:bg-blue-100 transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+                                        >
+                                            {patientsLoading
+                                                ? <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                                                : <RefreshCw className="h-4 w-4 mr-2" />}
+                                            {patientsLoading ? 'Loading...' : 'Refresh'}
+                                        </button>
+                                        <button
+                                            onClick={handleExportPatients}
+                                            disabled={filteredPatients.length === 0}
+                                            title="Download the listed patients as an Excel file"
+                                            className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-3 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-gray-300"
+                                        >
+                                            <FileSpreadsheet className="h-4 w-4" />
+                                            Export to Excel
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-4">
+                                    <div className="relative md:col-span-2">
+                                        <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
+                                        <input
+                                            type="text"
+                                            placeholder="Search by name, patient ID or phone..."
+                                            value={patientSearch}
+                                            onChange={(e) => setPatientSearch(e.target.value)}
+                                            className="w-full rounded-lg border border-gray-300 py-2 pl-10 pr-3 focus:border-blue-500 focus:ring-2 focus:ring-blue-500"
+                                        />
+                                    </div>
+                                    <div className="relative">
+                                        <Calendar className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
+                                        <input
+                                            type="date"
+                                            value={patientRange.from}
+                                            onChange={(e) => {
+                                                setPatientRange({ ...patientRange, from: e.target.value });
+                                                setPatientsLoaded(false);
+                                            }}
+                                            className="w-full rounded-lg border border-gray-300 py-2 pl-10 pr-3 focus:border-blue-500 focus:ring-2 focus:ring-blue-500"
+                                            aria-label="Visits from date"
+                                        />
+                                    </div>
+                                    <div className="relative">
+                                        <Calendar className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
+                                        <input
+                                            type="date"
+                                            value={patientRange.to}
+                                            onChange={(e) => {
+                                                setPatientRange({ ...patientRange, to: e.target.value });
+                                                setPatientsLoaded(false);
+                                            }}
+                                            className="w-full rounded-lg border border-gray-300 py-2 pl-10 pr-3 focus:border-blue-500 focus:ring-2 focus:ring-blue-500"
+                                            aria-label="Visits to date"
+                                        />
+                                    </div>
+                                </div>
+
+                                <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
+                                    <p className="text-sm text-gray-600">
+                                        Showing {filteredPatients.length} of {patients.length} patients
+                                    </p>
+                                    {(patientRange.from || patientRange.to) && (
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                setPatientRange({ from: '', to: '' });
+                                                setPatientsLoaded(false);
+                                            }}
+                                            className="text-sm font-medium text-blue-600 hover:text-blue-700"
+                                        >
+                                            Clear dates
+                                        </button>
+                                    )}
+                                </div>
+
+                                {patientsError && (
+                                    <div className="mt-3 flex items-start gap-2 rounded-lg border border-red-100 bg-red-50 p-2 text-sm text-red-600">
+                                        <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                                        <span>{patientsError}</span>
+                                    </div>
+                                )}
+                            </div>
+
+                            <div className="overflow-x-auto">
+                                <table className="w-full">
+                                    <thead className="border-b border-gray-200 bg-gray-50">
+                                        <tr>
+                                            <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">Patient ID</th>
+                                            <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">Patient Name</th>
+                                            <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">Age / Gender</th>
+                                            <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">Phone</th>
+                                            <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">First Visit</th>
+                                            <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">Last Visit</th>
+                                            <th className="px-4 py-3 text-right text-xs font-medium uppercase tracking-wider text-gray-500">Orders</th>
+                                            <th className="px-4 py-3 text-right text-xs font-medium uppercase tracking-wider text-gray-500">Amount</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-gray-200">
+                                        {patientsLoading ? (
+                                            <tr>
+                                                <td colSpan={8} className="px-4 py-8 text-center text-sm text-gray-500">
+                                                    Loading patients...
+                                                </td>
+                                            </tr>
+                                        ) : filteredPatients.length === 0 ? (
+                                            <tr>
+                                                <td colSpan={8} className="px-4 py-8 text-center text-sm text-gray-500">
+                                                    {patients.length === 0
+                                                        ? 'No patients booked under this account yet.'
+                                                        : 'No patients match your search.'}
+                                                </td>
+                                            </tr>
+                                        ) : (
+                                            filteredPatients.map((patient) => (
+                                                <tr key={patient.patient_id} className="hover:bg-gray-50">
+                                                    <td className="whitespace-nowrap px-4 py-3 text-sm font-mono text-gray-600">
+                                                        {patient.patient_code}
+                                                    </td>
+                                                    <td className="px-4 py-3 text-sm font-medium text-gray-900">
+                                                        {patient.name}
+                                                    </td>
+                                                    <td className="whitespace-nowrap px-4 py-3 text-sm text-gray-600">
+                                                        {[formatPatientAge(patient), patient.gender].filter(Boolean).join(' / ') || '-'}
+                                                    </td>
+                                                    <td className="whitespace-nowrap px-4 py-3 text-sm text-gray-600">
+                                                        {patient.phone || '-'}
+                                                    </td>
+                                                    <td className="whitespace-nowrap px-4 py-3 text-sm text-gray-600">
+                                                        {formatVisitDate(patient.first_visit) || '-'}
+                                                    </td>
+                                                    <td className="whitespace-nowrap px-4 py-3 text-sm text-gray-600">
+                                                        {formatVisitDate(patient.last_visit) || '-'}
+                                                    </td>
+                                                    <td className="whitespace-nowrap px-4 py-3 text-right text-sm text-gray-900">
+                                                        {patient.total_orders}
+                                                    </td>
+                                                    <td className="whitespace-nowrap px-4 py-3 text-right text-sm font-medium text-gray-900">
+                                                        {formatCurrency(patient.total_amount)}
+                                                    </td>
+                                                </tr>
+                                            ))
+                                        )}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                    )}
+
+                    {activeSection === 'home' && (
+                    <div className="space-y-6 min-w-0">
                         <div className="bg-white rounded-lg shadow-md border border-gray-200 p-6">
                             <h2 className="text-lg font-bold text-gray-900">Create Booking</h2>
                             <p className="mt-1 text-sm text-gray-500">Start a new sample booking for your patients.</p>
@@ -1165,47 +1750,19 @@ const B2BPortal: React.FC = () => {
                             </button>
                         </div>
 
-                        <div className="bg-white rounded-lg shadow-md border border-gray-200 p-6">
-                            <div className="flex items-center justify-between gap-4">
-                                <div>
-                                    <h2 className="text-lg font-bold text-gray-900">Current Balance</h2>
-                                    <p className="text-sm text-gray-500">Available credit</p>
-                                </div>
-                                <span className={`text-2xl font-bold ${availableCredit >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                                    {formatCurrency(availableCredit)}
-                                </span>
+                        <button
+                            type="button"
+                            onClick={() => openSection('billing')}
+                            className="flex w-full items-center justify-between gap-4 rounded-lg border border-gray-200 bg-white p-6 text-left shadow-md transition-colors hover:bg-gray-50"
+                        >
+                            <div>
+                                <h2 className="text-lg font-bold text-gray-900">Current Balance</h2>
+                                <p className="text-sm text-gray-500">Open billing to pay or view invoices</p>
                             </div>
-                            <div className="mt-5 space-y-3">
-                                <div className="relative">
-                                    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500">Rs.</span>
-                                    <input
-                                        type="number"
-                                        min="1"
-                                        value={topUpAmount}
-                                        onChange={(e) => {
-                                            setTopUpAmountEdited(true);
-                                            setTopUpAmount(e.target.value);
-                                        }}
-                                        placeholder="Enter amount"
-                                        className="w-full pl-11 pr-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-                                    />
-                                </div>
-                                {paymentError && (
-                                    <div className="flex items-start gap-2 text-sm text-red-600 bg-red-50 border border-red-100 rounded-lg p-2">
-                                        <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
-                                        <span>{paymentError}</span>
-                                    </div>
-                                )}
-                                <button
-                                    onClick={handlePayNow}
-                                    disabled={paymentLoading}
-                                    className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors disabled:opacity-60"
-                                >
-                                    {paymentLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <CreditCard className="h-4 w-4" />}
-                                    {paymentLoading ? 'Opening Gateway...' : 'Pay Now'}
-                                </button>
-                            </div>
-                        </div>
+                            <span className={`text-2xl font-bold ${availableCredit >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                {formatCurrency(availableCredit)}
+                            </span>
+                        </button>
 
                         {portalSettings.updates_enabled && activeImageSlide && (
                             <div className="overflow-hidden rounded-lg border border-gray-200 bg-white shadow-sm">
@@ -1281,17 +1838,59 @@ const B2BPortal: React.FC = () => {
                             </div>
                         )}
                     </div>
-                </div>
+                    )}
 
-                {/* Payment Section */}
-                {account && (
+                    {/* Billing & Payments */}
+                    {activeSection === 'billing' && account && (
                     <div className="space-y-6">
+                        <div className="bg-white rounded-lg shadow-md border border-gray-200 p-6">
+                            <div className="flex items-center justify-between gap-4">
+                                <div>
+                                    <h2 className="text-lg font-bold text-gray-900">Make a Payment</h2>
+                                    <p className="text-sm text-gray-500">Top up your account credit</p>
+                                </div>
+                                <span className={`text-2xl font-bold ${availableCredit >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                    {formatCurrency(availableCredit)}
+                                </span>
+                            </div>
+                            <div className="mt-5 space-y-3 sm:flex sm:items-start sm:gap-3 sm:space-y-0">
+                                <div className="relative sm:flex-1">
+                                    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500">Rs.</span>
+                                    <input
+                                        type="number"
+                                        min="1"
+                                        value={topUpAmount}
+                                        onChange={(e) => {
+                                            setTopUpAmountEdited(true);
+                                            setTopUpAmount(e.target.value);
+                                        }}
+                                        placeholder="Enter amount"
+                                        className="w-full pl-11 pr-3 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                                    />
+                                </div>
+                                <button
+                                    onClick={handlePayNow}
+                                    disabled={paymentLoading}
+                                    className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors disabled:opacity-60 sm:w-auto"
+                                >
+                                    {paymentLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <CreditCard className="h-4 w-4" />}
+                                    {paymentLoading ? 'Opening Gateway...' : 'Pay Now'}
+                                </button>
+                            </div>
+                            {paymentError && (
+                                <div className="mt-3 flex items-start gap-2 text-sm text-red-600 bg-red-50 border border-red-100 rounded-lg p-2">
+                                    <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
+                                    <span>{paymentError}</span>
+                                </div>
+                            )}
+                        </div>
+
                         <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
                             <div className="bg-white rounded-lg shadow-md border border-gray-200 p-6">
                                 <div className="flex items-center justify-between mb-5">
                                     <div>
                                         <h2 className="text-lg font-bold text-gray-900">Current Balance Details</h2>
-                                        <p className="text-sm text-gray-500">Credit limit, open work, and pending bills</p>
+                                        <p className="text-sm text-gray-500">Credit limit, work placed, and payments made</p>
                                     </div>
                                     <div className="h-10 w-10 rounded-lg bg-blue-50 flex items-center justify-center">
                                         <Wallet className="h-5 w-5 text-blue-600" />
@@ -1302,26 +1901,38 @@ const B2BPortal: React.FC = () => {
                                         <span className="text-sm text-gray-500">Credit Limit</span>
                                         <span className="font-semibold text-gray-900">{formatCurrency(creditLimit)}</span>
                                     </div>
+                                    {/* Signed so the column reads as one running sum:
+                                        limit - money out + money in = available. Money the partner
+                                        pays therefore shows as +, never -. The old card subtracted
+                                        payments (they reduce credit *used*) while the bottom line
+                                        was a *balance*, so a top-up appeared as a deduction and
+                                        then again as a gain - the same rupee three times.
+
+                                        Open orders and outstanding bills are not listed separately:
+                                        both are already inside "Orders Placed", and repeating them
+                                        read as extra charges. */}
                                     <div className="flex items-center justify-between">
-                                        <span className="text-sm text-gray-500">Open Orders</span>
-                                        <span className="font-semibold text-orange-600">{formatCurrency(openOrderAmount)}</span>
+                                        <span className="text-sm text-gray-500">Orders Placed</span>
+                                        <span className="font-semibold text-orange-600">
+                                            {orderDebitAmount > 0 ? '-' : ''}{formatCurrency(orderDebitAmount)}
+                                        </span>
                                     </div>
-                                    <div className="flex items-center justify-between">
-                                        <span className="text-sm text-gray-500">Outstanding Bills</span>
-                                        <span className="font-semibold text-orange-600">{formatCurrency(outstandingInvoiceAmount)}</span>
-                                    </div>
-                                    <div className="flex items-center justify-between">
-                                        <span className="text-sm text-gray-500">Pending Bookings</span>
-                                        <span className="font-semibold text-amber-600">{formatCurrency(pendingBookingAmount)}</span>
-                                    </div>
-                                    <div className="flex items-center justify-between">
-                                        <span className="text-sm text-gray-500">Payments Applied</span>
-                                        <span className="font-semibold text-green-600">-{formatCurrency(paymentCreditTotal)}</span>
-                                    </div>
-                                    {manualCreditTotal > 0 && (
+                                    {pendingBookingAmount > 0 && (
                                         <div className="flex items-center justify-between">
-                                            <span className="text-sm text-gray-500">Payments Received at Lab</span>
-                                            <span className="font-semibold text-green-600">-{formatCurrency(manualCreditTotal)}</span>
+                                            <span className="text-sm text-gray-500">Pending Bookings</span>
+                                            <span className="font-semibold text-amber-600">-{formatCurrency(pendingBookingAmount)}</span>
+                                        </div>
+                                    )}
+                                    <div className="flex items-center justify-between">
+                                        <span className="text-sm text-gray-500">Online Payments</span>
+                                        <span className="font-semibold text-green-600">
+                                            {shownGatewayCredit > 0 ? '+' : ''}{formatCurrency(shownGatewayCredit)}
+                                        </span>
+                                    </div>
+                                    {shownManualCredit > 0 && (
+                                        <div className="flex items-center justify-between">
+                                            <span className="text-sm text-gray-500">Paid at Lab</span>
+                                            <span className="font-semibold text-green-600">+{formatCurrency(shownManualCredit)}</span>
                                         </div>
                                     )}
                                     <div className="pt-3 border-t border-gray-200 flex items-center justify-between">
@@ -1330,6 +1941,16 @@ const B2BPortal: React.FC = () => {
                                             {formatCurrency(availableCredit)}
                                         </span>
                                     </div>
+                                    {/* A footnote under the total, not a term above it. At a zero
+                                        credit limit the advance IS the available credit, so showing
+                                        it as its own row just repeated the same number. It only
+                                        carries information once there is a limit to separate it
+                                        from - "how much of this headroom is my own money". */}
+                                    {advanceBalance > 0 && creditLimit > 0 && (
+                                        <div className="text-xs text-gray-500">
+                                            Includes {formatCurrency(advanceBalance)} you have paid in advance
+                                        </div>
+                                    )}
                                 </div>
                             </div>
 
@@ -1448,87 +2069,55 @@ const B2BPortal: React.FC = () => {
                     </div>
                 )}
 
-                {/* Support sections - collapsed by default, below reports and billing */}
-                {account && (
-                    <div className="mt-6 space-y-4">
+                    {/* Chat with the lab */}
+                    {activeSection === 'chat' && account && (
                         <div className="bg-white rounded-lg shadow-md border border-gray-200 overflow-hidden">
-                            <button
-                                type="button"
-                                onClick={() => {
-                                    setShowChatSection((current) => {
-                                        if (!current) setChatUnreadCount(0);
-                                        return !current;
-                                    });
-                                }}
-                                className="flex w-full items-center justify-between px-6 py-4 text-left hover:bg-gray-50"
-                            >
-                                <div className="flex items-center gap-3">
-                                    <div className="h-10 w-10 rounded-lg bg-blue-50 flex items-center justify-center">
-                                        <MessageSquare className="h-5 w-5 text-blue-600" />
-                                    </div>
-                                    <div>
-                                        <h2 className="text-lg font-bold text-gray-900 flex items-center gap-2">
-                                            Chat with the Lab
-                                            {chatUnreadCount > 0 && (
-                                                <span className="rounded-full bg-red-500 px-2 py-0.5 text-xs font-semibold text-white">
-                                                    {chatUnreadCount} new
-                                                </span>
-                                            )}
-                                        </h2>
-                                        <p className="text-sm text-gray-500">
-                                            Ask questions and share clinical history or documents
-                                        </p>
-                                    </div>
+                            <div className="flex items-center gap-3 px-6 py-4">
+                                <div className="h-10 w-10 rounded-lg bg-blue-50 flex items-center justify-center">
+                                    <MessageSquare className="h-5 w-5 text-blue-600" />
                                 </div>
-                                <ChevronDown
-                                    className={`h-5 w-5 text-gray-400 transition-transform ${showChatSection ? 'rotate-180' : ''}`}
+                                <div>
+                                    <h2 className="text-lg font-bold text-gray-900">Chat with the Lab</h2>
+                                    <p className="text-sm text-gray-500">
+                                        Ask questions and share clinical history or documents
+                                    </p>
+                                </div>
+                            </div>
+                            <div className="border-t border-gray-100 bg-gray-50 p-4">
+                                <PartnerChatPanel
+                                    accountId={account.id}
+                                    labId={account.lab_id}
+                                    counterpartyName={labInfo?.name || 'the lab'}
                                 />
-                            </button>
-                            {showChatSection && (
-                                <div className="border-t border-gray-100 bg-gray-50 p-4">
-                                    <PartnerChatPanel
-                                        accountId={account.id}
-                                        labId={account.lab_id}
-                                        counterpartyName={labInfo?.name || 'the lab'}
-                                    />
-                                </div>
-                            )}
+                            </div>
                         </div>
+                    )}
 
+                    {/* Material requests */}
+                    {activeSection === 'materials' && account && (
                         <div className="bg-white rounded-lg shadow-md border border-gray-200 overflow-hidden">
-                            <button
-                                type="button"
-                                onClick={() => setShowMaterialSection((current) => !current)}
-                                className="flex w-full items-center justify-between px-6 py-4 text-left hover:bg-gray-50"
-                            >
-                                <div className="flex items-center gap-3">
-                                    <div className="h-10 w-10 rounded-lg bg-emerald-50 flex items-center justify-center">
-                                        <Package className="h-5 w-5 text-emerald-600" />
-                                    </div>
-                                    <div>
-                                        <h2 className="text-lg font-bold text-gray-900">Material Requests</h2>
-                                        <p className="text-sm text-gray-500">
-                                            Request vacutainers, containers, and other supplies from the lab
-                                        </p>
-                                    </div>
+                            <div className="flex items-center gap-3 px-6 py-4">
+                                <div className="h-10 w-10 rounded-lg bg-emerald-50 flex items-center justify-center">
+                                    <Package className="h-5 w-5 text-emerald-600" />
                                 </div>
-                                <ChevronDown
-                                    className={`h-5 w-5 text-gray-400 transition-transform ${showMaterialSection ? 'rotate-180' : ''}`}
+                                <div>
+                                    <h2 className="text-lg font-bold text-gray-900">Material Requests</h2>
+                                    <p className="text-sm text-gray-500">
+                                        Request vacutainers, containers, and other supplies from the lab
+                                    </p>
+                                </div>
+                            </div>
+                            <div className="border-t border-gray-100 bg-gray-50 p-4">
+                                <MaterialRequestPanel
+                                    accountId={account.id}
+                                    labId={account.lab_id}
+                                    mode="account"
                                 />
-                            </button>
-                            {showMaterialSection && (
-                                <div className="border-t border-gray-100 bg-gray-50 p-4">
-                                    <MaterialRequestPanel
-                                        accountId={account.id}
-                                        labId={account.lab_id}
-                                        mode="account"
-                                    />
-                                </div>
-                            )}
+                            </div>
                         </div>
-                    </div>
-                )}
-            </main>
+                    )}
+                </main>
+            </div>
 
             {showBookingModal && account && (
                 <B2BBookingModal

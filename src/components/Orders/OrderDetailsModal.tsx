@@ -805,6 +805,9 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
             is_calculated: !!analyte.is_calculated,
             formula: analyte.formula ?? null,
             formula_variables: analyte.formula_variables ?? null,
+            // Carried on the row so live recalculation knows to run text rules
+            // instead of feeding the JSON rule list to the numeric evaluator.
+            calculation_result_type: analyte.calculation_result_type ?? null,
             expected_normal_values: analyte.expected_normal_values || [],
             expected_value_flag_map: analyte.expected_value_flag_map || {},
             expected_value_codes: analyte.expected_value_codes || {},
