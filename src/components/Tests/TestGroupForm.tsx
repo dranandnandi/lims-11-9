@@ -2152,6 +2152,33 @@ const TestGroupForm: React.FC<TestGroupFormProps> = ({ onClose, onSubmit, testGr
                     );
                   })}
 
+                  {/* Sample Condition Label — the prefix printed before the value
+                      (e.g. "Sample Condition: Fasting"). Blank prints the bare value. */}
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <span className="text-sm text-gray-700">Sample Condition Label</span>
+                      <p className="text-xs text-gray-500 mt-0.5">Prefix before the value, e.g. "Sample Condition: Fasting". Clear it to print just "Fasting".</p>
+                    </div>
+                    <div className="flex items-center gap-2 flex-shrink-0">
+                      {(formData.print_options as any)?.sampleConditionLabel !== undefined && (
+                        <button type="button"
+                          onClick={() => setFormData(prev => {
+                            const next = { ...(prev.print_options || {}) } as Record<string, unknown>;
+                            delete next.sampleConditionLabel;
+                            return { ...prev, print_options: Object.keys(next).length > 0 ? next as typeof prev.print_options : null };
+                          })}
+                          className="text-xs px-2 py-0.5 rounded border bg-white text-gray-500 border-gray-300 hover:border-amber-400">
+                          ↩ Lab
+                        </button>
+                      )}
+                      <input type="text"
+                        value={(formData.print_options as any)?.sampleConditionLabel ?? ''}
+                        placeholder="Sample Condition"
+                        onChange={(e) => setFormData(prev => ({ ...prev, print_options: { ...(prev.print_options || {}), sampleConditionLabel: e.target.value } }))}
+                        className="w-40 px-2 py-1 border border-gray-300 rounded text-sm" />
+                    </div>
+                  </div>
+
                   {/* Header Color */}
                   <div className="flex items-center justify-between">
                     <span className="text-sm text-gray-700">Header Color</span>

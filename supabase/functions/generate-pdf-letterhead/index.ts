@@ -1884,6 +1884,23 @@ interface CompactPrintPlan {
   notes?: string[];
 }
 
+// Prefix printed before the sample condition value. "Condition:" on its own
+// reads as specimen integrity (hemolyzed / lipemic), which is not what these
+// options mean, so the default spells it out. Labs that prefer "Fasting Status"
+// — or just the bare value — set the sampleConditionLabel print option; an
+// empty string drops the prefix entirely.
+const DEFAULT_SAMPLE_CONDITION_LABEL = "Sample Condition";
+
+function formatSampleCondition(printOptions: any): string {
+  const value = String(printOptions?._sampleCondition || "").trim();
+  if (!value) return "";
+  const raw = printOptions?.sampleConditionLabel;
+  const label = raw === undefined || raw === null
+    ? DEFAULT_SAMPLE_CONDITION_LABEL
+    : String(raw).trim();
+  return label ? `${label}: ${value}` : value;
+}
+
 function normalizePrintLayoutMode(value: unknown): PrintLayoutMode {
   return value === "compact" ? "compact" : "standard";
 }
@@ -2532,7 +2549,7 @@ function generateClassicDefaultTemplateHtml(
       <div class="test-group-section" style="margin-bottom: 16px;">
         <h4 style="font-size: 16px; font-weight: 600; color: #1e40af; padding: 6px 0; margin: 0;">${groupName}</h4>
         ${(printOptions as any)?._sampleType ? `<div style="font-size:11px;color:#6b7280;font-style:italic;margin:-4px 0 4px 0;">Specimen: ${(printOptions as any)._sampleType}</div>` : ''}
-        ${(printOptions as any)?._sampleCondition ? `<div style="font-size:11px;color:#6b7280;font-style:italic;margin:-4px 0 4px 0;">Condition: ${(printOptions as any)._sampleCondition}</div>` : ''}
+        ${formatSampleCondition(printOptions) ? `<div style="font-size:11px;color:#6b7280;font-style:italic;margin:-4px 0 4px 0;">${formatSampleCondition(printOptions)}</div>` : ''}
         <table class="report-table" style="width: 100%; border-collapse: collapse; font-size: 12px;">
           <thead>
             <tr style="background: #f1f5f9;">
@@ -3832,8 +3849,9 @@ ${patientInfoColumnDivider ? `
       : (analytes[0]?.specimen
         ? `<div class="center-subtitle">Specimen: ${analytes[0].specimen}</div>`
         : "");
-    const conditionText = (printOptions as any)?._sampleCondition
-      ? `<div class="center-subtitle">Condition: ${(printOptions as any)._sampleCondition}</div>`
+    const conditionLine = formatSampleCondition(printOptions);
+    const conditionText = conditionLine
+      ? `<div class="center-subtitle">${conditionLine}</div>`
       : "";
 
 	    const groupTitleBelowHeaders = testGroupTitlePosition === "below_headers";
@@ -4666,7 +4684,7 @@ function generateDefaultTemplateHtml(
         <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 10px; padding-bottom: 6px; border-bottom: 2px solid ${THEME.accent};">
           <h3 style="font-size: 18px; font-weight: 600; color: ${THEME.accent}; margin: 0;">${groupName}</h3>
           ${(printOptions as any)?._sampleType ? `<span style="font-size:11px;color:#6b7280;font-style:italic;">Â· Specimen: ${(printOptions as any)._sampleType}</span>` : ''}
-          ${(printOptions as any)?._sampleCondition ? `<span style="font-size:11px;color:#6b7280;font-style:italic;">Â· Condition: ${(printOptions as any)._sampleCondition}</span>` : ''}
+          ${formatSampleCondition(printOptions) ? `<span style="font-size:11px;color:#6b7280;font-style:italic;">Â· ${formatSampleCondition(printOptions)}</span>` : ''}
         </div>
     `;
 
@@ -9961,7 +9979,7 @@ serve(async (req) => {
           if (_sc) {
             (singlePrintOptions as any)._sampleCondition = _sc;
             fullContext.sampleCondition = _sc;
-            fullContext.sampleConditionLabel = `Condition: ${_sc}`;
+            fullContext.sampleConditionLabel = formatSampleCondition(singlePrintOptions);
           }
         }
         mergedPrintOptions = singlePrintOptions; // lift to outer scope for print version
@@ -10221,7 +10239,10 @@ serve(async (req) => {
           const groupSampleCondition = testGroupSampleConditions.get(testGroupId);
           if (groupSampleCondition) {
             groupFullContext.sampleCondition = groupSampleCondition;
-            groupFullContext.sampleConditionLabel = `Condition: ${groupSampleCondition}`;
+            groupFullContext.sampleConditionLabel = formatSampleCondition({
+              ...(mergePrintOptions(pdfSettings, testGroupPrintOptions.get(testGroupId)) ?? {}),
+              _sampleCondition: groupSampleCondition,
+            });
           }
           let renderedHtml = "";
           let bodyContent = "";

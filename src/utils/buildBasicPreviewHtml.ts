@@ -58,7 +58,7 @@ export interface PreviewTestGroup {
   printOptions?: Record<string, unknown> | null;
   /** test_groups.sample_type — printed as "Specimen: …" when showSampleType is on. */
   sampleType?: string | null;
-  /** order_test_groups.sample_condition — printed as "Condition: …" when showSampleCondition is on. */
+  /** order_test_groups.sample_condition — printed as "Sample Condition: …" when showSampleCondition is on. */
   sampleCondition?: string | null;
 }
 
@@ -292,8 +292,23 @@ function resolveBooleanOption(
   return false;
 }
 
+/** Default prefix for the sample condition line — see formatSampleCondition() in
+ * generate-pdf-letterhead. A blank sampleConditionLabel prints the bare value. */
+const DEFAULT_SAMPLE_CONDITION_LABEL = "Sample Condition";
+
+function resolveSampleConditionLabel(
+  groupOptions: Record<string, unknown> | null | undefined,
+  labOptions: Record<string, unknown> | null | undefined,
+): string {
+  for (const opts of [groupOptions, labOptions]) {
+    const raw = opts?.sampleConditionLabel;
+    if (raw !== undefined && raw !== null) return String(raw).trim();
+  }
+  return DEFAULT_SAMPLE_CONDITION_LABEL;
+}
+
 /**
- * "Specimen: …" / "Condition: …" subtitle lines under a group title.
+ * "Specimen: …" / "Sample Condition: …" subtitle lines under a group title.
  * Mirrors generateBasicDefaultTemplateHtml() in generate-pdf-letterhead, which
  * gates them on the showSampleType / showSampleCondition print options.
  */
@@ -306,8 +321,9 @@ function buildGroupSubtitleHtml(
   const specimen = sampleType && resolveBooleanOption("showSampleType", group.printOptions, labOptions)
     ? `<div class="center-subtitle">Specimen: ${escapeHtml(sampleType)}</div>`
     : "";
+  const conditionLabel = resolveSampleConditionLabel(group.printOptions, labOptions);
   const condition = sampleCondition && resolveBooleanOption("showSampleCondition", group.printOptions, labOptions)
-    ? `<div class="center-subtitle">Condition: ${escapeHtml(sampleCondition)}</div>`
+    ? `<div class="center-subtitle">${conditionLabel ? `${escapeHtml(conditionLabel)}: ` : ""}${escapeHtml(sampleCondition)}</div>`
     : "";
   return `${specimen}${condition}`;
 }
