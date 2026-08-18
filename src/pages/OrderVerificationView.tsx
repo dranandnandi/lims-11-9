@@ -1413,7 +1413,7 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
         return { ...fallback, imageUrl: sigUrl };
       };
 
-      const [patientRes, orderRes, tgaRes, tgRes, sectionsRes, verifierRes, otgConditionRes] = await Promise.all([
+      const [patientRes, orderRes, tgaRes, tgRes, sectionsRes, verifierRes, otgConditionRes, otConditionRes] = await Promise.all([
         supabase
           .from("patients")
           .select("age, age_unit, gender, display_id")
@@ -1447,6 +1447,15 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
               .eq("order_id", order.orderId)
               .in("test_group_id", groupIds)
           : Promise.resolve({ data: [] as any[], error: null }),
+        // orders booked through the order form only have order_tests rows, which
+        // carry the same column — the PDF falls back to it the same way
+        groupIds.length > 0
+          ? supabase
+              .from("order_tests")
+              .select("test_group_id, sample_condition")
+              .eq("order_id", order.orderId)
+              .in("test_group_id", groupIds)
+          : Promise.resolve({ data: [] as any[], error: null }),
       ]);
 
       [
@@ -1457,6 +1466,7 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
         ["result_section_content", sectionsRes.error],
         ["verifier", verifierRes.error],
         ["order_test_groups", otgConditionRes.error],
+        ["order_tests", otConditionRes.error],
       ].forEach(([label, error]) => {
         if (error) {
           console.warn(`[QuickPreview] ${label} query returned an error`, error);
@@ -1722,7 +1732,7 @@ const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToP
       // test_group_id → condition chosen at collection (first non-empty wins,
       // matching how generate-pdf-letterhead resolves it).
       const groupSampleConditions = new Map<string, string>();
-      for (const row of (otgConditionRes.data || []) as any[]) {
+      for (const row of [...((otgConditionRes.data || []) as any[]), ...((otConditionRes.data || []) as any[])]) {
         const condition = String(row.sample_condition || "").trim();
         if (row.test_group_id && condition && !groupSampleConditions.has(row.test_group_id)) {
           groupSampleConditions.set(row.test_group_id, condition);
