@@ -16,6 +16,12 @@
 import { database, supabase } from './supabase';
 import { determineFlag, FlagResult, ValueType, AnalyteConfig, PatientContext as FlagPatientContext } from './flagDetermination';
 import { findResolvedReferenceRange, isPlaceholderReferenceRange, resolveReferenceRanges } from './referenceRangeService';
+import {
+  contextForGroup,
+  fetchPatientRangeInfo,
+  fetchRangeRules,
+  resolveForAnalyte,
+} from './referenceRangeLoader';
 
 // Netlify function URL for AI interpretation (keeps API key secure)
 const AI_FLAG_FUNCTION_URL = '/.netlify/functions/ai-flag-interpretation';
@@ -685,6 +691,10 @@ export async function runAIFlagAnalysis(
     createAudit?: boolean;
     patientContext?: PatientContext;
     useAIService?: boolean; // If true, forces AI service call; if false, skips AI; if undefined, auto-decides
+    // Entry screens that already resolved reference ranges before saving pass
+    // this so the same rule pass and resolver edge function are not run a
+    // second time on every submit. Quick Result Entry does exactly that.
+    skipRangeResolution?: boolean;
     forceAI?: boolean; // Deprecated, use useAIService
   }
 ): Promise<BatchAnalysisResult> {
@@ -693,6 +703,7 @@ export async function runAIFlagAnalysis(
     applyToDatabase: true,
     createAudit: true,
     useAIService: undefined as boolean | undefined, // Auto-decide by default
+    skipRangeResolution: false,
     ...options
   };
 
@@ -780,7 +791,7 @@ export async function runAIFlagAnalysis(
           // --------------- DYNAMIC RANGE RESOLUTION START ---------------
           // If we have "Age-specific" or placeholder ranges, resolve them FIRST
           // using the referenceRangeService (which consults Knowledge Base + Patient Context)
-          try {
+          if (!defaultOptions.skipRangeResolution) try {
             // SAFEGUARD: Ensure test_group_id is present (some queries might omit it)
             if (toProcess.some(rv => !rv.test_group_id)) {
                console.log('[AI Flag] Some results missing test_group_id, re-fetching...');
@@ -798,6 +809,84 @@ export async function runAIFlagAnalysis(
                   });
                }
             }
+
+            // --- Deterministic rules first ---------------------------------
+            // A lab that has configured gender / age / sample-condition rules
+            // gets its answer here, with no AI call. Only what the rules do not
+            // cover falls through to the resolver below.
+            try {
+              const ruleLabAnalyteIds = toProcess.map(rv => rv.lab_analyte_id).filter(Boolean) as string[];
+              if (ruleLabAnalyteIds.length > 0) {
+                const [rules, patientInfo] = await Promise.all([
+                  fetchRangeRules(ruleLabAnalyteIds),
+                  fetchPatientRangeInfo(orderId),
+                ]);
+
+                if (rules.size > 0) {
+                  // Sample condition is per test group on the order.
+                  const conditionByGroup = new Map<string, string>();
+                  const [{ data: otgRows }, { data: otRows }] = await Promise.all([
+                    supabase.from('order_test_groups').select('test_group_id, sample_condition').eq('order_id', orderId),
+                    supabase.from('order_tests').select('test_group_id, sample_condition').eq('order_id', orderId),
+                  ]);
+                  for (const row of [...(otgRows || []), ...(otRows || [])]) {
+                    const condition = String((row as any)?.sample_condition || '').trim();
+                    const groupId = (row as any)?.test_group_id;
+                    if (groupId && condition && !conditionByGroup.has(groupId)) conditionByGroup.set(groupId, condition);
+                  }
+
+                  // Resolve every row first, then write the rewrites together.
+                  // Awaiting inside the loop made this cost one ~600ms round
+                  // trip per analyte on a panel where the rules moved ranges.
+                  const rangeRewrites: Array<{ id: string; patch: Record<string, unknown> }> = [];
+                  for (const rv of toProcess) {
+                    if (!rv.lab_analyte_id) continue;
+                    const ctx = contextForGroup(
+                      patientInfo,
+                      rv.test_group_id ? conditionByGroup.get(rv.test_group_id) ?? null : null,
+                    );
+                    const resolved = resolveForAnalyte(rules, {
+                      lab_analyte_id: rv.lab_analyte_id,
+                      reference_range: rv.reference_range,
+                      reference_range_male: rv.reference_range_male,
+                      reference_range_female: rv.reference_range_female,
+                      low_critical: rv.low_critical,
+                      high_critical: rv.high_critical,
+                    }, ctx);
+
+                    // Only a matched rule overrides a saved range. Without one
+                    // the resolver just echoes the legacy columns back, and
+                    // rewriting a range with itself would be pure churn.
+                    if (resolved.source !== 'rule') continue;
+                    if (!resolved.range_text || resolved.range_text === rv.reference_range) continue;
+
+                    console.log(`[AI Flag] 📐 Rule range for ${rv.parameter}: "${rv.reference_range}" -> "${resolved.range_text}" (${resolved.applied_rule})`);
+                    rv.reference_range = resolved.range_text;
+                    const ruleResult = analysisResult.results.find(r => r.resultValueId === rv.id);
+                    if (ruleResult) ruleResult.resolvedReferenceRange = resolved.range_text;
+
+                    rangeRewrites.push({
+                      id: rv.id,
+                      patch: {
+                        reference_range: resolved.range_text,
+                        range_rule_id: resolved.rule_id,
+                        range_source: 'rule',
+                        applied_range_rule: resolved.applied_rule,
+                      },
+                    });
+                  }
+
+                  if (rangeRewrites.length > 0) {
+                    await Promise.all(rangeRewrites.map(({ id, patch }) =>
+                      supabase.from('result_values').update(patch).eq('id', id)
+                    ));
+                  }
+                }
+              }
+            } catch (ruleErr) {
+              console.warn('[AI Flag] ⚠️ Deterministic range rules failed (continuing):', ruleErr);
+            }
+            // --- End deterministic rules -----------------------------------
 
             // Group by test group ID for batch resolution
             const rvsByGroup: Record<string, typeof toProcess> = {};

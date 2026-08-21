@@ -50,6 +50,7 @@ import { convertToCustomDomain } from '../utils/storageUrlBuilder';
 import type { LabTemplateRecord, ReportData, LabBrandingHtmlDefaults } from '../utils/pdfService';
 import PDFProgressModal from '../components/PDFProgressModal';
 import { usePDFGeneration, isOrderReportReady } from '../hooks/usePDFGeneration';
+import { buildReportLinkUrl } from '../utils/reportLink';
 import QuickSendReport from '../components/WhatsApp/QuickSendReport';
 import PDFSettingsModal, {
   PDFRenderSettings,
@@ -75,6 +76,8 @@ type DateFilter = CalendarDateFilter;
 type SortField = 'sample_id' | 'patient_name' | 'order_date' | 'verified_at' | 'test_name';
 type SortDirection = 'asc' | 'desc';
 
+// Matches the Result Verification console's default ("Sample ID newest first"),
+// so today's samples read 3 -> 2 -> 1 on both screens.
 const DEFAULT_REPORT_SORT: { field: SortField; direction: SortDirection } = {
   field: 'sample_id',
   direction: 'desc',
@@ -313,6 +316,44 @@ const Reports: React.FC = () => {
   const [isPolling, setIsPolling] = useState(false);
   const previousQueueStatusRef = React.useRef<Map<string, any>>(new Map());
 
+  // Stable report link state per order, polled alongside the queue.
+  // A job sits in 'processing' for the whole download+upload tail, but the link
+  // resolves to a real PDF as soon as PDF.co has rendered -- so this is what
+  // decides whether the row's actions are usable, not the queue status.
+  // orderId -> { final?: {status, url}, print?: {status, url} }
+  const [reportLinkStatus, setReportLinkStatus] = useState<
+    Map<string, Record<string, { status: string; url: string }>>
+  >(new Map());
+
+  /** A variant is usable once it resolves to an actual PDF rather than a wait page. */
+  const getReadyReportLink = useCallback(
+    (orderId: string, variant: 'final' | 'print') => {
+      const entry = reportLinkStatus.get(orderId)?.[variant];
+      if (!entry) return null;
+      return entry.status === 'temp' || entry.status === 'permanent' ? entry.url : null;
+    },
+    [reportLinkStatus]
+  );
+
+  const isReportLinkViewable = useCallback(
+    (orderId: string) => !!getReadyReportLink(orderId, 'final'),
+    [getReadyReportLink]
+  );
+
+  /**
+   * Whether the row's actions should stay disabled.
+   *
+   * Previously this was "the queue says processing", which kept View/Download/
+   * WhatsApp greyed out for the entire upload tail even though the report was
+   * already viewable. Once the stable link resolves there is a real PDF behind
+   * it, so the buttons are enabled and the progress card just keeps ticking.
+   */
+  const isOrderBusy = useCallback((orderId: string) => {
+    if (isReportLinkViewable(orderId)) return false;
+    return generatingOrderId === orderId
+      || pdfQueueStatus.get(orderId)?.status === 'processing';
+  }, [isReportLinkViewable, generatingOrderId, pdfQueueStatus]);
+
   // Poll PDF queue status for orders
   const pollPDFQueueStatus = useCallback(async (orderIds: string[], shouldReloadOnComplete = true) => {
     if (orderIds.length === 0) return;
@@ -353,6 +394,29 @@ const Reports: React.FC = () => {
       // Update the ref for next comparison
       previousQueueStatusRef.current = statusMap;
       setPdfQueueStatus(statusMap);
+
+      // Piggyback the stable-link state on the same poll. Labs not enrolled
+      // simply have no rows, leaving the map empty and every gate unchanged.
+      try {
+        const links: any[] = [];
+        for (const orderIdBatch of chunkArray(orderIds, RELATED_LOOKUP_BATCH_SIZE)) {
+          const { data: batchLinks } = await supabase
+            .from('report_links')
+            .select('order_id, variant, status, token')
+            .in('variant', ['final', 'print'])
+            .in('order_id', orderIdBatch);
+          links.push(...((batchLinks as any[]) || []));
+        }
+        const linkMap = new Map<string, Record<string, { status: string; url: string }>>();
+        for (const link of links) {
+          const entry = linkMap.get(link.order_id) ?? {};
+          entry[link.variant] = { status: link.status, url: buildReportLinkUrl(link.token) };
+          linkMap.set(link.order_id, entry);
+        }
+        setReportLinkStatus(linkMap);
+      } catch (linkErr) {
+        console.warn('Report link status poll failed (non-fatal):', linkErr);
+      }
 
       // If any job just completed, reload approved results
       if (hasNewlyCompleted && shouldReloadOnComplete) {
@@ -2339,6 +2403,23 @@ const Reports: React.FC = () => {
         const progressPercent = job.progress_percent || 0;
         const progressStage = job.progress_stage || 'Initializing...';
 
+        // The link already resolves to a real PDF, so the remaining work is the
+        // storage upload happening behind a URL the user can already open. Say
+        // that plainly instead of showing a spinner that implies "not ready".
+        if (isReportLinkViewable(orderId)) {
+          return (
+            <div className="flex items-center space-x-2 px-2 py-1 bg-green-50 border border-green-200 rounded-md">
+              <CheckCircle className="w-3.5 h-3.5 text-green-600" />
+              <div className="flex flex-col">
+                <span className="text-xs font-medium text-green-800">Report ready</span>
+                <span className="text-[10px] text-green-600">
+                  Saving to storage in background ({progressPercent}%)
+                </span>
+              </div>
+            </div>
+          );
+        }
+
         // Determine stage icon and color based on progress
         const getStageInfo = (percent: number) => {
           if (percent < 20) return { stage: 'Fetching data', icon: '📊' };
@@ -3077,13 +3158,49 @@ const Reports: React.FC = () => {
                                     </button>
                                   </div>
                                 )}
+                                {/* The report row still says "not generated" until the
+                                    approved-results query refreshes, but the stable
+                                    links already resolve to real PDFs. Offer them
+                                    straight away rather than making the user wait for
+                                    the storage upload and a list reload. */}
+                                {(() => {
+                                  const ecopyLink = getReadyReportLink(group.order_id, 'final');
+                                  const printLink = getReadyReportLink(group.order_id, 'print');
+                                  if (!ecopyLink && !printLink) return null;
+                                  return (
+                                    <div className="flex items-center gap-0.5">
+                                      {ecopyLink && (
+                                        <button
+                                          className={`flex items-center space-x-1 px-2 py-1 text-xs bg-green-600 text-white hover:bg-green-700 transition-colors ${printLink ? 'rounded-l' : 'rounded'}`}
+                                          onClick={() => window.open(ecopyLink, '_blank')}
+                                          title="Download eCopy (link stays valid permanently)"
+                                        >
+                                          <Download className="w-3.5 h-3.5" />
+                                          <span>Download</span>
+                                        </button>
+                                      )}
+                                      {printLink && (
+                                        <button
+                                          className={`flex items-center px-1.5 py-1 text-xs bg-emerald-600 text-white hover:bg-emerald-700 transition-colors border-l border-emerald-800 ${ecopyLink ? 'rounded-r' : 'rounded'}`}
+                                          onClick={() => {
+                                            window.open(printLink, '_blank');
+                                            void markOrderPrinted(group.order_id);
+                                          }}
+                                          title="Print copy (link stays valid permanently)"
+                                        >
+                                          <Printer className="w-3.5 h-3.5" />
+                                        </button>
+                                      )}
+                                    </div>
+                                  );
+                                })()}
                                 <button
-                                  className={`flex items-center space-x-1 px-2 py-1 text-xs bg-green-600 text-white rounded hover:bg-green-700 transition-colors ${(generatingOrderId === group.order_id || pdfQueueStatus.get(group.order_id)?.status === 'processing') ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                  className={`flex items-center space-x-1 px-2 py-1 text-xs bg-green-600 text-white rounded hover:bg-green-700 transition-colors ${(isOrderBusy(group.order_id)) ? 'opacity-50 cursor-not-allowed' : ''}`}
                                   onClick={() => handleDownload(group.order_id, false)}
-                                  disabled={generatingOrderId === group.order_id || pdfQueueStatus.get(group.order_id)?.status === 'processing'}
+                                  disabled={isOrderBusy(group.order_id)}
                                   title="Generate final report"
                                 >
-                                  {(generatingOrderId === group.order_id || pdfQueueStatus.get(group.order_id)?.status === 'processing') ? (
+                                  {(isOrderBusy(group.order_id)) ? (
                                     <Loader2 className="w-3.5 h-3.5 animate-spin" />
                                   ) : (
                                     <Download className="w-3.5 h-3.5" />
@@ -3247,18 +3364,18 @@ const Reports: React.FC = () => {
                           <>
                             <div className="flex items-center gap-0.5">
                               <button
-                                className={`flex items-center space-x-1 px-2 py-1 text-xs bg-amber-600 text-white rounded-l hover:bg-amber-700 transition-colors ${(generatingOrderId === group.order_id || pdfQueueStatus.get(group.order_id)?.status === 'processing') ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                className={`flex items-center space-x-1 px-2 py-1 text-xs bg-amber-600 text-white rounded-l hover:bg-amber-700 transition-colors ${(isOrderBusy(group.order_id)) ? 'opacity-50 cursor-not-allowed' : ''}`}
                                 onClick={() => handleDownload(group.order_id, true, 'ecopy')}
-                                disabled={generatingOrderId === group.order_id || pdfQueueStatus.get(group.order_id)?.status === 'processing'}
+                                disabled={isOrderBusy(group.order_id)}
                                 title="Generate eCopy draft (letterhead)"
                               >
-                                {(generatingOrderId === group.order_id || pdfQueueStatus.get(group.order_id)?.status === 'processing') ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+                                {(isOrderBusy(group.order_id)) ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
                                 <span>Draft eCopy</span>
                               </button>
                               <button
-                                className={`flex items-center space-x-1 px-2 py-1 text-xs bg-amber-500 text-white rounded-r hover:bg-amber-600 transition-colors border-l border-amber-700 ${(generatingOrderId === group.order_id || pdfQueueStatus.get(group.order_id)?.status === 'processing') ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                className={`flex items-center space-x-1 px-2 py-1 text-xs bg-amber-500 text-white rounded-r hover:bg-amber-600 transition-colors border-l border-amber-700 ${(isOrderBusy(group.order_id)) ? 'opacity-50 cursor-not-allowed' : ''}`}
                                 onClick={() => handleDownload(group.order_id, true, 'print')}
-                                disabled={generatingOrderId === group.order_id || pdfQueueStatus.get(group.order_id)?.status === 'processing'}
+                                disabled={isOrderBusy(group.order_id)}
                                 title="Generate print draft (no letterhead)"
                               >
                                 <Printer className="w-3.5 h-3.5" />
@@ -3407,15 +3524,15 @@ const Reports: React.FC = () => {
                                     <span>Template</span>
                                   </button>
                                   <button
-                                    className={`flex-1 flex items-center justify-center space-x-1 px-3 py-2 text-sm bg-green-600 text-white rounded-md hover:bg-green-700 transition-colors ${(generatingOrderId === group.order_id || pdfQueueStatus.get(group.order_id)?.status === 'processing')
+                                    className={`flex-1 flex items-center justify-center space-x-1 px-3 py-2 text-sm bg-green-600 text-white rounded-md hover:bg-green-700 transition-colors ${(isOrderBusy(group.order_id))
                                       ? 'opacity-50 cursor-not-allowed'
                                       : ''
                                       }`}
                                     onClick={() => handleDownload(group.order_id, false)}
-                                    disabled={generatingOrderId === group.order_id || pdfQueueStatus.get(group.order_id)?.status === 'processing'}
+                                    disabled={isOrderBusy(group.order_id)}
                                     title="Generate final report"
                                   >
-                                    {(generatingOrderId === group.order_id || pdfQueueStatus.get(group.order_id)?.status === 'processing') ? (
+                                    {(isOrderBusy(group.order_id)) ? (
                                       <div className="flex items-center space-x-1">
                                         <Loader2 className="w-4 h-4 animate-spin" />
                                         {pdfQueueStatus.get(group.order_id)?.progress_percent && (
@@ -3425,7 +3542,7 @@ const Reports: React.FC = () => {
                                     ) : (
                                       <Download className="w-4 h-4" />
                                     )}
-                                    <span>{(generatingOrderId === group.order_id || pdfQueueStatus.get(group.order_id)?.status === 'processing') ? 'Gen...' : 'Final'}</span>
+                                    <span>{(isOrderBusy(group.order_id)) ? 'Gen...' : 'Final'}</span>
                                   </button>
                                   {(() => {
                                     const job = pdfQueueStatus.get(group.order_id);
@@ -3633,15 +3750,15 @@ const Reports: React.FC = () => {
                             <>
                               <div className="flex-1 flex items-center gap-0.5">
                                 <button
-                                  className={`flex-1 flex items-center justify-center space-x-1 px-3 py-2 text-sm bg-amber-600 text-white rounded-l-md hover:bg-amber-700 transition-colors ${(generatingOrderId === group.order_id || pdfQueueStatus.get(group.order_id)?.status === 'processing')
+                                  className={`flex-1 flex items-center justify-center space-x-1 px-3 py-2 text-sm bg-amber-600 text-white rounded-l-md hover:bg-amber-700 transition-colors ${(isOrderBusy(group.order_id))
                                     ? 'opacity-50 cursor-not-allowed'
                                     : ''
                                     }`}
                                   onClick={() => handleDownload(group.order_id, true, 'ecopy')}
-                                  disabled={generatingOrderId === group.order_id || pdfQueueStatus.get(group.order_id)?.status === 'processing'}
+                                  disabled={isOrderBusy(group.order_id)}
                                   title="Generate eCopy draft (letterhead)"
                                 >
-                                  {(generatingOrderId === group.order_id || pdfQueueStatus.get(group.order_id)?.status === 'processing') ? (
+                                  {(isOrderBusy(group.order_id)) ? (
                                     <div className="flex items-center space-x-1">
                                       <Loader2 className="w-4 h-4 animate-spin" />
                                       {pdfQueueStatus.get(group.order_id)?.progress_percent && (
@@ -3651,15 +3768,15 @@ const Reports: React.FC = () => {
                                   ) : (
                                     <Download className="w-4 h-4" />
                                   )}
-                                  <span>{(generatingOrderId === group.order_id || pdfQueueStatus.get(group.order_id)?.status === 'processing') ? 'Gen...' : 'Draft eCopy'}</span>
+                                  <span>{(isOrderBusy(group.order_id)) ? 'Gen...' : 'Draft eCopy'}</span>
                                 </button>
                                 <button
-                                  className={`flex items-center justify-center px-3 py-2 text-sm bg-amber-500 text-white rounded-r-md hover:bg-amber-600 transition-colors border-l border-amber-700 ${(generatingOrderId === group.order_id || pdfQueueStatus.get(group.order_id)?.status === 'processing')
+                                  className={`flex items-center justify-center px-3 py-2 text-sm bg-amber-500 text-white rounded-r-md hover:bg-amber-600 transition-colors border-l border-amber-700 ${(isOrderBusy(group.order_id))
                                     ? 'opacity-50 cursor-not-allowed'
                                     : ''
                                     }`}
                                   onClick={() => handleDownload(group.order_id, true, 'print')}
-                                  disabled={generatingOrderId === group.order_id || pdfQueueStatus.get(group.order_id)?.status === 'processing'}
+                                  disabled={isOrderBusy(group.order_id)}
                                   title="Generate print draft (no letterhead)"
                                   aria-label="Generate draft print PDF"
                                 >

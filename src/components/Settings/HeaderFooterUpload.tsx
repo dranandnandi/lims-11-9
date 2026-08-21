@@ -15,6 +15,9 @@ interface Attachment {
     created_at: string;
 }
 
+/** null = inherit from the lab / auto-detect from what has been uploaded */
+type LetterheadMode = 'background' | 'header_footer' | null;
+
 const HeaderFooterUpload: React.FC<HeaderFooterUploadProps> = ({
     entityType,
     entityId,
@@ -26,10 +29,56 @@ const HeaderFooterUpload: React.FC<HeaderFooterUploadProps> = ({
     const [uploading, setUploading] = useState<'header' | 'footer' | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [success, setSuccess] = useState<string | null>(null);
+    // null = inherit / auto-detect from what has been uploaded
+    const [letterheadMode, setLetterheadMode] = useState<LetterheadMode>(null);
+    const [savingMode, setSavingMode] = useState(false);
+
+    const entityTable = entityType === 'location' ? 'locations' : entityType === 'account' ? 'accounts' : 'labs';
+    const supportsModeOverride = entityType === 'location' || entityType === 'account';
 
     useEffect(() => {
         loadAttachments();
+        if (supportsModeOverride) loadLetterheadMode();
     }, [entityType, entityId]);
+
+    const loadLetterheadMode = async () => {
+        const { data, error: modeError } = await supabase
+            .from(entityTable)
+            .select('pdf_letterhead_mode')
+            .eq('id', entityId)
+            .maybeSingle();
+
+        if (modeError) {
+            // Column not deployed yet - keep the selector on "inherit"
+            console.warn('Could not load letterhead mode:', modeError.message);
+            return;
+        }
+        const mode = (data as any)?.pdf_letterhead_mode;
+        setLetterheadMode(mode === 'background' || mode === 'header_footer' ? mode : null);
+    };
+
+    const handleModeChange = async (mode: LetterheadMode) => {
+        const previous = letterheadMode;
+        setLetterheadMode(mode);
+        setSavingMode(true);
+        setError(null);
+
+        const { error: updateError } = await supabase
+            .from(entityTable)
+            .update({ pdf_letterhead_mode: mode })
+            .eq('id', entityId);
+
+        setSavingMode(false);
+
+        if (updateError) {
+            setLetterheadMode(previous);
+            setError(updateError.message || 'Failed to save letterhead style');
+            return;
+        }
+
+        setSuccess('Letterhead style saved!');
+        setTimeout(() => setSuccess(null), 3000);
+    };
 
     const loadAttachments = async () => {
         setLoading(true);
@@ -284,12 +333,70 @@ const HeaderFooterUpload: React.FC<HeaderFooterUploadProps> = ({
                 </div>
             )}
 
+            {/* Letterhead style - decides how the uploaded artwork is rendered */}
+            {supportsModeOverride && (
+                <div className="border border-gray-200 rounded-lg p-4">
+                    <h4 className="font-medium text-gray-900 mb-1">Letterhead style</h4>
+                    <p className="text-xs text-gray-500 mb-3">
+                        Choose whether this {entityType}'s artwork prints as one full-page letterhead
+                        (like the lab default) or as separate header and footer strips.
+                    </p>
+                    <div className="space-y-2">
+                        {([
+                            {
+                                value: null as LetterheadMode,
+                                title: 'Auto (recommended)',
+                                desc: 'Full-page letterhead if only a header is uploaded; header + footer strips once a footer is uploaded.',
+                            },
+                            {
+                                value: 'background' as LetterheadMode,
+                                title: 'Full letterhead (whole page)',
+                                desc: 'The header upload is a complete A4 letterhead and is printed as the page background on every page.',
+                            },
+                            {
+                                value: 'header_footer' as LetterheadMode,
+                                title: 'Separate header & footer',
+                                desc: 'Header prints as a strip at the top and footer as a strip at the bottom of every page.',
+                            },
+                        ]).map((option) => (
+                            <label
+                                key={String(option.value)}
+                                className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${letterheadMode === option.value
+                                    ? 'border-blue-500 bg-blue-50'
+                                    : 'border-gray-200 hover:bg-gray-50'
+                                    }`}
+                            >
+                                <input
+                                    type="radio"
+                                    className="mt-1"
+                                    name={`letterhead-mode-${entityId}`}
+                                    checked={letterheadMode === option.value}
+                                    disabled={savingMode}
+                                    onChange={() => handleModeChange(option.value)}
+                                />
+                                <span>
+                                    <span className="block text-sm font-medium text-gray-800">{option.title}</span>
+                                    <span className="block text-xs text-gray-500">{option.desc}</span>
+                                </span>
+                            </label>
+                        ))}
+                    </div>
+                    <p className="text-xs text-gray-500 mt-3">
+                        Anything not uploaded here falls back to the lab's own header/footer.
+                    </p>
+                </div>
+            )}
+
             {/* Header Upload */}
             <div className="border border-gray-200 rounded-lg p-4">
                 <div className="flex items-center justify-between mb-3">
                     <div className="flex items-center">
                         <FileText className="h-5 w-5 text-blue-600 mr-2" />
-                        <h4 className="font-medium text-gray-900">Header</h4>
+                        <h4 className="font-medium text-gray-900">
+                            {letterheadMode === 'background' || (letterheadMode === null && !footerAttachment)
+                                ? 'Header / full letterhead'
+                                : 'Header'}
+                        </h4>
                     </div>
                     {headerAttachment && (
                         <span className="text-xs text-gray-500">

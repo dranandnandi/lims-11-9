@@ -1,4 +1,5 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { resolveWhatsAppSender, formatPhoneForSender } from '../_shared/whatsappSender.ts';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -123,28 +124,6 @@ function nextWindowStartIso(sendWindowStart?: string): string {
   return nextUtc.toISOString();
 }
 
-function formatPhoneWithCountryCode(phone: string, countryCode: string): string {
-  let cleanPhone = phone.replace(/\D/g, '');
-  if (cleanPhone.startsWith('0')) {
-    cleanPhone = cleanPhone.substring(1);
-  }
-
-  const countryCodeDigits = countryCode.replace(/\D/g, '');
-
-  if (cleanPhone.length === 10) {
-    return `${countryCode}${cleanPhone}`;
-  }
-
-  if (cleanPhone.startsWith(countryCodeDigits) && cleanPhone.length === (10 + countryCodeDigits.length)) {
-    return `+${cleanPhone}`;
-  }
-
-  if (cleanPhone.length > 10) {
-    return `+${cleanPhone}`;
-  }
-
-  return `${countryCode}${cleanPhone}`;
-}
 
 Deno.serve(async (req) => {
   // Handle CORS preflight
@@ -450,21 +429,22 @@ Deno.serve(async (req) => {
         const scheduledFor = withinWindow ? new Date().toISOString() : nextWindowStartIso(notifSettings.send_window_start);
         const testNames = orderTestsForNotification?.map((t) => t.test_name).join(', ') || 'Lab Tests';
 
-        const { data: labForMessage } = await supabaseClient
-          .from('labs')
-          .select('name, whatsapp_user_id, country_code')
-          .eq('id', labId)
-          .single();
+        // Route registration messages through the branch the order was booked
+        // at, falling back to the lab default.
+        const sender = await resolveWhatsAppSender(supabaseClient, {
+          labId,
+          locationId: orderData.location_id,
+        });
 
         const sendRegistrationMessage = async (phone: string, message: string) => {
           const NETLIFY_SEND_MESSAGE_URL = 'https://app.limsapp.in/.netlify/functions/whatsapp-send-message';
-          const formattedPhone = formatPhoneWithCountryCode(phone, labForMessage?.country_code || '+91');
+          const formattedPhone = formatPhoneForSender(phone, sender.countryCode);
 
           const response = await fetch(NETLIFY_SEND_MESSAGE_URL, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              userId: labForMessage!.whatsapp_user_id,
+              userId: sender.userId,
               phoneNumber: formattedPhone,
               message,
             }),
@@ -489,6 +469,7 @@ Deno.serve(async (req) => {
             .from('notification_queue')
             .insert({
               lab_id: labId,
+              location_id: orderData.location_id,
               recipient_type: recipientType,
               recipient_phone: recipientPhone,
               recipient_name: recipientName,
@@ -507,14 +488,14 @@ Deno.serve(async (req) => {
           let sent = false;
           let sendError = '';
 
-          if (withinWindow && labForMessage?.whatsapp_user_id) {
+          if (withinWindow && sender.userId) {
             const result = await sendRegistrationMessage(patient.phone, message);
             sent = result.sent;
             sendError = result.error;
           } else if (!withinWindow) {
             sendError = 'Outside send window';
           } else {
-            sendError = 'No whatsapp_user_id configured for lab';
+            sendError = 'No WhatsApp sender configured for this location or lab';
           }
 
           if (!sent && (withinWindow || shouldQueueOutsideWindow)) {
@@ -527,14 +508,14 @@ Deno.serve(async (req) => {
           let sent = false;
           let sendError = '';
 
-          if (withinWindow && labForMessage?.whatsapp_user_id) {
+          if (withinWindow && sender.userId) {
             const result = await sendRegistrationMessage(referringDoctorForNotification.phone, message);
             sent = result.sent;
             sendError = result.error;
           } else if (!withinWindow) {
             sendError = 'Outside send window';
           } else {
-            sendError = 'No whatsapp_user_id configured for lab';
+            sendError = 'No WhatsApp sender configured for this location or lab';
           }
 
           if (!sent && (withinWindow || shouldQueueOutsideWindow)) {

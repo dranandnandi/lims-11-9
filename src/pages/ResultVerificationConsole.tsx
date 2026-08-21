@@ -99,6 +99,9 @@ type Analyte = {
   value: string | null;
   unit: string;
   reference_range: string;
+  /** Audit of how reference_range was decided — see referenceRangeResolver. */
+  range_source?: string | null;
+  applied_range_rule?: string | null;
   flag: string | null;
   verify_status: "pending" | "approved" | "rejected" | null;
   verify_note: string | null;
@@ -673,7 +676,7 @@ const ResultVerificationConsole: React.FC = () => {
 	  const [showAdvancedFilters, setShowAdvancedFilters] = useState(false);
   const [doctorFilter, setDoctorFilter] = useState("all");
   const [accountFilter, setAccountFilter] = useState("all");
-  const [panelSortMode, setPanelSortMode] = useState<PanelSortMode>("sample_desc");
+  const [panelSortMode, setPanelSortMode] = useState<PanelSortMode>("sample_asc");
 
   // attachment view mode
   const [attachmentViewMode, setAttachmentViewMode] = useState<'test' | 'all'>('test');
@@ -976,6 +979,8 @@ const ResultVerificationConsole: React.FC = () => {
           "value",
           "unit",
           "reference_range",
+          "range_source",
+          "applied_range_rule",
           "flag",
           "verify_status",
           "verify_note",
@@ -2340,7 +2345,16 @@ const ResultVerificationConsole: React.FC = () => {
                 placeholder="Reference range"
               />
             ) : (
-              <div className="text-sm text-gray-600 max-w-xs">{a.reference_range}</div>
+              <div className="max-w-xs">
+                <div className="text-sm text-gray-600">{a.reference_range}</div>
+                {/* Why this patient got this range. Only shown when a rule or the
+                    AI resolver decided it — a plain default range needs no note. */}
+                {(a as any).applied_range_rule && (a as any).range_source !== "lab_default" && (
+                  <div className="mt-0.5 text-xs text-gray-400">
+                    {(a as any).range_source === "ai" ? "AI: " : ""}{(a as any).applied_range_rule}
+                  </div>
+                )}
+              </div>
             )}
           </td>
           <td className="px-4 py-4">

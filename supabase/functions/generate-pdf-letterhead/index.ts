@@ -6,14 +6,17 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.38.4";
 import {
   fetchFrontBackPages,
   fetchLetterheadBackground,
-  fetchLetterheadBackgroundForOrder,
-  fetchHeaderFooterImages,
+  resolveReportBranding,
   imageUrlToBase64,
   optimizeHeaderFooterImageUrl,
   buildHeaderHtml,
   buildFooterHtml,
 } from "./headerFooterHelper.ts";
 import { formatAnalyteDisplayValue } from "./resultValueFormat.ts";
+import {
+  resolveWhatsAppSender,
+  formatPhoneForSender,
+} from "../_shared/whatsappSender.ts";
 
 function formatIndianNumber(val: string | number): string {
   const str = String(val).replace(/,/g, "").trim();
@@ -110,6 +113,171 @@ function getPublicStorageUrl(bucket: string, path: string): string {
   // Fallback to Supabase default URL
   const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
   return `${supabaseUrl}/storage/v1/object/public/${bucket}/${path}`;
+}
+
+// ============================================================
+// SECTION: Stable report links (report_links / report-link fn)
+//
+// A report URL used to exist only after PDF.co rendered AND the file was
+// downloaded AND uploaded to the reports bucket -- up to ~65s of retries, all of
+// it blocking the WhatsApp/email send. Worse, when every download attempt failed
+// uploadPdfToStorage returned the PDF.co temp URL as publicUrl, which then went
+// into reports.pdf_url and out to the patient; PDF.co signs those for 3600s, so
+// the link was dead within the hour with no way to repair it.
+//
+// So each order gets a token up front. /report-link/<token>.pdf resolves to
+// whatever is live right now -- the PDF.co temp file early, permanent storage
+// once the upload lands -- so the URL handed to a patient never has to change.
+//
+// Everything below is best-effort by construction: every helper swallows its own
+// errors and returns null/false. A failure here must never affect PDF output.
+// ============================================================
+
+// Full public prefix for a token URL, used as `<prefix>/<token>.pdf`. Point this
+// at the branded short path (e.g. https://app.limsapp.in/r) so what reaches a
+// patient over WhatsApp carries no infrastructure in it. Falls back to the
+// resolver's own origin, which always works.
+const REPORT_LINK_PUBLIC_BASE = (Deno.env.get("REPORT_LINK_PUBLIC_BASE") ??
+  `${(Deno.env.get("SUPABASE_URL") ?? "").replace(/\/+$/, "")}/functions/v1/report-link`)
+  .replace(/\/+$/, "");
+
+// PDF.co signs its S3 URLs for 3600s. Stay inside that.
+const REPORT_LINK_TEMP_TTL_MS = 55 * 60 * 1000;
+
+type ReportLinkVariant = "final" | "print" | "compact";
+
+/** Per-lab kill switch. Unenrolled labs behave exactly as before this feature. */
+async function isReportLinkEnabled(
+  supabase: any,
+  labId: string,
+): Promise<boolean> {
+  try {
+    const { data } = await supabase
+      .from("labs")
+      .select("report_link_enabled")
+      .eq("id", labId)
+      .maybeSingle();
+    return data?.report_link_enabled === true;
+  } catch (err) {
+    console.warn("report_links: lab flag check failed:", err);
+    return false;
+  }
+}
+
+function reportLinkUrl(token: string): string {
+  return `${REPORT_LINK_PUBLIC_BASE}/${token}.pdf`;
+}
+
+/**
+ * Idempotent: returns the existing token for this (order, variant) or mints one.
+ * Called before generation so the link can be shared while the PDF is rendering.
+ */
+async function ensureReportLinkToken(
+  supabase: any,
+  orderId: string,
+  variant: ReportLinkVariant = "final",
+): Promise<string | null> {
+  try {
+    const { data, error } = await supabase.rpc("ensure_report_link", {
+      p_order_id: orderId,
+      p_variant: variant,
+    });
+    if (error) {
+      console.warn("report_links: ensure failed:", error.message);
+      return null;
+    }
+    return data ?? null;
+  } catch (err) {
+    console.warn("report_links: ensure threw:", err);
+    return null;
+  }
+}
+
+/**
+ * Publish the PDF.co temp URL so the token resolves ~65s before storage does.
+ * Never overwrites a permanent_url that is already set.
+ */
+async function publishReportLinkTemp(
+  supabase: any,
+  orderId: string,
+  variant: ReportLinkVariant,
+  tempUrl: string | null,
+): Promise<void> {
+  if (!tempUrl) return;
+  try {
+    const { error } = await supabase
+      .from("report_links")
+      .update({
+        temp_url: tempUrl,
+        temp_expires_at: new Date(Date.now() + REPORT_LINK_TEMP_TTL_MS)
+          .toISOString(),
+        status: "temp",
+      })
+      .eq("order_id", orderId)
+      .eq("variant", variant)
+      .is("permanent_url", null);
+    if (error) console.warn("report_links: temp publish failed:", error.message);
+    else console.log(`ðŸ”— report_links: temp URL published (${variant})`);
+  } catch (err) {
+    console.warn("report_links: temp publish threw:", err);
+  }
+}
+
+/**
+ * Stamp the storage URL. Callers MUST pass only a genuine bucket URL -- never
+ * uploadPdfToStorage's temp fallback, or the token would be frozen onto a URL
+ * that dies in an hour, which is the exact bug this feature exists to kill.
+ */
+async function publishReportLinkPermanent(
+  supabase: any,
+  orderId: string,
+  variant: ReportLinkVariant,
+  permanentUrl: string | null,
+): Promise<void> {
+  if (!permanentUrl) return;
+  if (/pdf\.co|pdf-temp-files|pdfco/i.test(permanentUrl)) {
+    console.warn(
+      "report_links: refusing to stamp an ephemeral URL as permanent",
+    );
+    return;
+  }
+  try {
+    const { error } = await supabase
+      .from("report_links")
+      .update({
+        permanent_url: permanentUrl,
+        status: "permanent",
+        temp_url: null,
+        temp_expires_at: null,
+      })
+      .eq("order_id", orderId)
+      .eq("variant", variant);
+    if (error) {
+      console.warn("report_links: permanent publish failed:", error.message);
+    } else {
+      console.log(`ðŸ”— report_links: permanent URL stamped (${variant})`);
+    }
+  } catch (err) {
+    console.warn("report_links: permanent publish threw:", err);
+  }
+}
+
+/** Records that the token actually went out, so it can never be recycled. */
+async function markReportLinkShared(
+  supabase: any,
+  orderId: string,
+  variant: ReportLinkVariant,
+): Promise<void> {
+  try {
+    await supabase
+      .from("report_links")
+      .update({ first_shared_at: new Date().toISOString() })
+      .eq("order_id", orderId)
+      .eq("variant", variant)
+      .is("first_shared_at", null);
+  } catch (err) {
+    console.warn("report_links: share stamp threw:", err);
+  }
 }
 
 // ============================================================
@@ -7800,6 +7968,47 @@ serve(async (req) => {
       }
 
       // ========================================
+      // Step 2b: Reserve the stable report link
+      // ========================================
+      // Minted before any rendering happens so the URL can be shared while the
+      // PDF is still being produced. Best-effort: a null token simply means
+      // every downstream consumer keeps using the direct storage URL.
+      const reportLinkEnabled = await isReportLinkEnabled(
+        supabaseClient,
+        job.lab_id,
+      );
+      const reportLinkVariant: ReportLinkVariant =
+        printLayoutMode === "compact" ? "compact" : "final";
+      let reportLinkToken: string | null = null;
+      // The print copy gets its own token. PDF.co hands back two temp URLs, so
+      // both the eCopy and the print PDF can be openable well before either has
+      // been uploaded -- which is what lets the Download and Print buttons go
+      // live while the job is still 'processing'.
+      let reportLinkPrintToken: string | null = null;
+      if (reportLinkEnabled) {
+        reportLinkToken = await ensureReportLinkToken(
+          supabaseClient,
+          orderId,
+          reportLinkVariant,
+        );
+        reportLinkPrintToken = await ensureReportLinkToken(
+          supabaseClient,
+          orderId,
+          "print",
+        );
+        console.log(
+          reportLinkToken
+            ? `ðŸ”— Stable report link reserved: ${reportLinkUrl(reportLinkToken)}`
+            : "ðŸ”— Stable report link unavailable - falling back to direct URLs",
+        );
+        if (reportLinkPrintToken) {
+          console.log(
+            `ðŸ”— Stable print link reserved: ${reportLinkUrl(reportLinkPrintToken)}`,
+          );
+        }
+      }
+
+      // ========================================
       // Step 3: Get Template Context (RPC)
       // ========================================
       console.log("\nðŸ“Š Step 3: Fetching template context via RPC...");
@@ -8442,7 +8651,22 @@ serve(async (req) => {
         .eq('lab_id', job.lab_id)
         .order('sort_order');
 
-      const pdfLetterheadMode = labSettings?.pdf_letterhead_mode || 'background';
+      // Resolve branding ONCE: the winning entity (B2B account > location > lab)
+      // decides both the artwork and how it is rendered, so a location that
+      // uploads a whole letterhead still gets a full-page background even when
+      // the lab itself is configured for separate header/footer strips.
+      const branding = await resolveReportBranding(
+        supabaseClient,
+        orderId,
+        job.lab_id,
+      );
+      const pdfLetterheadMode = branding.mode;
+      console.log(
+        "  Letterhead source:",
+        branding.source,
+        "| lab default:",
+        labSettings?.pdf_letterhead_mode || "background",
+      );
       console.log("  ðŸ“‹ PDF Letterhead Mode:", pdfLetterheadMode);
 
       // Variables for both modes
@@ -8453,11 +8677,7 @@ serve(async (req) => {
         // MODE: Separate Header/Footer Images
         // Fetch header and footer separately, convert to base64 for PDF.co native header/footer
         console.log("  ðŸ–¼ï¸ Fetching SEPARATE header/footer images (header_footer mode)...");
-        const { headerUrl, footerUrl } = await fetchHeaderFooterImages(
-          supabaseClient,
-          orderId,
-          job.lab_id,
-        );
+        const { headerUrl, footerUrl } = branding;
 
         console.log("  ðŸ“ Header URL:", headerUrl ? "FOUND" : "NOT FOUND");
         console.log("  ðŸ“ Footer URL:", footerUrl ? "FOUND" : "NOT FOUND");
@@ -8532,11 +8752,7 @@ serve(async (req) => {
         // Priority: B2B Account > Location > Lab
         console.log("  ðŸ–¼ï¸ Fetching letterhead background image (background mode)...");
         console.log("  ðŸ“ Order ID:", orderId, "| Lab ID:", job.lab_id);
-        const letterheadBackgroundUrl = await fetchLetterheadBackgroundForOrder(
-          supabaseClient,
-          orderId,
-          job.lab_id,
-        );
+        const letterheadBackgroundUrl = branding.letterheadUrl;
 
         // Apply ImageKit transforms for high-quality A4 rendering (2480x3508 @ 300dpi)
         letterheadUrl = letterheadBackgroundUrl
@@ -11316,6 +11532,25 @@ serve(async (req) => {
       console.log("  eCopy URL:", pdfCoUrl ? "âœ“" : "âœ—");
       console.log("  Print URL:", printPdfCoUrl ? "âœ“" : "skipped");
 
+      // The PDF exists at PDF.co right now. Publish it so the stable link starts
+      // resolving immediately, instead of after the download+upload tail below.
+      if (reportLinkToken) {
+        await publishReportLinkTemp(
+          supabaseClient,
+          orderId,
+          reportLinkVariant,
+          pdfCoUrl,
+        );
+      }
+      if (reportLinkPrintToken) {
+        await publishReportLinkTemp(
+          supabaseClient,
+          orderId,
+          "print",
+          printPdfCoUrl,
+        );
+      }
+
       await updateProgress(
         supabaseClient,
         job.id,
@@ -11413,6 +11648,35 @@ serve(async (req) => {
       );
       console.log("  eCopy:", storageUrl);
       console.log("  Print:", printStorageUrl || "none");
+
+      // Point the token at storage. publishReportLinkPermanent rejects ephemeral
+      // URLs, so if every upload attempt above fell back to the PDF.co URL the
+      // token stays on temp and the resolver re-generates when it expires --
+      // rather than freezing a link that dies within the hour.
+      if (reportLinkToken) {
+        await publishReportLinkPermanent(
+          supabaseClient,
+          orderId,
+          reportLinkVariant,
+          storageUrl,
+        );
+      }
+      if (reportLinkPrintToken) {
+        await publishReportLinkPermanent(
+          supabaseClient,
+          orderId,
+          "print",
+          printStorageUrl,
+        );
+      }
+
+      // Text links (WhatsApp body, email, portal, copy-link) go through the token
+      // so they keep working no matter what the underlying URL becomes. The
+      // WhatsApp *attachment* below deliberately stays on the direct URL: the
+      // provider fetches it server-side, once, and may not follow a 302.
+      const shareableReportUrl = reportLinkToken
+        ? reportLinkUrl(reportLinkToken)
+        : storageUrl;
 
       await updateProgress(
         supabaseClient,
@@ -11647,6 +11911,7 @@ serve(async (req) => {
               .from("orders")
               .select(`
               patient_name,
+              location_id,
               ai_clinical_summary,
               include_clinical_summary_in_report,
               patients!inner (id, phone, name),
@@ -11673,87 +11938,48 @@ serve(async (req) => {
                 .single();
 
               // ========================================
-              // SMART WHATSAPP ROUTING (Priority Order)
+              // WHATSAPP SENDER ROUTING
               // ========================================
-              // 1. User who triggered (highest priority) - whoever clicked "Generate PDF"
-              // 2. Location-based user (branch manager) - assigned to order's location
-              // 3. Lab-level account (fallback) - central WhatsApp account
+              // 1. The order's location, if that branch has its own number
+              // 2. The lab-wide default from Settings
+              // 3. The user who triggered generation, as a last resort
+              //
+              // Previously this tried the triggering user first, which made the
+              // sending number depend on who happened to click Generate. Explicit
+              // configuration now wins; see supabase/functions/_shared/whatsappSender.ts.
               // ========================================
 
-              let whatsappUserId: string | null = null;
-              let whatsappUserName: string | null = null;
+              const sender = await resolveWhatsAppSender(supabaseClient, {
+                labId: job.lab_id,
+                locationId: order.location_id,
+              });
 
-              // Priority 1: User who triggered this request
-              if (triggeredByUserId) {
+              let whatsappUserId: string | null = sender.userId;
+
+              if (whatsappUserId) {
+                console.log(
+                  `[whatsapp] sender ${whatsappUserId} resolved via ${sender.source}`,
+                );
+              } else if (triggeredByUserId) {
+                // triggeredByUserId is a LIMS users.id — the same id space the
+                // WhatsApp backend registers sessions under.
                 const { data: triggeringUser } = await supabaseClient
                   .from("users")
                   .select("id, name, whatsapp_user_id")
                   .eq("id", triggeredByUserId)
-                  .single();
+                  .maybeSingle();
 
                 if (triggeringUser?.whatsapp_user_id) {
                   whatsappUserId = triggeringUser.whatsapp_user_id;
-                  whatsappUserName = triggeringUser.name;
                   console.log(
-                    `âœ… [Priority 1] Using triggering user's WhatsApp: ${whatsappUserName}`,
-                  );
-                } else {
-                  console.log(
-                    `âš ï¸ Triggering user (${
-                      triggeringUser?.name || triggeredByUserId
-                    }) has no whatsapp_user_id - checking location...`,
+                    `[whatsapp] falling back to triggering user: ${triggeringUser.name}`,
                   );
                 }
-              }
-
-              // Priority 2: Location-based routing (find user assigned to order's location)
-              if (!whatsappUserId && order.location_id) {
-                console.log(
-                  `ðŸ” Checking for location-based WhatsApp user for location: ${order.location_id}`,
-                );
-
-                // Find users assigned to this location with WhatsApp connected
-                // Prioritize: Lab Manager > Lab Technician > any user with WhatsApp
-                const { data: locationUsers } = await supabaseClient
-                  .from("users")
-                  .select(
-                    "id, name, role, whatsapp_user_id, default_location_id",
-                  )
-                  .eq("lab_id", job.lab_id)
-                  .not("whatsapp_user_id", "is", null)
-                  .or(`default_location_id.eq.${order.location_id}`)
-                  .order("role", { ascending: true }) // Lab Manager comes before Lab Technician
-                  .limit(5);
-
-                if (locationUsers && locationUsers.length > 0) {
-                  // Prefer Lab Manager role if available
-                  const locationUser = locationUsers.find((u) =>
-                    u.role === "Lab Manager"
-                  ) || locationUsers[0];
-                  whatsappUserId = locationUser.whatsapp_user_id;
-                  whatsappUserName = locationUser.name;
-                  console.log(
-                    `âœ… [Priority 2] Using location-based WhatsApp: ${whatsappUserName} (${locationUser.role}) at location ${order.location_id}`,
-                  );
-                } else {
-                  console.log(
-                    `âš ï¸ No users with WhatsApp found for location: ${order.location_id}`,
-                  );
-                }
-              }
-
-              // Priority 3: Lab-level fallback (deprecated but kept for backwards compatibility)
-              if (!whatsappUserId && lab?.whatsapp_user_id) {
-                whatsappUserId = lab.whatsapp_user_id;
-                whatsappUserName = lab.name;
-                console.log(
-                  `âœ… [Priority 3] Using lab-level WhatsApp fallback: ${lab.name}`,
-                );
               }
 
               if (!whatsappUserId) {
                 console.warn(
-                  "âš ï¸ No whatsapp_user_id configured - notifications will be queued only",
+                  "[whatsapp] no sender configured - notifications will be queued only",
                 );
               }
 
@@ -11776,40 +12002,15 @@ serve(async (req) => {
                 }
 
                 try {
-                  // Use lab's country code (already fetched)
-                  const countryCode = lab?.country_code || "+91"; // Default to India
-                  console.log("ðŸŒ Using country code:", countryCode);
+                  // Country code follows the resolved sender, so a branch that
+                  // overrides its dialling code formats numbers its own way.
+                  const countryCode = sender.countryCode;
+                  console.log("[whatsapp] country code:", countryCode);
 
-                  let cleanPhone = phone.replace(/\D/g, "");
-
-                  // Remove leading 0 (common for local numbers)
-                  if (cleanPhone.startsWith("0")) {
-                    cleanPhone = cleanPhone.substring(1);
-                  }
-
-                  // Format phone number with lab's country code
-                  let formattedPhone: string;
-                  const countryCodeDigits = countryCode.replace(/\D/g, "");
-
-                  if (cleanPhone.length === 10) {
-                    // 10 digit number - add country code
-                    formattedPhone = countryCode + cleanPhone;
-                  } else if (
-                    cleanPhone.startsWith(countryCodeDigits) &&
-                    cleanPhone.length === (10 + countryCodeDigits.length)
-                  ) {
-                    // Already has country code digits - just add +
-                    formattedPhone = "+" + cleanPhone;
-                  } else if (cleanPhone.length > 10) {
-                    // Assume it has country code, just add +
-                    formattedPhone = "+" + cleanPhone;
-                  } else {
-                    // Fallback - add country code
-                    formattedPhone = countryCode + cleanPhone;
-                  }
+                  const formattedPhone = formatPhoneForSender(phone, countryCode);
 
                   console.log(
-                    `ðŸ“¤ Sending WhatsApp to ${formattedPhone} via Netlify function`,
+                    `[whatsapp] sending to ${formattedPhone} via Netlify function`,
                   );
 
                   // Extract filename from URL
@@ -11906,7 +12107,7 @@ serve(async (req) => {
                       )
                       .replace(/\[OrderId\]/gi, orderId.slice(-6))
                       .replace(/\[TestName\]/gi, testNames)
-                      .replace(/\[ReportUrl\]/gi, storageUrl)
+                      .replace(/\[ReportUrl\]/gi, shareableReportUrl)
                       .replace(/\[LabName\]/gi, lab?.name || "")
                       .replace(/\[LabAddress\]/gi, "") // Not fetched in this context
                       .replace(/\[LabContact\]/gi, "") // Not fetched in this context
@@ -11945,6 +12146,13 @@ serve(async (req) => {
                   : false;
 
                 if (sent) {
+                  if (reportLinkToken) {
+                    await markReportLinkShared(
+                      supabaseClient,
+                      orderId,
+                      reportLinkVariant,
+                    );
+                  }
                   await supabaseClient
                     .from("reports")
                     .update({
@@ -11965,6 +12173,7 @@ serve(async (req) => {
                       .from("notification_queue")
                       .insert({
                         lab_id: job.lab_id,
+                        location_id: order.location_id,
                         recipient_type: "patient",
                         recipient_phone: order.patients.phone,
                         recipient_name: order.patient_name,
@@ -12047,6 +12256,7 @@ serve(async (req) => {
                       .from("notification_queue")
                       .insert({
                         lab_id: job.lab_id,
+                        location_id: order.location_id,
                         recipient_type: "doctor",
                         recipient_phone: order.doctors.phone,
                         recipient_name: order.doctors.name,
@@ -12100,6 +12310,14 @@ serve(async (req) => {
           pdfUrl: printLayoutMode !== "compact" ? storageUrl : null,
           printPdfUrl: printStorageUrl,
           compactEcopyUrl: printLayoutMode === "compact" ? storageUrl : null,
+          // Stable link for sharing. Null when the lab is not enrolled, in which
+          // case callers should keep using pdfUrl exactly as before.
+          reportLinkUrl: reportLinkToken ? reportLinkUrl(reportLinkToken) : null,
+          reportLinkToken,
+          reportLinkPrintUrl: reportLinkPrintToken
+            ? reportLinkUrl(reportLinkPrintToken)
+            : null,
+          reportLinkPrintToken,
           storagePath: eCopyResult.path,
           jobId: job.id,
           orderId,

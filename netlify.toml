@@ -20,6 +20,20 @@
 #   schedule = "*/30 * * * *"
 #   name = "pdf-worker"
 
+# Stable patient report links: /r/<token>.pdf -> the report-link resolver, which
+# 302s on to whichever copy of the PDF is live (PDF.co temp early, storage once
+# uploaded). MUST stay above the SPA catch-alls below -- Netlify matches in order,
+# so /* would otherwise swallow /r/* and serve index.html instead.
+#
+# A 302 (not a 200 proxy) is deliberate: the resolver's own response is itself a
+# redirect, and proxying a redirect through Netlify is ill-defined. Two clean hops
+# is what every browser and WhatsApp client handles correctly.
+[[redirects]]
+  from = "/r/*"
+  to = "https://api.limsapp.in/functions/v1/report-link/:splat"
+  status = 302
+  force = true
+
 # SPA fallback
 [[redirects]]
   from = "/app/*"

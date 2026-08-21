@@ -1,6 +1,7 @@
 import React, { useState, useMemo, useRef, useEffect } from 'react';
 import { X, Beaker, AlertTriangle, Settings, Brain, Calculator, Search, Plus, Trash2, ChevronDown, Flag, Sparkles, Loader2, CheckCircle, ChevronUp } from 'lucide-react';
 import { generateAnalyteConfiguration, AnalyteConfigurationResponse } from '../../utils/geminiAI';
+import ReferenceRangeRulesEditor from './ReferenceRangeRulesEditor';
 
 interface SourceAnalyte {
   id: string;
@@ -32,6 +33,8 @@ interface Analyte {
   name: string;
   unit: string;
   referenceRange: string;
+  /** lab_analytes PK — reference range rules hang off this. */
+  lab_analyte_id?: string | null;
   lowCritical?: string | number;
   highCritical?: string | number;
   // Snake-case fallbacks for raw DB objects
@@ -657,7 +660,7 @@ const AnalyteForm: React.FC<AnalyteFormProps> = ({ onClose, onSubmit, analyte, a
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Reference Range *
+                  Default Reference Range *
                 </label>
                 <input
                   type="text"
@@ -665,10 +668,24 @@ const AnalyteForm: React.FC<AnalyteFormProps> = ({ onClose, onSubmit, analyte, a
                   required
                   value={formData.referenceRange}
                   onChange={handleChange}
-                  placeholder="e.g., 12.0-16.0 or M: 13.5-17.5, F: 12.0-16.0"
+                  placeholder="e.g., 12.0-16.0"
                   className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                 />
+                <p className="text-xs text-gray-500 mt-1">
+                  Used when no rule below matches. Gender, age and fasting-specific ranges
+                  belong in the rules — a range described in prose here cannot be flagged against.
+                </p>
               </div>
+            </div>
+
+            {/* Deterministic (non-AI) reference range rules */}
+            <div className="md:col-span-2 mt-4">
+              <ReferenceRangeRulesEditor
+                labAnalyteId={analyte?.lab_analyte_id}
+                analyteName={formData.name}
+                unit={formData.unit}
+                defaultRange={formData.referenceRange}
+              />
             </div>
 
             {/* Description */}

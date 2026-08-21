@@ -1,6 +1,7 @@
 import React, { useState, useMemo, useRef, useEffect } from 'react';
 import { X, Save, AlertCircle, Flag, Calculator, Link2, Search, Plus, Trash2, ChevronDown, Activity } from 'lucide-react';
 import { database, supabase } from '../../utils/supabase';
+import ReferenceRangeRulesEditor from '../Tests/ReferenceRangeRulesEditor';
 import {
   dedupeDependenciesForSave,
   selectPreferredCalculatedDependencies,
@@ -854,16 +855,27 @@ export const SimpleAnalyteEditor: React.FC<SimpleAnalyteEditorProps> = ({
 
             <div className="space-y-4">
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Reference Range (Text)</label>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Default Reference Range (Text)</label>
                 <textarea
                   rows={3}
                   value={formData.reference_range}
                   onChange={(e) => setFormData(prev => ({ ...prev, reference_range: e.target.value }))}
                   className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-y"
-                  placeholder="e.g., 12-16 (F), 14-18 (M) or Normal/Abnormal&#10;Press Enter for multiple lines"
+                  placeholder="e.g., 12-16 or Normal/Abnormal&#10;Press Enter for multiple lines"
                 />
-                <p className="text-xs text-gray-500 mt-1">Text description of normal ranges, including gender/age specific values</p>
+                <p className="text-xs text-gray-500 mt-1">
+                  Used when no rule below matches. For gender, age or fasting-specific ranges,
+                  add rules instead of describing them here — only a rule changes what the
+                  report prints and how the value is flagged.
+                </p>
               </div>
+
+              <ReferenceRangeRulesEditor
+                labAnalyteId={formData.lab_analyte_id}
+                analyteName={formData.name}
+                unit={formData.unit}
+                defaultRange={formData.reference_range}
+              />
 
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-2">

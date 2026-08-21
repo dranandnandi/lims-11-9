@@ -12,6 +12,7 @@
 // that lab's own WhatsApp session, one message per lab.
 
 import { createClient } from "npm:@supabase/supabase-js@2.45.4";
+import { resolveWhatsAppSender, formatPhoneForSender } from '../_shared/whatsappSender.ts';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -32,14 +33,6 @@ function generatePin(): string {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
 
-// Mirror of frontend WhatsAppAPI.formatPhoneNumber (assumes +91 for 10-digit numbers)
-function formatPhoneForSend(phone: string): string {
-  const digits = phone.replace(/\D/g, '');
-  if (digits.length === 10) return '91' + digits;
-  if (digits.length === 12 && digits.startsWith('91')) return digits;
-  if (digits.length === 13 && digits.startsWith('091')) return digits.substring(1);
-  return digits;
-}
 
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders });
@@ -64,7 +57,7 @@ Deno.serve(async (req) => {
     // because stored phone formats vary (spaces, +91, dashes).
     const { data: candidates } = await supabaseAdmin
       .from('patients')
-      .select('id, name, phone, lab_id, patient_auth_id, portal_pin_reset_at, portal_access_enabled')
+      .select('id, name, phone, lab_id, default_location_id, patient_auth_id, portal_pin_reset_at, portal_access_enabled')
       .eq('portal_access_enabled', true)
       .eq('is_active', true)
       .not('patient_auth_id', 'is', null)
@@ -103,7 +96,7 @@ Deno.serve(async (req) => {
     const labIds = [...new Set(patients.map((p) => p.lab_id))];
     const { data: labRows } = await supabaseAdmin
       .from('labs')
-      .select('id, name, whatsapp_user_id')
+      .select('id, name')
       .in('id', labIds);
 
     const labsById = new Map((labRows || []).map((l) => [l.id, l]));
@@ -118,17 +111,24 @@ Deno.serve(async (req) => {
     for (const patient of patients) {
       const lab = labsById.get(patient.lab_id);
 
-      if (!lab?.whatsapp_user_id) {
+      // Send from the branch the patient is registered at when that branch has
+      // its own number, so the PIN arrives from a number they recognise.
+      const sender = await resolveWhatsAppSender(supabaseAdmin, {
+        labId: patient.lab_id,
+        locationId: patient.default_location_id,
+      });
+
+      if (!sender.userId) {
         whatsappUnavailable++;
         continue;
       }
 
       const pin = generatePin();
       const message =
-        `Hello ${patient.name},\n\nYour new patient portal PIN for *${lab.name || 'your lab'}* is *${pin}*.\n\n` +
+        `Hello ${patient.name},\n\nYour new patient portal PIN for *${lab?.name || 'your lab'}* is *${pin}*.\n\n` +
         `Login: https://app.limsapp.in/patient/login\n` +
         `Use your registered mobile number and this PIN.\n\n` +
-        `If you did not request this, please contact ${lab.name || 'your lab'}.`;
+        `If you did not request this, please contact ${lab?.name || 'your lab'}.`;
 
       let sendOk = false;
       try {
@@ -136,8 +136,8 @@ Deno.serve(async (req) => {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-API-Key': waKey },
           body: JSON.stringify({
-            userId: lab.whatsapp_user_id,
-            phoneNumber: formatPhoneForSend(patient.phone),
+            userId: sender.userId,
+            phoneNumber: formatPhoneForSender(patient.phone, sender.countryCode),
             message,
           }),
         });
@@ -188,7 +188,7 @@ Deno.serve(async (req) => {
       }
 
       sentCount++;
-      if (lab.name && !labNamesSent.includes(lab.name)) labNamesSent.push(lab.name);
+      if (lab?.name && !labNamesSent.includes(lab.name)) labNamesSent.push(lab.name);
     }
 
     // A patient's PIN attempts are throttled per number; a successful reset should

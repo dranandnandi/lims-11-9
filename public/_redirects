@@ -1,1 +1,6 @@
+# Stable patient report links. Must precede the SPA catch-all below, otherwise
+# /* serves index.html for /r/<token>.pdf. netlify.toml carries the same rule --
+# it is evaluated first, this is here so the precedence is not implicit.
+/r/*  https://api.limsapp.in/functions/v1/report-link/:splat  302!
+
 /*    /index.html   200

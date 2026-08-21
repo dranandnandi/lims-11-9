@@ -1,4 +1,10 @@
 import { createClient } from 'jsr:@supabase/supabase-js@2'
+import {
+  buildRangeContext,
+  normalizeGender,
+  resolveReferenceRange,
+  type ReferenceRangeRule,
+} from '../_shared/referenceRangeResolver.ts'
 import Anthropic from 'npm:@anthropic-ai/sdk'
 import { computeCalculatedResults } from './calculatedAnalytes.ts'
 import { normalizeUnitForCompare, quantityKind, quantityKindsConflict } from './quantityKind.ts'
@@ -1608,9 +1614,12 @@ Do NOT include or describe binary histogram data — it is already extracted sep
         statusLog += "Sample found. Processing results... "
 
         // Fetch Patient Details from Order (patient_name from orders, gender from patients join)
+        // DOB and age unit come along for the deterministic range rules; the
+        // order's patient_context carries pregnancy status when the order was
+        // booked through the order form.
         const { data: orderData, error: orderError } = await supabase
             .from('orders')
-            .select('patient_id, patient_name, patients (gender, age)')
+            .select('patient_id, patient_name, patient_context, patients (gender, age, age_unit, dob, date_of_birth)')
             .eq('id', sample.order_id)
             .single()
 
@@ -1626,6 +1635,9 @@ Do NOT include or describe binary histogram data — it is already extracted sep
         // @ts-ignore
         const patientAge: number | null = (orderData as any)?.patients?.age ?? null
         const patientName = orderData?.patient_name || "Unknown Patient"
+        // @ts-ignore - joined row
+        const patientRowForRanges: any = (orderData as any)?.patients ?? null
+        const orderPatientContext: any = (orderData as any)?.patient_context ?? null
 
         if (patientId) {
             const sectionResult = await upsertAnalyzerSectionContent(supabase, {
@@ -2354,6 +2366,41 @@ Note machine_code is the exact test_code (here "6690-2"), even though the name i
               }
             }
 
+            // Deterministic (non-AI) range rules: gender / age / sample condition
+            // / pregnancy. Absent rules leave the legacy columns in charge.
+            const rangeRulesByLabAnalyte = new Map<string, ReferenceRangeRule[]>()
+            if (allLabAnalyteIds.length > 0) {
+              const { data: ruleRows, error: ruleErr } = await supabase
+                .from('lab_analyte_reference_ranges')
+                .select('id, lab_analyte_id, gender, age_min_days, age_max_days, sample_condition, pregnancy, range_text, range_low, range_high, low_critical, high_critical, priority, is_active, created_at')
+                .in('lab_analyte_id', allLabAnalyteIds)
+                .eq('is_active', true)
+              if (ruleErr) {
+                console.warn('DEBUG: range rule lookup failed, using legacy columns:', ruleErr.message)
+              }
+              for (const rule of (ruleRows ?? []) as ReferenceRangeRule[]) {
+                if (!rule.lab_analyte_id) continue
+                if (!rangeRulesByLabAnalyte.has(rule.lab_analyte_id)) rangeRulesByLabAnalyte.set(rule.lab_analyte_id, [])
+                rangeRulesByLabAnalyte.get(rule.lab_analyte_id)!.push(rule)
+              }
+              console.log(`DEBUG: Loaded range rules for ${rangeRulesByLabAnalyte.size} lab_analytes`)
+            }
+
+            // Sample condition is chosen per test group on the order.
+            const sampleConditionByTestGroup = new Map<string, string>()
+            {
+              const [{ data: otgRows }, { data: otRows }] = await Promise.all([
+                supabase.from('order_test_groups').select('test_group_id, sample_condition').eq('order_id', sample.order_id),
+                supabase.from('order_tests').select('test_group_id, sample_condition').eq('order_id', sample.order_id),
+              ])
+              for (const row of [...(otgRows ?? []), ...(otRows ?? [])]) {
+                const condition = String(row?.sample_condition ?? '').trim()
+                if (row?.test_group_id && condition && !sampleConditionByTestGroup.has(row.test_group_id)) {
+                  sampleConditionByTestGroup.set(row.test_group_id, condition)
+                }
+              }
+            }
+
             const mappedCandidates: Array<{
               item: any
               mapping: any
@@ -2363,6 +2410,9 @@ Note machine_code is the exact test_code (here "6690-2"), even though the name i
               finalUnit: string
               verifyStatus: string
               fallbackReferenceRange: string
+              // How the lab-saved range was resolved. Carried on the candidate so
+              // the insert loop below can record it without re-resolving.
+              resolvedSavedRange: ReturnType<typeof resolveReferenceRange>
               analyteKey: string
               matchScore: number
             }> = []
@@ -2472,22 +2522,40 @@ Note machine_code is the exact test_code (here "6690-2"), even though the name i
                 }
 
                 const rr = labAnalyteId ? refRangeMap.get(labAnalyteId) : null
-                const isMale = patientGender?.toLowerCase().startsWith('m')
-                const isFemale = patientGender?.toLowerCase().startsWith('f')
-                const savedReferenceRange =
-                  rr?.lab_specific ||
-                  (isMale ? rr?.ref_male : null) ||
-                  (isFemale ? rr?.ref_female : null) ||
-                  rr?.ref_generic ||
-                  null
+                // Deterministic rules first (gender / age / sample condition /
+                // pregnancy); the legacy gender columns are the resolver's own
+                // fallback, so behaviour is unchanged when no rule matches.
+                const resolvedSavedRange = resolveReferenceRange(
+                  labAnalyteId ? rangeRulesByLabAnalyte.get(labAnalyteId) : null,
+                  buildRangeContext({
+                    patient: patientRowForRanges,
+                    patientContext: orderPatientContext,
+                    sampleCondition: mapping.test_group_id
+                      ? sampleConditionByTestGroup.get(mapping.test_group_id) ?? null
+                      : null,
+                  }),
+                  {
+                    lab_specific_reference_range: rr?.lab_specific ?? null,
+                    reference_range: rr?.ref_generic ?? null,
+                    reference_range_male: rr?.ref_male ?? null,
+                    reference_range_female: rr?.ref_female ?? null,
+                    low_critical: rr?.low_critical ?? null,
+                    high_critical: rr?.high_critical ?? null,
+                  },
+                )
+                const savedReferenceRange = resolvedSavedRange.range_text || null
                 // With the toggle on, the lab's saved range wins and the machine's
                 // range (item.reference_range) is only a last resort when the lab
                 // has none. With it off, preserve the prior machine-first behaviour.
+                const legacyGenderRange = normalizeGender(patientRowForRanges?.gender) === 'male'
+                  ? rr?.ref_male
+                  : normalizeGender(patientRowForRanges?.gender) === 'female'
+                    ? rr?.ref_female
+                    : null
                 const fallbackReferenceRange = useSavedReferenceRanges
                   ? (savedReferenceRange || item.reference_range || '-')
                   : (rr?.lab_specific ||
-                     (isMale ? rr?.ref_male : null) ||
-                     (isFemale ? rr?.ref_female : null) ||
+                     legacyGenderRange ||
                      item.reference_range ||
                      rr?.ref_generic ||
                      '-')
@@ -2514,6 +2582,7 @@ Note machine_code is the exact test_code (here "6690-2"), even though the name i
                   finalUnit,
                   verifyStatus,
                   fallbackReferenceRange,
+                  resolvedSavedRange,
                   analyteKey: String(labAnalyteId || mapping.analyte_id),
                   matchScore,
                 })
@@ -2603,6 +2672,7 @@ Note machine_code is the exact test_code (here "6690-2"), even though the name i
                   finalUnit,
                   verifyStatus,
                   fallbackReferenceRange,
+                  resolvedSavedRange,
                 } = candidate
                 const aiResolution = mapping.test_group_id
                   ? aiResolvedRanges.get(`${mapping.test_group_id}:${labAnalyteId || mapping.analyte_id}`)
@@ -2617,8 +2687,10 @@ Note machine_code is the exact test_code (here "6690-2"), even though the name i
                 let finalFlagSource: string
                 if (useSavedReferenceRanges) {
                   const computed = computeSavedFlag(finalValue, finalReferenceRange, {
-                    lowCritical: rrMeta?.low_critical,
-                    highCritical: rrMeta?.high_critical,
+                    // A matched rule may carry criticals specific to that
+                    // condition; otherwise the analyte-level ones stand.
+                    lowCritical: resolvedSavedRange.low_critical ?? rrMeta?.low_critical,
+                    highCritical: resolvedSavedRange.high_critical ?? rrMeta?.high_critical,
                     expectedNormalValues: rrMeta?.expected_normal_values,
                     valueType: rrMeta?.value_type,
                   })
@@ -2642,7 +2714,8 @@ Note machine_code is the exact test_code (here "6690-2"), even though the name i
                   test_group_id: mapping.test_group_id || null,
                   analyte_id: mapping.analyte_id,
                   analyzer_code: item.test_code || null,
-                  range_source: aiResolution ? 'ai' : (useSavedReferenceRanges ? 'lab_saved' : 'analyzer_or_lab'),
+                  range_source: aiResolution ? 'ai' : (useSavedReferenceRanges ? resolvedSavedRange.source : 'analyzer_or_lab'),
+                  applied_range_rule: aiResolution ? null : resolvedSavedRange.applied_rule,
                   flag_source: finalFlagSource,
                   fallback_reason: fallbackReason,
                   reference_range: finalReferenceRange,
@@ -2662,6 +2735,9 @@ Note machine_code is the exact test_code (here "6690-2"), even though the name i
                     unit: finalUnit,
                     flag: finalFlag,
                     reference_range: finalReferenceRange,
+                    range_rule_id: aiResolution ? null : resolvedSavedRange.rule_id,
+                    range_source: aiResolution ? 'ai' : (useSavedReferenceRanges ? resolvedSavedRange.source : 'analyzer_or_lab'),
+                    applied_range_rule: aiResolution ? null : resolvedSavedRange.applied_rule,
                     reference_range_male: labAnalyteId ? (refRangeMap.get(labAnalyteId)?.ref_male ?? null) : null,
                     reference_range_female: labAnalyteId ? (refRangeMap.get(labAnalyteId)?.ref_female ?? null) : null,
                     extracted_by_ai: true,

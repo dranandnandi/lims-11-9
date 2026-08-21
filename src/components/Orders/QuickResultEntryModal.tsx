@@ -22,6 +22,16 @@ import {
 } from "../../utils/analyteInterfaceConversion";
 import { normalizeResultFlagForSave } from "../../utils/referenceRangeService";
 import {
+  contextForGroup,
+  fetchPatientRangeInfo,
+  fetchRangeRules,
+  rangeAuditColumns,
+  resolveForAnalyte,
+  type AnalyteRangeInput,
+  type PatientRangeInfo,
+  type RangeRuleMap,
+} from "../../utils/referenceRangeLoader";
+import {
   FALLBACK_DECIMAL_PLACES,
   normalizeDecimalPlaces,
   roundHalfUp,
@@ -70,6 +80,21 @@ interface AnalyteRow {
   // saved row can be approved / unapproved without leaving the modal.
   result_value_id?: string | null;
   verify_status?: string | null;
+  // How `reference` was decided. Recorded on save so the verification desk can
+  // see why a patient got the range they did.
+  range_rule_id?: string | null;
+  range_source?: string | null;
+  applied_range_rule?: string | null;
+  // Set once the user types in the reference cell. A hand-edited range is never
+  // overwritten by a re-resolve (e.g. when the sample condition changes).
+  reference_edited?: boolean;
+  // The analyte's legacy range columns, carried on the row so changing the
+  // sample condition can re-resolve without re-querying lab_analytes.
+  range_fallback?: AnalyteRangeInput;
+  // Criticals carried by a matched rule. Only populated when the range came
+  // from a rule, so labs without rules keep exactly the flagging they had.
+  rule_low_critical?: number | null;
+  rule_high_critical?: number | null;
 }
 
 interface TestGroup {
@@ -368,6 +393,10 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
   // Sample condition chosen per test group (keyed by test_group_id). Mirrors the
   // selection made during sample collection so it can still be set/corrected here.
   const [sampleConditions, setSampleConditions] = useState<Record<string, string>>({});
+  // Deterministic (non-AI) reference range rules, keyed by lab_analyte_id, plus
+  // the patient facts they are matched against.
+  const [rangeRules, setRangeRules] = useState<RangeRuleMap>(new Map());
+  const [patientRangeInfo, setPatientRangeInfo] = useState<PatientRangeInfo | null>(null);
   const [initialSampleConditions, setInitialSampleConditions] = useState<Record<string, string>>({});
   const [activeGroupId, setActiveGroupId] = useState<string | null>(null);
   // Saved analytes render collapsed by default — a group is only expanded once
@@ -601,7 +630,7 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
 	      if (allLabAnalyteIds.length > 0 && data.lab_id) {
 	        const { data: la } = await supabase
 	          .from("lab_analytes")
-	          .select("id, analyte_id, decimal_places, expected_normal_values, expected_value_flag_map, value_type, expected_value_codes, default_value, reference_range, lab_specific_reference_range, is_calculated, formula, formula_variables, calculation_result_type, lab_analyte_interface_config(multiply_by, add_offset, decimal_places, lims_unit, apply_to_quick_result_entry)")
+	          .select("id, analyte_id, decimal_places, expected_normal_values, expected_value_flag_map, value_type, expected_value_codes, default_value, reference_range, lab_specific_reference_range, reference_range_male, reference_range_female, low_critical, high_critical, is_calculated, formula, formula_variables, calculation_result_type, lab_analyte_interface_config(multiply_by, add_offset, decimal_places, lims_unit, apply_to_quick_result_entry)")
 	          .eq("lab_id", data.lab_id)
 	          .in("id", allLabAnalyteIds);
 	        if (la) {
@@ -610,6 +639,15 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
 	          }
 	        }
 	      }
+
+	      // Deterministic range rules + the patient facts they match on. Both are
+	      // best-effort: without them the legacy columns still resolve a range.
+	      const [loadedRules, loadedPatientInfo] = await Promise.all([
+	        fetchRangeRules(allLabAnalyteIds as string[]),
+	        fetchPatientRangeInfo(order.id, order.patient_id),
+	      ]);
+	      setRangeRules(loadedRules);
+	      setPatientRangeInfo(loadedPatientInfo);
 
       setTestGroups(merged);
       // A group that also arrives via order_test_groups already has an entry
@@ -723,9 +761,22 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
 
 
 	      // Build flat rows
-	      const flat: AnalyteRow[] = merged.flatMap(tg =>
-	        tg.analytes.map(a => {
+	      const flat: AnalyteRow[] = merged.flatMap(tg => {
+	        // One context per group — sample condition is per-group, the patient
+	        // facts are per-order.
+	        const rangeCtx = contextForGroup(loadedPatientInfo, loadedConditions[tg.test_group_id]);
+	        return tg.analytes.map(a => {
 	          const la = a.lab_analyte_id ? (labAnalytesMap.get(a.lab_analyte_id) || a) : a;
+	          const rangeFallback: AnalyteRangeInput = {
+	            lab_analyte_id: a.lab_analyte_id,
+	            lab_specific_reference_range: la?.lab_specific_reference_range,
+	            reference_range: la?.reference_range ?? a.reference_range,
+	            reference_range_male: la?.reference_range_male,
+	            reference_range_female: la?.reference_range_female,
+	            low_critical: la?.low_critical,
+	            high_critical: la?.high_critical,
+	          };
+	          const resolvedRange = resolveForAnalyte(loadedRules, rangeFallback, rangeCtx);
 	          let envValues: string[] = a.expected_normal_values || [];
 	          let envMap: Record<string, string> = a.expected_value_flag_map || {};
           if (la?.expected_normal_values) {
@@ -762,7 +813,17 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
             parameter: a.name,
             value: prefillValue,
             unit: a.existing_result?.unit || a.units || "",
-            reference: a.existing_result?.reference_range ?? (la != null ? (la.lab_specific_reference_range ?? la.reference_range ?? a.reference_range) : a.reference_range) ?? "",
+            // A range already saved on the result wins: it is the range the
+            // patient was actually reported against. Only a fresh row picks up
+            // the currently resolved one.
+            reference: a.existing_result?.reference_range ?? resolvedRange.range_text ?? "",
+            range_rule_id: resolvedRange.rule_id,
+            range_source: resolvedRange.source,
+            applied_range_rule: resolvedRange.applied_rule,
+            reference_edited: false,
+            range_fallback: rangeFallback,
+            rule_low_critical: resolvedRange.source === 'rule' ? resolvedRange.low_critical : null,
+            rule_high_critical: resolvedRange.source === 'rule' ? resolvedRange.high_critical : null,
             flag: a.existing_result?.flag || defaultFlag,
             // A flag already in the database is not treated as a human override:
             // rows saved before flag_source was tracked honestly all read
@@ -794,8 +855,8 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
 	            is_hidden_from_report: isHiddenExisting,
 	            hidden_reason: a.existing_result?.hidden_reason || "",
 	          };
-        })
-      );
+        });
+      });
 
       // Load analyte_dependencies for live formula evaluation
       // Prefer lab-specific rows; fall back to global (lab_id IS NULL) when no lab override exists
@@ -1272,6 +1333,7 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
 	        value: r.value.replace(/,/g, ''),
 	        unit: r.unit,
 	        reference_range: r.reference,
+	        ...rangeAuditColumns(r, { edited: r.reference_edited }),
 	        flag: r.flag,
 	        value_type: r.value_type,
 	        is_hidden_from_report: !!r.is_hidden_from_report,
@@ -1312,6 +1374,53 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
   // order_test_groups is the column sample collection writes and
   // generate-pdf-letterhead reads first; orders booked through the order form
   // only get order_tests rows, which mirror the same column.
+  /**
+   * Changing the sample condition changes which reference range applies, so the
+   * grid has to follow — a fasting glucose range left on a post-prandial sample
+   * is a wrong report, not a cosmetic mismatch.
+   *
+   * Two rows are deliberately left alone: one whose range the user typed over,
+   * and one that is already saved (its range is what the patient was reported
+   * against). Flags are recomputed only where the range actually moved.
+   */
+  const handleSampleConditionChange = (tgId: string, value: string) => {
+    setSampleConditions(current => ({ ...current, [tgId]: value }));
+
+    const ctx = contextForGroup(patientRangeInfo, value);
+    setRows(prev => prev.map(row => {
+      if (row.test_group_id !== tgId) return row;
+      if (row.reference_edited || row.is_existing) return row;
+      if (!row.range_fallback) return row;
+
+      const resolved = resolveForAnalyte(rangeRules, row.range_fallback, ctx);
+      if (resolved.range_text === row.reference) return row;
+
+      // The range moved, so any verdict derived from the old one is stale.
+      const recomputed = resolveFlag(
+        row.value.replace(/,/g, ''),
+        resolved.range_text,
+        patientRangeInfo?.patient?.gender ?? undefined,
+        resolved.low_critical ?? undefined,
+        resolved.high_critical ?? undefined,
+        undefined,
+        undefined,
+        undefined,
+        row.value_type,
+      );
+
+      return {
+        ...row,
+        reference: resolved.range_text,
+        range_rule_id: resolved.rule_id,
+        range_source: resolved.source,
+        applied_range_rule: resolved.applied_rule,
+        rule_low_critical: resolved.source === 'rule' ? resolved.low_critical : null,
+        rule_high_critical: resolved.source === 'rule' ? resolved.high_critical : null,
+        flag: applyAutoFlag(row, recomputed),
+      };
+    }));
+  };
+
   const persistSampleConditions = async () => {
     const changed = testGroups.filter((tg) =>
       (tg.order_test_group_id || tg.order_test_id) &&
@@ -1408,7 +1517,12 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
       if (groupsToResolve.length > 0) {
         setMessage({ text: `Resolving AI reference ranges for ${groupsToResolve.length} group(s)...`, type: "success" });
         const { findResolvedReferenceRange, resolveReferenceRanges } = await import("../../utils/referenceRangeService");
-        for (const tg of groupsToResolve) {
+
+        // Each group is an independent edge-function call, and the payloads
+        // carry only values and units, so nothing a group resolves changes what
+        // another group would send. Awaiting them one at a time just stacked
+        // their latencies.
+        const resolutions = await Promise.all(groupsToResolve.map(async tg => {
           const payload = tg.analytes.map(a => {
 	            const row = workingRows.find(r =>
 	              r.test_group_id === tg.test_group_id &&
@@ -1423,21 +1537,26 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
             };
           });
           try {
-            const resolved = await resolveReferenceRanges(order.id, tg.test_group_id, payload);
-            if (resolved) {
-              workingRows = workingRows.map(r => {
-                const hit = findResolvedReferenceRange(resolved, r);
-                if (!hit?.used_reference_range) return r;
-                const newRef = hit.used_reference_range;
-                // The range just changed, so the previous verdict is stale by
-                // definition — recompute against the new one.
-                const resolved = resolveFlag(r.value.replace(/,/g, ''), newRef, order.patient?.gender ?? undefined, undefined, undefined, undefined, undefined, undefined, r.value_type);
-                return { ...r, reference: newRef, flag: applyAutoFlag(r, resolved) };
-              });
-            }
+            return await resolveReferenceRanges(order.id, tg.test_group_id, payload);
           } catch (aiErr) {
             console.warn(`AI ref range failed for group ${tg.test_group_name}:`, aiErr);
+            return null;
           }
+        }));
+
+        // Applied in group order, so overlapping analytes settle exactly the
+        // way the sequential version left them.
+        for (const resolved of resolutions) {
+          if (!resolved) continue;
+          workingRows = workingRows.map(r => {
+            const hit = findResolvedReferenceRange(resolved, r);
+            if (!hit?.used_reference_range) return r;
+            const newRef = hit.used_reference_range;
+            // The range just changed, so the previous verdict is stale by
+            // definition — recompute against the new one.
+            const reflagged = resolveFlag(r.value.replace(/,/g, ''), newRef, order.patient?.gender ?? undefined, undefined, undefined, undefined, undefined, undefined, r.value_type);
+            return { ...r, reference: newRef, flag: applyAutoFlag(r, reflagged) };
+          });
         }
         // Sync resolved references back to UI state
         setRows(workingRows);
@@ -1515,8 +1634,10 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
             rawVal,
             r.reference,
             order.patient?.gender ?? undefined,
-            undefined,
-            undefined,
+            // Criticals only apply when a rule supplied them. Labs with no rules
+            // configured keep the flagging behaviour they had before.
+            r.rule_low_critical ?? undefined,
+            r.rule_high_critical ?? undefined,
             undefined,
             undefined,
             undefined,
@@ -1551,6 +1672,7 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
           value: rawVal || null,
           unit: r.unit || "",
           reference_range: r.reference || "",
+          ...rangeAuditColumns(r, { edited: r.reference_edited }),
 	          flag: normalizeResultFlagForSave(finalFlag, rawVal),
 	          flag_source: flagSource,
 	          is_auto_calculated: r.is_calculated,
@@ -1619,9 +1741,19 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
       setInitialRemarkEnabled({ ...remarkEnabled });
 
       try {
+        // This screen has already done the range work: rule ranges are applied
+        // as the rows load and AI ranges are resolved just before the save
+        // above. So the post-save pass only normalises flags, and the paid AI
+        // call is made only for orders that actually use AI reference ranges.
+        const usesAIRanges = testGroups.some(tg => tg.ref_range_ai_config?.enabled === true);
         setMessage({ text: "Finalizing flags and reference details...", type: "success" });
         const { runAIFlagAnalysis } = await import("../../utils/aiFlagAnalysis");
-        await runAIFlagAnalysis(order.id, { applyToDatabase: true, createAudit: true, useAIService: true });
+        await runAIFlagAnalysis(order.id, {
+          applyToDatabase: true,
+          createAudit: true,
+          useAIService: usesAIRanges,
+          skipRangeResolution: true,
+        });
       } catch (e) {
         console.warn("AI flag analysis skipped:", e);
       }
@@ -2317,10 +2449,7 @@ const QuickResultEntryModal: React.FC<QuickResultEntryModalProps> = ({ order, on
                     </label>
                     <select
                       value={sampleConditions[tg.test_group_id] || ""}
-                      onChange={(event) => setSampleConditions((current) => ({
-                        ...current,
-                        [tg.test_group_id]: event.target.value,
-                      }))}
+                      onChange={(event) => handleSampleConditionChange(tg.test_group_id, event.target.value)}
                       disabled={!tg.order_test_group_id && !tg.order_test_id}
                       className="min-w-[200px] rounded border border-blue-200 bg-white px-2 py-1 text-sm text-gray-800 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100 disabled:bg-gray-100 disabled:text-gray-500"
                     >

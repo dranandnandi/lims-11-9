@@ -221,6 +221,26 @@ const fetchPanelStatusRows = async (
   return rows;
 };
 
+// order_date is a plain DATE column ("2026-08-19"). new Date() parses that as UTC
+// midnight, so toLocaleString() renders "5:30:00 AM" in IST. Render the calendar
+// date only, built from the raw parts so the day can never shift.
+const fmtOrderDate = (raw: string | null | undefined): string => {
+  if (!raw) return "";
+  const parts = String(raw).slice(0, 10).split("-");
+  if (parts.length === 3) {
+    const [y, m, d] = parts.map(Number);
+    if (Number.isFinite(y) && Number.isFinite(m) && Number.isFinite(d)) {
+      return new Date(y, m - 1, d).toLocaleDateString("en-IN", {
+        day: "2-digit",
+        month: "short",
+        year: "numeric",
+      });
+    }
+  }
+  const fallback = new Date(raw);
+  return Number.isNaN(fallback.getTime()) ? "" : fallback.toLocaleDateString("en-IN");
+};
+
 const OrderVerificationView: React.FC<OrderVerificationViewProps> = ({ onBackToPanel }) => {
   const [from, setFrom] = useState(todayISO());
   const [to, setTo] = useState(todayISO());
@@ -3103,8 +3123,12 @@ ${summary.urgent_findings.map(f => `• ${f}`).join('\n')}` : ''}
                             </div>
                             <div>
                               <h3 className="text-2xl font-bold text-gray-900">{order.patientName}</h3>
-                              <p className="text-sm text-gray-500">Order #{order.orderId}</p>
-                              <p className="text-sm text-gray-500">{new Date(order.orderDate).toLocaleString()}</p>
+                              {(order.sampleId || order.orderNumber) && (
+                                <p className="text-sm text-gray-500">
+                                  {order.sampleId ? `Sample ${order.sampleId}` : `Order ${order.orderNumber}`}
+                                </p>
+                              )}
+                              <p className="text-sm text-gray-500">{fmtOrderDate(order.orderDate)}</p>
                             </div>
                           </div>
                           <div className="mt-3 flex items-center space-x-3">

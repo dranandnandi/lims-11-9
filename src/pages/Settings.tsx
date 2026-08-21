@@ -1982,12 +1982,12 @@ const Settings: React.FC = () => {
                           <option value="+880">🇧🇩 Bangladesh (+880)</option>
                           <option value="+977">🇳🇵 Nepal (+977)</option>
                         </select>
-                        <p className="text-xs text-gray-500 mt-1">Used for WhatsApp messages and phone number formatting</p>
+                        <p className="text-xs text-gray-500 mt-1">Used for WhatsApp messages and phone number formatting. A location can override this.</p>
                       </div>
                       <div>
                         <label className="block text-sm font-medium text-gray-700 mb-1">
                           <MessageSquare className="h-4 w-4 inline mr-1" />
-                          WhatsApp Sender Account
+                          Default WhatsApp Sender Account
                         </label>
                         <select
                           value={labSettings.whatsapp_user_id || ''}
@@ -2004,7 +2004,7 @@ const Settings: React.FC = () => {
                         <p className="text-xs text-gray-500 mt-1">
                           {syncedWhatsAppUsers.length === 0 
                             ? '⚠️ No synced users. Go to WhatsApp → User Sync to sync users first.'
-                            : 'Select which user\'s WhatsApp account to use for sending messages'}
+                            : 'Used for any location that has no sender of its own. To give a branch its own number, set it in Masters → Locations.'}
                         </p>
                       </div>
                       <div>

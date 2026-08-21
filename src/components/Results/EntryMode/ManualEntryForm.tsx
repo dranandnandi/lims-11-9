@@ -8,6 +8,13 @@ import SectionEditor from '../SectionEditor';
 import OutsourcedReportUpload from '../OutsourcedReportUpload';
 import { usePermissions } from '../../../hooks/usePermissions';
 import { getResultEntryPermissionForDepartment, getSectionEditPermissionForDepartment } from '../../../utils/resultPermissions';
+import {
+  contextForGroup,
+  fetchPatientRangeInfo,
+  fetchRangeRules,
+  rangeAuditColumns,
+  resolveForAnalyte,
+} from '../../../utils/referenceRangeLoader';
 
 interface ManualEntryFormProps {
   order: {
@@ -32,6 +39,10 @@ interface AnalyteData {
   isApproved?: boolean;
   isVerified?: boolean;
   existingId?: string;
+  // How referenceRange was decided, carried through to result_values.
+  rangeRuleId?: string | null;
+  rangeSource?: string | null;
+  appliedRangeRule?: string | null;
 }
 
 const formatIndianNumber = (value: string): string => {
@@ -78,6 +89,33 @@ const ManualEntryForm: React.FC<ManualEntryFormProps> = ({ order, testGroup, onS
     return null;
   };
 
+  /**
+   * The condition chosen for this test group on this order (Fasting, Random,
+   * Post Prandial...). Orders booked through the order form carry it on
+   * order_tests; panel-style orders carry it on order_test_groups.
+   */
+  const fetchSampleConditionForGroup = async (): Promise<string | null> => {
+    try {
+      const [{ data: otg }, { data: ot }] = await Promise.all([
+        supabase
+          .from('order_test_groups')
+          .select('sample_condition')
+          .eq('order_id', order.id)
+          .eq('test_group_id', testGroup.id)
+          .maybeSingle(),
+        supabase
+          .from('order_tests')
+          .select('sample_condition')
+          .eq('order_id', order.id)
+          .eq('test_group_id', testGroup.id)
+          .maybeSingle(),
+      ]);
+      return (otg?.sample_condition || ot?.sample_condition || null);
+    } catch {
+      return null;
+    }
+  };
+
   // Fetch analytes for the test group
   const fetchAnalytes = async () => {
     try {
@@ -101,6 +139,8 @@ const ManualEntryForm: React.FC<ManualEntryFormProps> = ({ order, testGroup, onS
             unit,
             reference_range,
             lab_specific_reference_range,
+            reference_range_male,
+            reference_range_female,
             low_critical,
             high_critical,
             method,
@@ -117,15 +157,38 @@ const ManualEntryForm: React.FC<ManualEntryFormProps> = ({ order, testGroup, onS
         .eq('test_group_id', testGroup.id);
 
       if (!error && data) {
+        // Deterministic range rules for this group. The sample condition lives on
+        // the order row for this test group, so pull it alongside the patient facts.
+        const labAnalyteIds = data.map((item: any) => item.lab_analyte_id).filter(Boolean);
+        const [rules, patientInfo, sampleCondition] = await Promise.all([
+          fetchRangeRules(labAnalyteIds),
+          fetchPatientRangeInfo(order.id, order.patient_id),
+          fetchSampleConditionForGroup(),
+        ]);
+        const rangeCtx = contextForGroup(patientInfo, sampleCondition);
+
         const analyteList = data.map(item => {
           const a = item.analytes;
           const la = item.lab_analyte_id ? item.lab_analytes : null;
+          const labAnalyteId = item.lab_analyte_id || la?.id || null;
+          const resolvedRange = resolveForAnalyte(rules, {
+            lab_analyte_id: labAnalyteId,
+            lab_specific_reference_range: la?.lab_specific_reference_range,
+            reference_range: la?.reference_range ?? a.reference_range,
+            reference_range_male: (la as any)?.reference_range_male,
+            reference_range_female: (la as any)?.reference_range_female,
+            low_critical: la?.low_critical ?? a.low_critical,
+            high_critical: la?.high_critical ?? a.high_critical,
+          }, rangeCtx);
           return {
             id: a.id,
-            lab_analyte_id: item.lab_analyte_id || la?.id || null,
+            lab_analyte_id: labAnalyteId,
             name: la?.name || a.name,
             unit: la?.unit || a.unit || '',
-            reference_range: la?.lab_specific_reference_range ?? la?.reference_range ?? a.reference_range ?? '',
+            reference_range: resolvedRange.range_text,
+            range_rule_id: resolvedRange.rule_id,
+            range_source: resolvedRange.source,
+            applied_range_rule: resolvedRange.applied_rule,
             low_critical: la?.low_critical ?? a.low_critical,
             high_critical: la?.high_critical ?? a.high_critical,
             category: a.category,
@@ -149,7 +212,10 @@ const ManualEntryForm: React.FC<ManualEntryFormProps> = ({ order, testGroup, onS
             value: '',
             unit: analyte.unit,
             referenceRange: analyte.reference_range,
-            flag: ''
+            flag: '',
+            rangeRuleId: analyte.range_rule_id,
+            rangeSource: analyte.range_source,
+            appliedRangeRule: analyte.applied_range_rule,
           };
         });
         setFormData(initialData);
@@ -386,6 +452,12 @@ const ManualEntryForm: React.FC<ManualEntryFormProps> = ({ order, testGroup, onS
             value: data.value.replace(/,/g, ''),
             unit: data.unit,
             reference_range: data.referenceRange,
+            // A range that no longer matches what the resolver produced was
+            // typed over by hand.
+            ...rangeAuditColumns(
+              { rule_id: data.rangeRuleId, applied_rule: data.appliedRangeRule, source: data.rangeSource },
+              { edited: data.referenceRange !== analyte?.reference_range },
+            ),
             flag: data.flag
           };
         });

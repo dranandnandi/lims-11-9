@@ -782,6 +782,28 @@ let _cachedUser: any = null;
 let _cachedUserTimestamp: number = 0;
 const USER_CACHE_TTL_MS = 60000; // Cache user for 60 seconds
 
+// ============================================================================
+// Location Filter Cache - the lab's enforcement flag and the user's location
+// assignments do not change mid-session, but every list page resolves them on
+// each refetch. Uncached, a burst of refreshes costs one labs + users +
+// user_centers round trip apiece.
+// ============================================================================
+type LocationFilterResult = {
+  shouldFilter: boolean;
+  locationIds: string[];
+  canViewAll: boolean;
+};
+let _cachedLocationFilter: LocationFilterResult | null = null;
+let _cachedLocationFilterAt = 0;
+let _locationFilterInflight: Promise<LocationFilterResult> | null = null;
+const LOCATION_FILTER_TTL_MS = 60000;
+
+const clearLocationFilterCache = () => {
+  _cachedLocationFilter = null;
+  _cachedLocationFilterAt = 0;
+  _locationFilterInflight = null;
+};
+
 const resolveCurrentAppUserId = async (): Promise<string | null> => {
   const { data: { user }, error } = await supabase.auth.getUser();
   if (error || !user) return null;
@@ -819,6 +841,7 @@ supabase.auth.onAuthStateChange((event) => {
     _labIdInflightPromise = null;
     _cachedUser = null;
     _cachedUserTimestamp = 0;
+    clearLocationFilterCache();
   }
 });
 
@@ -832,7 +855,12 @@ export const database = {
     _cachedLabId = null;
     _cachedLabIdUserId = null;
     _labIdInflightPromise = null;
+    clearLocationFilterCache();
   },
+
+  // Drops the memoized location filter so the next caller re-reads the lab
+  // enforcement flag and the user's centers.
+  clearLocationFilterCache,
 
   // Helper to get current user's lab ID (with caching)
   getCurrentUserLabId: async () => {
@@ -1001,10 +1029,32 @@ export const database = {
     }
   },
 
-  // Helper to check if current user should have location filtering applied
-  shouldFilterByLocation: async (): Promise<
-    { shouldFilter: boolean; locationIds: string[]; canViewAll: boolean }
-  > => {
+  // Helper to check if current user should have location filtering applied.
+  // Memoized for LOCATION_FILTER_TTL_MS, with concurrent callers sharing one
+  // in-flight promise, so a screen that refetches in a burst resolves it once.
+  shouldFilterByLocation: async (): Promise<LocationFilterResult> => {
+    if (
+      _cachedLocationFilter &&
+      Date.now() - _cachedLocationFilterAt < LOCATION_FILTER_TTL_MS
+    ) {
+      return _cachedLocationFilter;
+    }
+    if (_locationFilterInflight) return _locationFilterInflight;
+
+    _locationFilterInflight = database._loadLocationFilter()
+      .then((result) => {
+        _cachedLocationFilter = result;
+        _cachedLocationFilterAt = Date.now();
+        return result;
+      })
+      .finally(() => {
+        _locationFilterInflight = null;
+      });
+
+    return _locationFilterInflight;
+  },
+
+  _loadLocationFilter: async (): Promise<LocationFilterResult> => {
     const labId = await database.getCurrentUserLabId();
     if (!labId) {
       return { shouldFilter: false, locationIds: [], canViewAll: true };
@@ -4926,57 +4976,95 @@ export const database = {
         value_type?: string | null;
       }>,
     ): Promise<{ success: number; failed: number }> => {
-      let successCount = 0;
-      let failedCount = 0;
+      if (!updates.length) return { success: 0, failed: 0 };
 
-      for (const update of updates) {
-        const { error } = await supabase
-          .from("result_values")
-          .update({
-            flag: update.flag,
-            flag_source: update.flag_source,
-            flag_confidence: update.flag_confidence,
-            ai_interpretation: update.ai_interpretation,
-            ai_audit_status: update.ai_audit_status,
-            ...(update.reference_range !== undefined
-              ? { reference_range: update.reference_range }
-              : {}),
-            // Enriched analyte snapshot fields (only set if provided)
-            ...(update.normal_range_min !== undefined
-              ? { normal_range_min: update.normal_range_min }
-              : {}),
-            ...(update.normal_range_max !== undefined
-              ? { normal_range_max: update.normal_range_max }
-              : {}),
-            ...(update.low_critical !== undefined
-              ? { low_critical: update.low_critical }
-              : {}),
-            ...(update.high_critical !== undefined
-              ? { high_critical: update.high_critical }
-              : {}),
-            ...(update.reference_range_male !== undefined
-              ? { reference_range_male: update.reference_range_male }
-              : {}),
-            ...(update.reference_range_female !== undefined
-              ? { reference_range_female: update.reference_range_female }
-              : {}),
-            ...(update.method !== undefined ? { method: update.method } : {}),
-            ...(update.value_type !== undefined
-              ? { value_type: update.value_type }
-              : {}),
-            updated_at: new Date().toISOString(),
-          })
-          .eq("id", update.id);
+      // One row per PATCH used to cost ~600ms of round trip each, so a 23
+      // analyte order spent ~14s here. The RPC applies the whole batch in a
+      // single transaction and suppresses the per-row order rollup, which also
+      // stops the realtime storm those individual writes used to produce.
+      const payload = updates.map((update) => ({
+        id: update.id,
+        // Keys are omitted, not sent as null, when the caller had nothing to
+        // say about a column — the RPC only writes keys that are present.
+        ...(update.flag !== undefined ? { flag: update.flag } : {}),
+        ...(update.flag_source !== undefined
+          ? { flag_source: update.flag_source }
+          : {}),
+        ...(update.flag_confidence !== undefined
+          ? { flag_confidence: update.flag_confidence }
+          : {}),
+        ...(update.ai_interpretation !== undefined
+          ? { ai_interpretation: update.ai_interpretation }
+          : {}),
+        ...(update.ai_audit_status !== undefined
+          ? { ai_audit_status: update.ai_audit_status }
+          : {}),
+        ...(update.reference_range !== undefined
+          ? { reference_range: update.reference_range }
+          : {}),
+        ...(update.normal_range_min !== undefined
+          ? { normal_range_min: update.normal_range_min }
+          : {}),
+        ...(update.normal_range_max !== undefined
+          ? { normal_range_max: update.normal_range_max }
+          : {}),
+        ...(update.low_critical !== undefined
+          ? { low_critical: update.low_critical }
+          : {}),
+        ...(update.high_critical !== undefined
+          ? { high_critical: update.high_critical }
+          : {}),
+        ...(update.reference_range_male !== undefined
+          ? { reference_range_male: update.reference_range_male }
+          : {}),
+        ...(update.reference_range_female !== undefined
+          ? { reference_range_female: update.reference_range_female }
+          : {}),
+        ...(update.method !== undefined ? { method: update.method } : {}),
+        ...(update.value_type !== undefined
+          ? { value_type: update.value_type }
+          : {}),
+      }));
 
-        if (error) {
-          console.error(`Failed to update result ${update.id}:`, error);
-          failedCount++;
-        } else {
-          successCount++;
-        }
+      const { data, error } = await supabase.rpc(
+        "bulk_update_result_value_flags",
+        { p_updates: payload },
+      );
+
+      if (!error) {
+        const updated = typeof data === "number" ? data : updates.length;
+        return { success: updated, failed: updates.length - updated };
       }
 
-      return { success: successCount, failed: failedCount };
+      // Deployments that have not run the migration yet fall back to the
+      // per-row path, but issued concurrently rather than one at a time.
+      const rpcMissing = /bulk_update_result_value_flags|PGRST202|does not exist/i
+        .test(`${(error as any).message || ""} ${(error as any).code || ""}`);
+      if (!rpcMissing) {
+        console.error("bulk_update_result_value_flags failed:", error);
+        return { success: 0, failed: updates.length };
+      }
+
+      console.warn(
+        "bulk_update_result_value_flags RPC unavailable — falling back to per-row updates",
+      );
+      const stamp = new Date().toISOString();
+      const outcomes = await Promise.all(
+        payload.map(async ({ id, ...columns }) => {
+          const { error: rowError } = await supabase
+            .from("result_values")
+            .update({ ...columns, updated_at: stamp })
+            .eq("id", id);
+          if (rowError) console.error(`Failed to update result ${id}:`, rowError);
+          return !rowError;
+        }),
+      );
+
+      const successCount = outcomes.filter(Boolean).length;
+      return {
+        success: successCount,
+        failed: outcomes.length - successCount,
+      };
     },
 
     // Get result value with full flag context for verification
@@ -10009,6 +10097,9 @@ const masterDataAPI = {
       credit_limit?: number;
       collection_percentage?: number;
       is_cash_collection_center?: boolean;
+      is_collection_center?: boolean;
+      is_processing_center?: boolean;
+      can_receive_samples?: boolean;
       notes?: string;
     }) => {
       const lab_id = await database.getCurrentUserLabId();
@@ -10042,6 +10133,10 @@ const masterDataAPI = {
       credit_limit?: number;
       collection_percentage?: number;
       is_cash_collection_center?: boolean;
+      is_collection_center?: boolean;
+      is_processing_center?: boolean;
+      can_receive_samples?: boolean;
+      pdf_letterhead_mode?: "background" | "header_footer" | null;
       notes?: string;
       is_active?: boolean;
     }) => {

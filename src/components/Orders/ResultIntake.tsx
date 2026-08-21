@@ -8,6 +8,7 @@ import { useAuth } from '../../contexts/AuthContext'
 import { calculateFlagsForResults } from '../../utils/flagCalculation'
 import { CheckCircle, AlertTriangle, Sparkles, Calculator, EyeOff } from 'lucide-react'
 import { findResolvedReferenceRange, normalizeResultFlagForSave, resolveReferenceRanges } from '../../utils/referenceRangeService'
+import { rangeAuditColumns } from '../../utils/referenceRangeLoader'
 import { evaluate } from 'mathjs'
 import SectionEditor, { type SectionEditorRef } from '../Results/SectionEditor'
 
@@ -75,6 +76,13 @@ type Entry = {
   value: string
   unit: string
   reference: string
+  // How the range was decided, resolved upstream in OrderDetail and carried
+  // through to result_values so the verification desk can explain it.
+  range_rule_id?: string | null
+  range_source?: string | null
+  applied_range_rule?: string | null
+  // The range as resolved, so a hand-edited one can be told apart on save.
+  resolved_reference?: string
   flag: FlagCode
   is_hidden_from_report?: boolean
   hidden_reason?: string | null
@@ -153,6 +161,10 @@ export function ResultIntake({ order, onResultProcessed, showAutoVerifyOption = 
             value: a.existing_result?.value ?? '',
             unit: a.existing_result?.unit || a.units || a.unit || '',
             reference: a.existing_result?.reference_range ?? a.reference_range ?? '',
+            resolved_reference: a.reference_range ?? '',
+            range_rule_id: (a as any).range_rule_id ?? null,
+            range_source: (a as any).range_source ?? null,
+            applied_range_rule: (a as any).applied_range_rule ?? null,
             flag: (a.existing_result?.flag as FlagCode) || '',
             is_hidden_from_report: !!a.existing_result?.is_hidden_from_report,
             hidden_reason: a.existing_result?.hidden_reason || null,
@@ -461,9 +473,16 @@ export function ResultIntake({ order, onResultProcessed, showAutoVerifyOption = 
           // If we have an entry for this (it's pending), update it
           // Logic: Only update if it's currently editable (in 'entries')
           if (next[entryKey]) {
+            const aiReference = r.used_reference_range || (r.ref_low && r.ref_high ? `${r.ref_low} - ${r.ref_high}` : next[entryKey].reference);
             next[entryKey] = {
               ...next[entryKey],
-              reference: r.used_reference_range || (r.ref_low && r.ref_high ? `${r.ref_low} - ${r.ref_high}` : next[entryKey].reference),
+              reference: aiReference,
+              // Keep the two in step so the save path does not mistake an
+              // AI-supplied range for one a technician typed.
+              resolved_reference: aiReference,
+              range_source: 'ai',
+              range_rule_id: null,
+              applied_range_rule: r.applied_rule || null,
               flag: (r.flag || '') as FlagCode
             };
           } else if (!isCompleted(groupData.tg.analytes.find(a => a.id === r.id)!)) {
@@ -640,6 +659,10 @@ export function ResultIntake({ order, onResultProcessed, showAutoVerifyOption = 
             value: `${v.value}`.trim() === '' ? null : v.value,
             unit: v.unit || '',
             reference_range: v.reference || '',
+            ...rangeAuditColumns(
+              { rule_id: v.range_rule_id, applied_rule: v.applied_range_rule, source: v.range_source },
+              { edited: (v.reference || '') !== (v.resolved_reference || '') },
+            ),
             flag: resolvedFlag,
             verify_status: mode === 'submit' && (autoVerifyOnSubmit || hidden) ? 'approved' : 'pending',
             verified: mode === 'submit' && (autoVerifyOnSubmit || hidden),

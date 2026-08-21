@@ -454,3 +454,10 @@ entrypoint = "./functions/public-booking/index.ts"
 enabled = true
 verify_jwt = false
 entrypoint = "./functions/patient-portal-login/index.ts"
+
+# Public report link resolver (/report-link/<token>.pdf) - the token is the only
+# credential, exactly like pay-link. Redirects to PDF.co temp early, storage later.
+[functions.report-link]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/report-link/index.ts"

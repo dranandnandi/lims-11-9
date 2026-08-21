@@ -1,0 +1,506 @@
+/**
+ * Deterministic reference range resolution.
+ *
+ * Picks the best-matching rule from `lab_analyte_reference_ranges` for a given
+ * patient + order context. No network call, no LLM — this is the non-AI route.
+ *
+ * Design notes:
+ * - Every predicate is NULL-means-any, so a lab can express exactly as much
+ *   structure as it needs and no more.
+ * - Specificity, not row order, decides. A rule matching on sample condition
+ *   beats one matching only on gender, regardless of how they were entered.
+ * - When nothing matches, we fall back to the legacy chain
+ *   (lab_specific_reference_range -> gender column -> reference_range) so labs
+ *   that never configure a rule keep the behaviour they have today.
+ *
+ * A byte-identical copy lives at supabase/functions/_shared/referenceRangeResolver.ts
+ * for the Deno edge functions. Keep them in sync — same as flagDetermination.
+ */
+
+import { parseReferenceRange } from './flagDetermination';
+
+export interface ReferenceRangeRule {
+  id: string;
+  lab_analyte_id?: string | null;
+  gender?: string | null;
+  age_min_days?: number | null;
+  age_max_days?: number | null;
+  sample_condition?: string | null;
+  pregnancy?: boolean | null;
+  range_text: string;
+  range_low?: number | null;
+  range_high?: number | null;
+  range_operator?: string | null;
+  low_critical?: number | null;
+  high_critical?: number | null;
+  priority?: number | null;
+  is_active?: boolean | null;
+  notes?: string | null;
+  created_at?: string | null;
+}
+
+export interface RangeResolutionContext {
+  gender?: string | null;
+  ageInDays?: number | null;
+  sampleCondition?: string | null;
+  pregnancy?: boolean | null;
+}
+
+export interface RangeFallback {
+  lab_specific_reference_range?: string | null;
+  reference_range?: string | null;
+  reference_range_male?: string | null;
+  reference_range_female?: string | null;
+  low_critical?: string | number | null;
+  high_critical?: string | number | null;
+}
+
+export type RangeSource = 'rule' | 'gender_column' | 'lab_default' | 'none';
+
+export interface ResolvedRange {
+  /** Report-facing text. Empty string when nothing could be resolved. */
+  range_text: string;
+  low: number | null;
+  high: number | null;
+  low_critical: number | null;
+  high_critical: number | null;
+  /** The rule row that won, when source === 'rule'. */
+  rule_id: string | null;
+  /** Human-readable description of what matched, e.g. "Female, 12-50y, Fasting". */
+  applied_rule: string;
+  source: RangeSource;
+}
+
+/** Weights are powers of two so a more specific predicate can never be
+ *  out-voted by a combination of less specific ones. */
+const SPECIFICITY = {
+  sampleCondition: 8,
+  gender: 4,
+  age: 2,
+  pregnancy: 1,
+} as const;
+
+const DAYS_PER_YEAR = 365.25;
+const DAYS_PER_MONTH = 30.4375;
+
+// ---------------------------------------------------------------------------
+// Normalization helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Reduce any spelling of gender to male/female/other.
+ *
+ * The flag engine compares `gender === "Male"` with exact case, which silently
+ * breaks for labs that configure `gender_options` as M/F or lowercase. Every
+ * gender comparison should go through here instead.
+ */
+export function normalizeGender(value: unknown): 'male' | 'female' | 'other' | null {
+  const raw = String(value ?? '').trim().toLowerCase();
+  if (!raw) return null;
+  if (raw === 'm' || raw.startsWith('male') || raw === 'man' || raw === 'boy') return 'male';
+  if (raw === 'f' || raw.startsWith('female') || raw === 'woman' || raw === 'girl') return 'female';
+  return 'other';
+}
+
+export function normalizeSampleCondition(value: unknown): string | null {
+  const raw = String(value ?? '').trim().toLowerCase();
+  return raw || null;
+}
+
+/**
+ * Collapse the order form's pregnancy_status vocabulary to a boolean.
+ *
+ * The form offers Not Pregnant / Trimester 1-3 / Lactating. Lactating is a
+ * distinct physiological state, not pregnancy, so it maps to false — a lab that
+ * needs lactation-specific ranges should model it as a sample condition or a
+ * custom patient field rather than overload this.
+ */
+export function normalizePregnancy(value: unknown): boolean | null {
+  if (typeof value === 'boolean') return value;
+  const raw = String(value ?? '').trim().toLowerCase();
+  if (!raw) return null;
+  if (raw === 'not pregnant' || raw === 'no' || raw === 'false' || raw === 'n') return false;
+  if (raw === 'lactating') return false;
+  if (raw.startsWith('trimester') || raw.includes('pregnant') || raw === 'yes' || raw === 'true' || raw === 'y') return true;
+  return null;
+}
+
+/**
+ * Age in days from whatever the patient record happens to carry.
+ *
+ * DOB wins when present because it is exact; otherwise we scale the stored
+ * age by its unit. Callers across the codebase were each re-deriving this
+ * slightly differently — route them all through here.
+ */
+export function patientAgeInDays(patient: {
+  dob?: string | null;
+  date_of_birth?: string | null;
+  age?: number | string | null;
+  age_unit?: string | null;
+  age_in_days?: number | null;
+} | null | undefined, now: Date = new Date()): number | null {
+  if (!patient) return null;
+
+  // Number(null) is 0, which is finite — check for absence explicitly or every
+  // patient without a precomputed age reads as a newborn.
+  if (patient.age_in_days !== null && patient.age_in_days !== undefined
+      && Number.isFinite(Number(patient.age_in_days))) {
+    return Math.floor(Number(patient.age_in_days));
+  }
+
+  const dobRaw = patient.dob || patient.date_of_birth;
+  if (dobRaw) {
+    const dob = new Date(dobRaw);
+    if (!Number.isNaN(dob.getTime())) {
+      const days = Math.floor((now.getTime() - dob.getTime()) / 86_400_000);
+      if (days >= 0) return days;
+    }
+  }
+
+  const age = Number(patient.age);
+  if (!Number.isFinite(age) || age < 0) return null;
+
+  const unit = String(patient.age_unit || 'years').trim().toLowerCase();
+  if (unit.startsWith('d')) return Math.floor(age);
+  if (unit.startsWith('m')) return Math.floor(age * DAYS_PER_MONTH);
+  if (unit.startsWith('w')) return Math.floor(age * 7);
+  return Math.floor(age * DAYS_PER_YEAR);
+}
+
+/** Inverse of patientAgeInDays, for the config UI: days -> {value, unit}. */
+export function daysToAgeParts(days: number | null | undefined): { value: number; unit: 'days' | 'months' | 'years' } | null {
+  if (days === null || days === undefined || !Number.isFinite(Number(days))) return null;
+  const d = Number(days);
+  if (d >= DAYS_PER_YEAR && Math.abs(d % DAYS_PER_YEAR) < 1) {
+    return { value: Math.round(d / DAYS_PER_YEAR), unit: 'years' };
+  }
+  if (d >= DAYS_PER_MONTH && Math.abs(d % DAYS_PER_MONTH) < 1) {
+    return { value: Math.round(d / DAYS_PER_MONTH), unit: 'months' };
+  }
+  return { value: Math.round(d), unit: 'days' };
+}
+
+/** {value, unit} -> days, for the config UI. */
+export function agePartsToDays(value: number | string | null | undefined, unit: string): number | null {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return null;
+  const u = String(unit || 'years').trim().toLowerCase();
+  if (u.startsWith('d')) return Math.round(n);
+  if (u.startsWith('m')) return Math.round(n * DAYS_PER_MONTH);
+  if (u.startsWith('w')) return Math.round(n * 7);
+  return Math.round(n * DAYS_PER_YEAR);
+}
+
+/**
+ * Build a resolution context from whatever the caller has to hand.
+ *
+ * Patient shape varies across call sites (a joined `patients` row, an order's
+ * `patient_context` jsonb, an analyzer's minimal lookup), so this accepts the
+ * union and prefers the most reliable field available.
+ */
+export interface PatientLike {
+  gender?: string | null;
+  dob?: string | null;
+  date_of_birth?: string | null;
+  age?: number | string | null;
+  age_unit?: string | null;
+  pregnancy_status?: string | null;
+}
+
+/** The subset of orders.patient_context this resolver reads. */
+export interface PatientContextLike {
+  gender?: string | null;
+  date_of_birth?: string | null;
+  age?: number | string | null;
+  age_unit?: string | null;
+  age_in_days?: number | null;
+  pregnancy_status?: string | null;
+  pregnancy?: string | boolean | null;
+  additional_inputs?: { pregnancy_status?: string | null } | null;
+}
+
+export function buildRangeContext(input: {
+  patient?: PatientLike | null;
+  patientContext?: PatientContextLike | null;
+  sampleCondition?: string | null;
+  now?: Date;
+}): RangeResolutionContext {
+  const { patient, patientContext, sampleCondition, now } = input;
+
+  const ageSource = {
+    dob: patient?.dob ?? patientContext?.date_of_birth ?? null,
+    date_of_birth: patient?.date_of_birth ?? patientContext?.date_of_birth ?? null,
+    age: patient?.age ?? patientContext?.age ?? null,
+    age_unit: patient?.age_unit ?? patientContext?.age_unit ?? null,
+    age_in_days: patientContext?.age_in_days ?? null,
+  };
+
+  return {
+    gender: normalizeGender(patient?.gender ?? patientContext?.gender),
+    ageInDays: patientAgeInDays(ageSource, now),
+    sampleCondition: normalizeSampleCondition(sampleCondition),
+    pregnancy: normalizePregnancy(
+      patient?.pregnancy_status
+      ?? patientContext?.pregnancy_status
+      ?? patientContext?.pregnancy
+      ?? patientContext?.additional_inputs?.pregnancy_status,
+    ),
+  };
+}
+
+function toNumberOrNull(value: unknown): number | null {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+// ---------------------------------------------------------------------------
+// Matching
+// ---------------------------------------------------------------------------
+
+interface ScoredRule {
+  rule: ReferenceRangeRule;
+  score: number;
+  ageSpan: number;
+}
+
+function matchScore(rule: ReferenceRangeRule, ctx: RangeResolutionContext): number | null {
+  let score = 0;
+
+  // Gender
+  const ruleGender = normalizeGender(rule.gender);
+  if (ruleGender) {
+    if (normalizeGender(ctx.gender) !== ruleGender) return null;
+    score += SPECIFICITY.gender;
+  }
+
+  // Sample condition
+  const ruleCondition = normalizeSampleCondition(rule.sample_condition);
+  if (ruleCondition) {
+    if (normalizeSampleCondition(ctx.sampleCondition) !== ruleCondition) return null;
+    score += SPECIFICITY.sampleCondition;
+  }
+
+  // Age band. A rule with either bound set is an age rule; an unset bound is
+  // simply unbounded on that side.
+  const min = toNumberOrNull(rule.age_min_days);
+  const max = toNumberOrNull(rule.age_max_days);
+  if (min !== null || max !== null) {
+    const age = toNumberOrNull(ctx.ageInDays);
+    // An age-scoped rule cannot match a patient whose age we do not know.
+    // Falling through to a wider rule is safer than guessing.
+    if (age === null) return null;
+    if (min !== null && age < min) return null;
+    if (max !== null && age > max) return null;
+    score += SPECIFICITY.age;
+  }
+
+  // Pregnancy
+  if (rule.pregnancy === true || rule.pregnancy === false) {
+    if (ctx.pregnancy === null || ctx.pregnancy === undefined) return null;
+    if (Boolean(ctx.pregnancy) !== rule.pregnancy) return null;
+    score += SPECIFICITY.pregnancy;
+  }
+
+  return score;
+}
+
+function ageSpanOf(rule: ReferenceRangeRule): number {
+  const min = toNumberOrNull(rule.age_min_days);
+  const max = toNumberOrNull(rule.age_max_days);
+  if (min === null && max === null) return Number.POSITIVE_INFINITY;
+  return (max ?? Number.MAX_SAFE_INTEGER) - (min ?? 0);
+}
+
+/** Readable description of what a rule matches on, for the audit column. */
+export function describeRule(rule: ReferenceRangeRule): string {
+  const parts: string[] = [];
+
+  const gender = normalizeGender(rule.gender);
+  if (gender) parts.push(gender.charAt(0).toUpperCase() + gender.slice(1));
+
+  const min = daysToAgeParts(rule.age_min_days);
+  const max = daysToAgeParts(rule.age_max_days);
+  if (min && max) {
+    parts.push(min.unit === max.unit
+      ? `${min.value}-${max.value}${max.unit.charAt(0)}`
+      : `${min.value}${min.unit.charAt(0)}-${max.value}${max.unit.charAt(0)}`);
+  } else if (min) {
+    parts.push(`>= ${min.value}${min.unit.charAt(0)}`);
+  } else if (max) {
+    parts.push(`<= ${max.value}${max.unit.charAt(0)}`);
+  }
+
+  const condition = String(rule.sample_condition || '').trim();
+  if (condition) parts.push(condition);
+
+  if (rule.pregnancy === true) parts.push('Pregnant');
+  else if (rule.pregnancy === false) parts.push('Non-pregnant');
+
+  return parts.length ? parts.join(', ') : 'Default';
+}
+
+/**
+ * Pick the winning rule, or null when none apply.
+ *
+ * Exported separately from resolveReferenceRange so the config UI can show a
+ * live preview without constructing a fallback.
+ */
+export function selectMatchingRule(
+  rules: ReferenceRangeRule[] | null | undefined,
+  ctx: RangeResolutionContext,
+): ReferenceRangeRule | null {
+  if (!rules?.length) return null;
+
+  const scored: ScoredRule[] = [];
+  for (const rule of rules) {
+    if (rule.is_active === false) continue;
+    if (!String(rule.range_text || '').trim()) continue;
+    const score = matchScore(rule, ctx);
+    if (score === null) continue;
+    scored.push({ rule, score, ageSpan: ageSpanOf(rule) });
+  }
+
+  if (!scored.length) return null;
+
+  scored.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    const pa = Number(a.rule.priority ?? 0);
+    const pb = Number(b.rule.priority ?? 0);
+    if (pb !== pa) return pb - pa;
+    // Narrower age band is the more deliberate rule.
+    if (a.ageSpan !== b.ageSpan) return a.ageSpan - b.ageSpan;
+    // Stable last resort so the same inputs always give the same answer.
+    return String(a.rule.created_at || '').localeCompare(String(b.rule.created_at || ''))
+      || String(a.rule.id).localeCompare(String(b.rule.id));
+  });
+
+  return scored[0].rule;
+}
+
+/**
+ * Resolve the range for one analyte.
+ *
+ * `fallback` carries the legacy lab_analytes columns; it is what keeps this
+ * safe to deploy before any lab has configured a single rule.
+ */
+export function resolveReferenceRange(
+  rules: ReferenceRangeRule[] | null | undefined,
+  ctx: RangeResolutionContext,
+  fallback: RangeFallback | null | undefined,
+): ResolvedRange {
+  const fallbackLowCritical = toNumberOrNull(fallback?.low_critical);
+  const fallbackHighCritical = toNumberOrNull(fallback?.high_critical);
+
+  const winner = selectMatchingRule(rules, ctx);
+  if (winner) {
+    const text = String(winner.range_text).trim();
+    // Precomputed bounds win; parsing the display string is the fallback so a
+    // lab can express "< 140" without also filling in numeric columns.
+    const parsed = parseReferenceRange(text);
+    return {
+      range_text: text,
+      low: toNumberOrNull(winner.range_low) ?? parsed.low,
+      high: toNumberOrNull(winner.range_high) ?? parsed.high,
+      low_critical: toNumberOrNull(winner.low_critical) ?? fallbackLowCritical,
+      high_critical: toNumberOrNull(winner.high_critical) ?? fallbackHighCritical,
+      rule_id: winner.id,
+      applied_rule: describeRule(winner),
+      source: 'rule',
+    };
+  }
+
+  // Legacy chain.
+  const gender = normalizeGender(ctx.gender);
+  const genderColumn = gender === 'male'
+    ? fallback?.reference_range_male
+    : gender === 'female'
+      ? fallback?.reference_range_female
+      : null;
+
+  const labDefault = fallback?.lab_specific_reference_range || fallback?.reference_range || '';
+  const chosen = String(genderColumn || labDefault || '').trim();
+  const parsed = parseReferenceRange(chosen);
+
+  return {
+    range_text: chosen,
+    low: parsed.low,
+    high: parsed.high,
+    low_critical: fallbackLowCritical,
+    high_critical: fallbackHighCritical,
+    rule_id: null,
+    applied_rule: genderColumn ? `${gender === 'male' ? 'Male' : 'Female'} (legacy column)` : 'Default',
+    source: chosen ? (genderColumn ? 'gender_column' : 'lab_default') : 'none',
+  };
+}
+
+/**
+ * Overlap / gap report for the config UI.
+ *
+ * Overlaps are not fatal — specificity and priority still produce a single
+ * deterministic answer — but they are almost always a mistake worth surfacing.
+ */
+export interface RuleConflict {
+  kind: 'duplicate' | 'overlap' | 'gap';
+  message: string;
+  ruleIds: string[];
+}
+
+export function findRuleConflicts(rules: ReferenceRangeRule[] | null | undefined): RuleConflict[] {
+  const active = (rules || []).filter(r => r.is_active !== false);
+  const conflicts: RuleConflict[] = [];
+
+  const keyOf = (r: ReferenceRangeRule) => [
+    normalizeGender(r.gender) || '*',
+    normalizeSampleCondition(r.sample_condition) || '*',
+    r.pregnancy === true ? 'preg' : r.pregnancy === false ? 'nonpreg' : '*',
+  ].join('|');
+
+  const buckets = new Map<string, ReferenceRangeRule[]>();
+  for (const rule of active) {
+    const key = keyOf(rule);
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key)!.push(rule);
+  }
+
+  for (const [, bucket] of buckets) {
+    const sorted = [...bucket].sort((a, b) =>
+      (toNumberOrNull(a.age_min_days) ?? 0) - (toNumberOrNull(b.age_min_days) ?? 0));
+
+    for (let i = 0; i < sorted.length - 1; i++) {
+      const current = sorted[i];
+      const next = sorted[i + 1];
+      const currentMax = toNumberOrNull(current.age_max_days);
+      const nextMin = toNumberOrNull(next.age_min_days);
+
+      if (currentMax === null || nextMin === null) {
+        if (Number(current.priority ?? 0) === Number(next.priority ?? 0)) {
+          conflicts.push({
+            kind: 'overlap',
+            message: `"${describeRule(current)}" and "${describeRule(next)}" both match the same patients and share a priority.`,
+            ruleIds: [current.id, next.id],
+          });
+        }
+        continue;
+      }
+
+      if (nextMin <= currentMax) {
+        conflicts.push({
+          kind: 'overlap',
+          message: `Age bands overlap: "${describeRule(current)}" and "${describeRule(next)}".`,
+          ruleIds: [current.id, next.id],
+        });
+      } else if (nextMin > currentMax + 1) {
+        const from = daysToAgeParts(currentMax + 1);
+        const to = daysToAgeParts(nextMin - 1);
+        conflicts.push({
+          kind: 'gap',
+          message: `No rule covers ${from?.value}${from?.unit.charAt(0)} to ${to?.value}${to?.unit.charAt(0)} — those patients fall back to the default range.`,
+          ruleIds: [current.id, next.id],
+        });
+      }
+    }
+  }
+
+  return conflicts;
+}

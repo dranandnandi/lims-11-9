@@ -58,10 +58,16 @@ const WhatsAppUserSyncManager: React.FC = () => {
       const syncData = await whatsappUserSync.getSyncStatus(labId);
       setUsers(syncData);
       
-      // Calculate stats
+      // Calculate stats. The column is nullable, so an unrecognised value has
+      // to land somewhere — counting it as pending beats an NaN tile.
       const stats = syncData.reduce((acc, user) => {
         acc.total++;
-        acc[user.whatsapp_sync_status]++;
+        const bucket = user.whatsapp_sync_status;
+        if (bucket === 'synced' || bucket === 'failed' || bucket === 'disabled') {
+          acc[bucket]++;
+        } else {
+          acc.pending++;
+        }
         return acc;
       }, { total: 0, synced: 0, pending: 0, failed: 0, disabled: 0 });
       

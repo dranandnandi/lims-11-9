@@ -1,5 +1,7 @@
 import React, { useState } from 'react';
 import { supabase } from '../../utils/supabase';
+import { resolveWhatsAppSender } from '../../utils/whatsappSenderResolver';
+import WhatsAppAPI from '../../utils/whatsappAPI';
 import { useAuth } from '../../contexts/AuthContext';
 import { Send, Phone, FileText, Check, X } from 'lucide-react';
 
@@ -49,14 +51,8 @@ export const SendReportModal: React.FC<SendReportModalProps> = ({
             // Direct call to Netlify function (as seen in generate-pdf-auto)
             const NETLIFY_SEND_REPORT_URL = 'https://app.limsapp.in/.netlify/functions/send-report-url';
 
-            // Smart WhatsApp Routing (matching Edge Function logic):
-            // Priority 1: Current user's whatsapp_user_id
-            // Priority 2: Lab's whatsapp_user_id (fallback)
-            
-            let whatsappUserId: string | null = null;
-            let countryCode = '+91';
-
-            // Get order's lab_id and location_id for routing
+            // Sender cascade lives in one place now: this order's location,
+            // then the lab default, then the current user.
             const { data: order, error: orderError } = await supabase
                 .from('orders')
                 .select('lab_id, location_id')
@@ -67,70 +63,17 @@ export const SendReportModal: React.FC<SendReportModalProps> = ({
                 throw new Error('Could not fetch order details');
             }
 
-            // Priority 1: Current logged-in user's whatsapp_user_id
-            if (user?.id) {
-                const { data: currentUser } = await supabase
-                    .from('users')
-                    .select('whatsapp_user_id')
-                    .eq('id', user.id)
-                    .single();
-                
-                if (currentUser?.whatsapp_user_id) {
-                    whatsappUserId = currentUser.whatsapp_user_id;
-                    console.log('Using current user WhatsApp ID');
-                }
+            const sender = await resolveWhatsAppSender({
+                labId: order.lab_id,
+                locationId: order.location_id,
+                fallbackUserId: user?.id ?? null,
+            });
+
+            if (!sender.userId) {
+                throw new Error('No WhatsApp sender configured. Set one on this location (Masters → Locations) or a lab default in Settings → Lab Settings.');
             }
 
-            // Priority 2: Find any user with WhatsApp at the same lab
-            if (!whatsappUserId) {
-                const { data: labUsers } = await supabase
-                    .from('users')
-                    .select('whatsapp_user_id')
-                    .eq('lab_id', order.lab_id)
-                    .not('whatsapp_user_id', 'is', null)
-                    .limit(1);
-                
-                if (labUsers && labUsers.length > 0) {
-                    whatsappUserId = labUsers[0].whatsapp_user_id;
-                    console.log('Using lab user WhatsApp ID');
-                }
-            }
-
-            // Priority 3: Lab-level fallback
-            if (!whatsappUserId) {
-                const { data: lab } = await supabase
-                    .from('labs')
-                    .select('whatsapp_user_id, country_code')
-                    .eq('id', order.lab_id)
-                    .single();
-                
-                if (lab?.whatsapp_user_id) {
-                    whatsappUserId = lab.whatsapp_user_id;
-                    console.log('Using lab-level WhatsApp ID');
-                }
-                if (lab?.country_code) {
-                    countryCode = lab.country_code;
-                }
-            }
-
-            if (!whatsappUserId) {
-                throw new Error('Lab WhatsApp integration not configured. Please set up WhatsApp in Settings or contact support.');
-            }
-
-            // Format Phone
-            let cleanPhone = phone.replace(/\D/g, '');
-            if (cleanPhone.startsWith('0')) cleanPhone = cleanPhone.substring(1);
-
-            let formattedPhone = cleanPhone;
-            const countryDigits = countryCode.replace(/\D/g, '');
-
-            if (cleanPhone.length === 10) {
-                formattedPhone = countryCode + cleanPhone;
-            } else if (!cleanPhone.startsWith(countryDigits)) {
-                formattedPhone = countryCode + cleanPhone; // Fallback
-            } else {
-                formattedPhone = '+' + cleanPhone;
-            }
+            const formattedPhone = '+' + WhatsAppAPI.formatPhoneNumber(phone, sender.countryCode);
 
             // Construct Message
             // Debug: Log clinical summary state
@@ -153,7 +96,7 @@ export const SendReportModal: React.FC<SendReportModalProps> = ({
 
             // Payload
             const payload = {
-                userId: whatsappUserId,
+                userId: sender.userId,
                 fileUrl: reportUrl,
                 fileName: `Report_${patientName}_${orderId.slice(-4)}.pdf`,
                 caption: message,

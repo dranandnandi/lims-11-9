@@ -4,6 +4,11 @@
 
 import { createClient } from 'jsr:@supabase/supabase-js@2'
 import { GoogleGenerativeAI } from 'npm:@google/generative-ai'
+import {
+  buildRangeContext,
+  resolveReferenceRange,
+  type ReferenceRangeRule,
+} from '../_shared/referenceRangeResolver.ts'
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -733,18 +738,62 @@ OUTPUT JSON:
     }
   }
 
-  // Patient gender drives gender-specific saved ranges.
-  let patientGender: string | null = null
+  // Patient facts drive the deterministic range rules: gender, age and
+  // pregnancy. Loaded once per order rather than per result row.
+  let patientRow: any = null
+  let orderPatientContext: any = null
   if (useSavedReferenceRanges && order.patient_id) {
-    const { data: patientRow } = await supabase
-      .from('patients')
-      .select('gender')
-      .eq('id', order.patient_id)
-      .maybeSingle()
-    patientGender = patientRow?.gender ?? null
+    const [{ data: p }, { data: o }] = await Promise.all([
+      supabase
+        .from('patients')
+        .select('gender, dob, date_of_birth, age, age_unit')
+        .eq('id', order.patient_id)
+        .maybeSingle(),
+      supabase
+        .from('orders')
+        .select('patient_context')
+        .eq('id', order.id)
+        .maybeSingle(),
+    ])
+    patientRow = p ?? null
+    orderPatientContext = o?.patient_context ?? null
   }
-  const isMale = patientGender?.toLowerCase().startsWith('m')
-  const isFemale = patientGender?.toLowerCase().startsWith('f')
+
+  // Deterministic range rules, keyed by lab_analyte_id.
+  const rangeRulesByLabAnalyte = new Map<string, ReferenceRangeRule[]>()
+  if (useSavedReferenceRanges) {
+    const ruleLabAnalyteIds = Array.from(new Set(labAnalyteIdMap.values()))
+    if (ruleLabAnalyteIds.length > 0) {
+      const { data: ruleRows, error: ruleErr } = await supabase
+        .from('lab_analyte_reference_ranges')
+        .select('id, lab_analyte_id, gender, age_min_days, age_max_days, sample_condition, pregnancy, range_text, range_low, range_high, low_critical, high_critical, priority, is_active, created_at')
+        .in('lab_analyte_id', ruleLabAnalyteIds)
+        .eq('is_active', true)
+      if (ruleErr) {
+        console.warn('[analyzer-result] range rule lookup failed, using legacy columns:', ruleErr.message)
+      }
+      for (const rule of (ruleRows ?? []) as ReferenceRangeRule[]) {
+        if (!rule.lab_analyte_id) continue
+        if (!rangeRulesByLabAnalyte.has(rule.lab_analyte_id)) rangeRulesByLabAnalyte.set(rule.lab_analyte_id, [])
+        rangeRulesByLabAnalyte.get(rule.lab_analyte_id)!.push(rule)
+      }
+    }
+  }
+
+  // Sample condition is per test group on the order.
+  const sampleConditionByTestGroup = new Map<string, string>()
+  if (useSavedReferenceRanges) {
+    const [{ data: otgRows }, { data: otRows }] = await Promise.all([
+      supabase.from('order_test_groups').select('test_group_id, sample_condition').eq('order_id', order.id),
+      supabase.from('order_tests').select('test_group_id, sample_condition').eq('order_id', order.id),
+    ])
+    for (const row of [...(otgRows ?? []), ...(otRows ?? [])]) {
+      const condition = String(row?.sample_condition ?? '').trim()
+      if (row?.test_group_id && condition && !sampleConditionByTestGroup.has(row.test_group_id)) {
+        sampleConditionByTestGroup.set(row.test_group_id, condition)
+      }
+    }
+  }
 
   const mappedCandidates: Array<{ item: any; mapping: any }> = []
   for (const item of parsedData.results) {
@@ -818,12 +867,27 @@ OUTPUT JSON:
       : null
 
     const rr = labAnalyteId ? refRangeMap.get(labAnalyteId) : null
-    const savedReferenceRange =
-      rr?.lab_specific ||
-      (isMale ? rr?.ref_male : null) ||
-      (isFemale ? rr?.ref_female : null) ||
-      rr?.ref_generic ||
-      null
+    // Deterministic rules first (gender / age / sample condition / pregnancy),
+    // with the legacy gender columns as the fallback inside the resolver.
+    const resolvedSavedRange = resolveReferenceRange(
+      labAnalyteId ? rangeRulesByLabAnalyte.get(labAnalyteId) : null,
+      buildRangeContext({
+        patient: patientRow,
+        patientContext: orderPatientContext,
+        sampleCondition: mapping.test_group_id
+          ? sampleConditionByTestGroup.get(mapping.test_group_id) ?? null
+          : null,
+      }),
+      {
+        lab_specific_reference_range: rr?.lab_specific ?? null,
+        reference_range: rr?.ref_generic ?? null,
+        reference_range_male: rr?.ref_male ?? null,
+        reference_range_female: rr?.ref_female ?? null,
+        low_critical: rr?.low_critical ?? null,
+        high_critical: rr?.high_critical ?? null,
+      },
+    )
+    const savedReferenceRange = resolvedSavedRange.range_text || null
     // With the toggle on, the lab's saved range wins and the machine's range is
     // only a last resort. With it off, keep the prior machine-first behaviour.
     const fallbackReferenceRange = useSavedReferenceRanges
@@ -837,8 +901,9 @@ OUTPUT JSON:
     let finalFlagSource: string
     if (useSavedReferenceRanges) {
       const computed = computeSavedFlag(item.value, finalReferenceRange, {
-        lowCritical: rr?.low_critical,
-        highCritical: rr?.high_critical,
+        // A matched rule may carry its own criticals for that condition.
+        lowCritical: resolvedSavedRange.low_critical ?? rr?.low_critical,
+        highCritical: resolvedSavedRange.high_critical ?? rr?.high_critical,
         expectedNormalValues: rr?.expected_normal_values,
         valueType: rr?.value_type,
       })
@@ -863,7 +928,8 @@ OUTPUT JSON:
       test_group_id: mapping.test_group_id || null,
       analyte_id: mapping.analyte_id,
       analyzer_code: item.analyzer_code || item.test_code || null,
-      range_source: aiResolution ? 'ai' : (useSavedReferenceRanges ? 'lab_saved' : 'analyzer'),
+      range_source: aiResolution ? 'ai' : (useSavedReferenceRanges ? resolvedSavedRange.source : 'analyzer'),
+      applied_range_rule: aiResolution ? null : resolvedSavedRange.applied_rule,
       flag_source: finalFlagSource,
       fallback_reason: fallbackReason,
       reference_range: finalReferenceRange,
@@ -882,6 +948,9 @@ OUTPUT JSON:
       unit: item.unit,
       flag: finalFlag,
       reference_range: finalReferenceRange,
+      range_rule_id: aiResolution ? null : resolvedSavedRange.rule_id,
+      range_source: aiResolution ? 'ai' : (useSavedReferenceRanges ? resolvedSavedRange.source : 'analyzer'),
+      applied_range_rule: aiResolution ? null : resolvedSavedRange.applied_rule,
       extracted_by_ai: true,
       flag_source: finalFlagSource,
       test_group_id: mapping.test_group_id,

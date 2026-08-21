@@ -70,6 +70,15 @@ import {
   type AnalyteInterfaceConversionConfig,
 } from "../../utils/analyteInterfaceConversion";
 import { normalizeResultFlagForSave } from "../../utils/referenceRangeService";
+import {
+  contextForGroup,
+  fetchPatientRangeInfo,
+  fetchRangeRules,
+  rangeAuditColumns,
+  resolveForAnalyte,
+  type PatientRangeInfo,
+  type RangeRuleMap,
+} from "../../utils/referenceRangeLoader";
 
 interface WorkflowStep {
   name: string;
@@ -661,6 +670,24 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
   // Catalog & order analytes/test-groups
   const [orderAnalytes, setOrderAnalytes] = useState<any[]>([]);
   const [testGroups, setTestGroups] = useState<TestGroupResult[]>([]);
+  // Deterministic (non-AI) reference range rules keyed by lab_analyte_id, and
+  // the patient facts they match against.
+  const [rangeRules, setRangeRules] = useState<RangeRuleMap>(new Map());
+  const [patientRangeInfo, setPatientRangeInfo] = useState<PatientRangeInfo | null>(null);
+
+  /**
+   * Audit columns describing how the range on a saved row was decided.
+   *
+   * A range the AI resolver supplied is recorded as such; otherwise a value that
+   * no longer matches the analyte's resolved range means a human typed over it.
+   */
+  const rangeAuditFor = (row: any, analyte: any) => {
+    if (row?.range_source === "ai") {
+      return { range_rule_id: null, range_source: "ai", applied_range_rule: row.applied_range_rule || null };
+    }
+    const edited = (row?.reference || "") !== (analyte?.reference_range || "");
+    return rangeAuditColumns(analyte, { edited });
+  };
   const [selectedTestGroup, setSelectedTestGroup] = useState<string>();
 
   // Get all available order tests for test selection
@@ -927,6 +954,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
             test_group_id,
             test_name,
             price,
+            sample_condition,
             test_groups(
               id,
               name,
@@ -966,6 +994,8 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                   lab_specific_reference_range,
                   reference_range_male,
                   reference_range_female,
+                  low_critical,
+                  high_critical,
                   expected_normal_values,
                   expected_value_flag_map,
                   expected_value_codes,
@@ -995,6 +1025,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
             test_name,
             test_group_id,
             sample_id,
+            sample_condition,
             is_canceled,
             outsourced_lab_id,
             test_groups(
@@ -1036,6 +1067,8 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                   lab_specific_reference_range,
                   reference_range_male,
                   reference_range_female,
+                  low_critical,
+                  high_critical,
                   expected_normal_values,
                   expected_value_flag_map,
                   expected_value_codes,
@@ -1094,6 +1127,35 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
         .single();
       if (error) throw error;
 
+      // Deterministic (non-AI) reference range rules. Loaded before the analyte
+      // mapping below so every downstream consumer of analyte.reference_range —
+      // manual entry seed, AI extraction merge, save payload — sees the range
+      // that actually applies to this patient and this sample condition.
+      const allLabAnalyteIdsForRanges: string[] = [
+        ...(data.order_test_groups || []),
+        ...(data.order_tests || []),
+      ].flatMap((row: any) =>
+        (row.test_groups?.test_group_analytes || []).map((tga: any) => tga.lab_analyte_id),
+      ).filter(Boolean);
+
+      const [rangeRulesMap, patientRangeData] = await Promise.all([
+        fetchRangeRules(allLabAnalyteIdsForRanges),
+        fetchPatientRangeInfo(order.id, (order as any).patient_id),
+      ]);
+      setRangeRules(rangeRulesMap);
+      setPatientRangeInfo(patientRangeData);
+
+      const resolveAnalyteRange = (la: any, a: any, labAnalyteId: string | null, sampleCondition: string | null) =>
+        resolveForAnalyte(rangeRulesMap, {
+          lab_analyte_id: labAnalyteId,
+          lab_specific_reference_range: la?.lab_specific_reference_range,
+          reference_range: la?.reference_range ?? a?.reference_range,
+          reference_range_male: la?.reference_range_male,
+          reference_range_female: la?.reference_range_female,
+          low_critical: la?.low_critical,
+          high_critical: la?.high_critical,
+        }, contextForGroup(patientRangeData, sampleCondition));
+
       const tgFromOTG =
         data.order_test_groups?.filter((otg: any) => otg.test_groups).map((otg: any) => ({
           test_group_id: otg.test_groups.id,
@@ -1115,15 +1177,20 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
               .map((tga: any) => {
               const a = tga.analytes;
               const la = tga.lab_analyte_id ? tga.lab_analytes : null;
+              const labAnalyteId = tga.lab_analyte_id || la?.id || null;
+              const resolvedRange = resolveAnalyteRange(la, a, labAnalyteId, otg.sample_condition || null);
               return {
                 ...a,
                 sort_order: tga.sort_order,
                 display_order: tga.display_order,
                 section_heading: tga.section_heading || null,
-                lab_analyte_id: tga.lab_analyte_id || la?.id || null,
+                lab_analyte_id: labAnalyteId,
                 name: la?.name || a.name,
                 unit: la?.unit || a.unit,
-                reference_range: la?.lab_specific_reference_range ?? la?.reference_range ?? a.reference_range,
+                reference_range: resolvedRange.range_text,
+                range_rule_id: resolvedRange.rule_id,
+                range_source: resolvedRange.source,
+                applied_range_rule: resolvedRange.applied_rule,
                 reference_range_male: la?.reference_range_male ?? undefined,
                 reference_range_female: la?.reference_range_female ?? undefined,
                 expected_normal_values: la?.expected_normal_values ?? a.expected_normal_values,
@@ -1187,15 +1254,20 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                 .map((tga: any) => {
                 const a = tga.analytes;
                 const la = tga.lab_analyte_id ? tga.lab_analytes : null;
+                const labAnalyteId = tga.lab_analyte_id || la?.id || null;
+                const resolvedRange = resolveAnalyteRange(la, a, labAnalyteId, ot.sample_condition || null);
                 return {
                   ...a,
                   sort_order: tga.sort_order,
                   display_order: tga.display_order,
                   section_heading: tga.section_heading || null,
-                  lab_analyte_id: tga.lab_analyte_id || la?.id || null,
+                  lab_analyte_id: labAnalyteId,
                   name: la?.name || a.name,
                   unit: la?.unit || a.unit,
-                  reference_range: la?.lab_specific_reference_range ?? la?.reference_range ?? a.reference_range,
+                  reference_range: resolvedRange.range_text,
+                  range_rule_id: resolvedRange.rule_id,
+                  range_source: resolvedRange.source,
+                  applied_range_rule: resolvedRange.applied_rule,
                   reference_range_male: la?.reference_range_male ?? undefined,
                   reference_range_female: la?.reference_range_female ?? undefined,
                   expected_normal_values: la?.expected_normal_values ?? a.expected_normal_values,
@@ -3484,6 +3556,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
             value: r.value && r.value.trim() !== "" ? r.value : null,
             unit: r.unit || "",
             reference_range: r.reference || "",
+            ...rangeAuditFor(r, analyte),
             flag: normalizeResultFlagForSave(autoFlag, r.value),
             flag_source: r.flag ? 'manual' : 'auto_numeric',
             is_auto_calculated: !!r.is_calculated,
@@ -3585,6 +3658,8 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                 const target = finalResults.find(v => findResolvedReferenceRange([r], v));
                 if (target && !target.reference_locked) {
                   target.reference = r.used_reference_range;
+                  (target as any).range_source = "ai";
+                  (target as any).applied_range_rule = r.applied_rule || null;
                   if (r.flag && ['H', 'L', 'C', 'LL', 'HH', 'H*', 'L*', 'high', 'low', 'critical_h', 'critical_l', 'critical_high', 'critical_low'].includes(r.flag)) target.flag = r.flag;
                 }
               }
@@ -3876,6 +3951,7 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
             value: r.value && r.value.trim() !== "" ? r.value : null,
             unit: r.unit || "",
             reference_range: r.reference || "",
+            ...rangeAuditFor(r, analyte),
 	            flag: normalizeResultFlagForSave(autoFlag, r.value),
 	            flag_source: hasUserFlag ? 'manual' : 'auto_numeric',
 	            is_auto_calculated: !!r.is_calculated,
@@ -4214,7 +4290,9 @@ const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({
                 next[idx] = {
                   ...next[idx],
                   reference: r.used_reference_range,
-                };
+                  range_source: "ai",
+                  applied_range_rule: r.applied_rule || null,
+                } as any;
               }
             }
           });

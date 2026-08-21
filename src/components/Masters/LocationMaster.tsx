@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, Search, Edit, Trash2, Save, X, MapPin, Building, Phone, Mail, CreditCard, DollarSign, TrendingUp, User, IndianRupee, ArrowLeft, ChevronRight, Printer } from 'lucide-react';
-import { database } from '../../utils/supabase';
+import { Plus, Search, Edit, Trash2, Save, X, MapPin, Building, Phone, Mail, CreditCard, DollarSign, TrendingUp, User, IndianRupee, ArrowLeft, ChevronRight, Printer, MessageSquare } from 'lucide-react';
+import { database, supabase } from '../../utils/supabase';
 import { Location, CreditTransaction } from '../../types';
 import HeaderFooterUpload from '../Settings/HeaderFooterUpload';
 import PricingGrid from '../Pricing/PricingGrid';
@@ -16,6 +16,9 @@ interface LocationFormData {
   credit_limit: number;
   collection_percentage: number;
   is_cash_collection_center: boolean;
+  is_collection_center: boolean;
+  is_processing_center: boolean;
+  can_receive_samples: boolean;
   notes: string;
   upi_id: string;
   barcode_printer_name: string;
@@ -23,6 +26,10 @@ interface LocationFormData {
   barcode_browser_print_enabled: boolean | null;
   auto_print_barcode_on_order: boolean | null;
   auto_print_report_on_approval: boolean | null;
+  /** users.id of this branch's WhatsApp sender; '' = inherit the lab default */
+  whatsapp_user_id: string;
+  /** '' = inherit labs.country_code */
+  whatsapp_country_code: string;
 }
 
 const initialFormData: LocationFormData = {
@@ -36,6 +43,9 @@ const initialFormData: LocationFormData = {
   credit_limit: 0,
   collection_percentage: 0,
   is_cash_collection_center: false,
+  is_collection_center: true,
+  is_processing_center: false,
+  can_receive_samples: true,
   notes: '',
   upi_id: '',
   barcode_printer_name: '',
@@ -43,6 +53,8 @@ const initialFormData: LocationFormData = {
   barcode_browser_print_enabled: null,
   auto_print_barcode_on_order: null,
   auto_print_report_on_approval: null,
+  whatsapp_user_id: '',
+  whatsapp_country_code: '',
 };
 
 interface LocationWithBalance extends Location {
@@ -65,11 +77,59 @@ const LocationMaster: React.FC = () => {
   const [newCreditDescription, setNewCreditDescription] = useState('');
   const [addingCredit, setAddingCredit] = useState(false);
   const [selectedLocationForPricing, setSelectedLocationForPricing] = useState<Location | null>(null);
+  // Candidates for this branch's WhatsApp sender. The backend keys sessions by
+  // users.id, so the dropdown offers the lab's users directly.
+  const [labUsers, setLabUsers] = useState<{ id: string; name: string; role: string; synced: boolean }[]>([]);
+  const [labDefaultSender, setLabDefaultSender] = useState<{ name: string; countryCode: string } | null>(null);
 
   // Load locations on component mount
   useEffect(() => {
     loadLocations();
+    loadWhatsAppSenderOptions();
   }, []);
+
+  // Populates the per-location WhatsApp sender dropdown and the label that tells
+  // the user what "inherit" currently resolves to.
+  const loadWhatsAppSenderOptions = async () => {
+    try {
+      const labId = await database.getCurrentUserLabId();
+      if (!labId) return;
+
+      const [{ data: users }, { data: lab }] = await Promise.all([
+        supabase
+          .from('users')
+          .select('id, name, role, whatsapp_user_id')
+          .eq('lab_id', labId)
+          .eq('status', 'Active')
+          .order('name'),
+        supabase
+          .from('labs')
+          .select('whatsapp_user_id, country_code')
+          .eq('id', labId)
+          .maybeSingle(),
+      ]);
+
+      type LabUserRow = { id: string; name: string; role: string | null; whatsapp_user_id: string | null };
+      const options = ((users || []) as LabUserRow[]).map((u) => ({
+        id: u.id,
+        name: u.name,
+        role: u.role || '',
+        // whatsapp_user_id is stamped when the user is registered with the
+        // WhatsApp backend; unsynced users can still be picked, they just have
+        // to scan a QR before anything will send.
+        synced: !!u.whatsapp_user_id,
+      }));
+      setLabUsers(options);
+
+      const defaultUser = options.find(o => o.id === lab?.whatsapp_user_id);
+      setLabDefaultSender({
+        name: defaultUser?.name || (lab?.whatsapp_user_id ? 'Unknown user' : 'not set'),
+        countryCode: lab?.country_code || '+91',
+      });
+    } catch (err) {
+      console.error('Error loading WhatsApp sender options:', err);
+    }
+  };
 
   const loadLocations = async () => {
     setLoading(true);
@@ -126,6 +186,9 @@ const LocationMaster: React.FC = () => {
       credit_limit: location.credit_limit || 0,
       collection_percentage: location.collection_percentage || 0,
       is_cash_collection_center: location.is_cash_collection_center || false,
+      is_collection_center: location.is_collection_center ?? true,
+      is_processing_center: location.is_processing_center ?? false,
+      can_receive_samples: location.can_receive_samples ?? true,
       notes: location.notes || '',
       upi_id: (location as any).upi_id || '',
       barcode_printer_name: (location as any).barcode_printer_name || '',
@@ -133,6 +196,8 @@ const LocationMaster: React.FC = () => {
       barcode_browser_print_enabled: (location as any).barcode_browser_print_enabled ?? null,
       auto_print_barcode_on_order: (location as any).auto_print_barcode_on_order ?? null,
       auto_print_report_on_approval: (location as any).auto_print_report_on_approval ?? null,
+      whatsapp_user_id: location.whatsapp_user_id || '',
+      whatsapp_country_code: location.whatsapp_country_code || '',
     });
     setShowForm(true);
     setError(null);
@@ -144,16 +209,24 @@ const LocationMaster: React.FC = () => {
     setError(null);
 
     try {
+      // Blank means "inherit from the lab", which the uuid/varchar columns need
+      // as a real NULL rather than an empty string.
+      const payload = {
+        ...formData,
+        whatsapp_user_id: formData.whatsapp_user_id || null,
+        whatsapp_country_code: formData.whatsapp_country_code || null,
+      };
+
       if (editingLocation) {
         // Update existing location
-        const { data, error } = await database.locations.update(editingLocation.id, formData);
+        const { data, error } = await database.locations.update(editingLocation.id, payload);
         if (error) throw error;
 
         // Update local state
         setLocations(prev => prev.map(l => l.id === editingLocation.id ? { ...l, ...data } : l));
       } else {
         // Create new location
-        const { data, error } = await database.locations.create(formData);
+        const { data, error } = await database.locations.create(payload);
         if (error) throw error;
 
         // Add to local state
@@ -547,6 +620,66 @@ const LocationMaster: React.FC = () => {
                   </label>
                 </div>
 
+                {/* Location role in the sample workflow */}
+                <div className="md:col-span-2 border rounded-lg p-4 bg-gray-50 space-y-3">
+                  <div>
+                    <h3 className="text-sm font-semibold text-gray-700">Role in sample workflow</h3>
+                    <p className="text-xs text-gray-500">
+                      Controls where samples can be sent and which centers process them in-house.
+                    </p>
+                  </div>
+
+                  <label className="flex items-start gap-2">
+                    <input
+                      type="checkbox"
+                      checked={formData.is_collection_center}
+                      onChange={(e) => setFormData({ ...formData, is_collection_center: e.target.checked })}
+                      className="w-4 h-4 mt-0.5 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
+                    />
+                    <span>
+                      <span className="block text-sm font-medium text-gray-700">Collection center</span>
+                      <span className="block text-xs text-gray-500">Collects samples from patients and registers orders.</span>
+                    </span>
+                  </label>
+
+                  <label className="flex items-start gap-2">
+                    <input
+                      type="checkbox"
+                      checked={formData.is_processing_center}
+                      onChange={(e) => setFormData({
+                        ...formData,
+                        is_processing_center: e.target.checked,
+                        // A processing center must be able to receive samples
+                        can_receive_samples: e.target.checked ? true : formData.can_receive_samples,
+                      })}
+                      className="w-4 h-4 mt-0.5 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
+                    />
+                    <span>
+                      <span className="block text-sm font-medium text-gray-700">Processing center</span>
+                      <span className="block text-xs text-gray-500">
+                        Runs tests and enters results in-house. Appears as a transit destination and as
+                        the "processed at" center on reports.
+                      </span>
+                    </span>
+                  </label>
+
+                  <label className="flex items-start gap-2">
+                    <input
+                      type="checkbox"
+                      checked={formData.can_receive_samples}
+                      disabled={formData.is_processing_center}
+                      onChange={(e) => setFormData({ ...formData, can_receive_samples: e.target.checked })}
+                      className="w-4 h-4 mt-0.5 text-blue-600 border-gray-300 rounded focus:ring-blue-500 disabled:opacity-60"
+                    />
+                    <span>
+                      <span className="block text-sm font-medium text-gray-700">Can receive samples in transit</span>
+                      <span className="block text-xs text-gray-500">
+                        Can be picked as a destination when dispatching samples from another center.
+                      </span>
+                    </span>
+                  </label>
+                </div>
+
                 {/* Notes */}
                 <div className="md:col-span-2">
                   <label className="block text-sm font-medium text-gray-700 mb-1">
@@ -641,6 +774,69 @@ const LocationMaster: React.FC = () => {
                     </select>
                   </div>
                 </div>
+              </div>
+
+              {/* WhatsApp Sender (per-branch number) */}
+              <div className="border-t pt-5 mt-2">
+                <h3 className="text-sm font-semibold text-gray-700 mb-1 flex items-center gap-2">
+                  <MessageSquare className="w-4 h-4 text-green-600" />
+                  WhatsApp Sender (overrides lab default)
+                </h3>
+                <p className="text-xs text-gray-500 mb-3">
+                  Messages for orders from this center are sent from this account's WhatsApp number.
+                  Leave on "Inherit" to use the lab-wide sender
+                  {labDefaultSender ? ` (currently ${labDefaultSender.name})` : ''}.
+                </p>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Sender Account</label>
+                    <select
+                      value={formData.whatsapp_user_id}
+                      onChange={(e) => setFormData({ ...formData, whatsapp_user_id: e.target.value })}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent text-sm"
+                    >
+                      <option value="">
+                        Inherit from lab{labDefaultSender ? ` (${labDefaultSender.name})` : ''}
+                      </option>
+                      {labUsers.map(u => (
+                        <option key={u.id} value={u.id}>
+                          {u.name}{u.role ? ` — ${u.role}` : ''}{u.synced ? '' : ' (not yet synced)'}
+                        </option>
+                      ))}
+                    </select>
+                    <p className="text-xs text-gray-500 mt-1">
+                      This user must connect their own number under WhatsApp → Connection before messages will send.
+                    </p>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Country Code</label>
+                    <select
+                      value={formData.whatsapp_country_code}
+                      onChange={(e) => setFormData({ ...formData, whatsapp_country_code: e.target.value })}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent text-sm"
+                    >
+                      <option value="">
+                        Inherit from lab{labDefaultSender ? ` (${labDefaultSender.countryCode})` : ''}
+                      </option>
+                      <option value="+91">India (+91)</option>
+                      <option value="+92">Pakistan (+92)</option>
+                      <option value="+94">Sri Lanka (+94)</option>
+                      <option value="+971">UAE (+971)</option>
+                      <option value="+880">Bangladesh (+880)</option>
+                      <option value="+977">Nepal (+977)</option>
+                    </select>
+                    <p className="text-xs text-gray-500 mt-1">
+                      Used to format recipient numbers for this center.
+                    </p>
+                  </div>
+                </div>
+                {formData.whatsapp_user_id
+                  && !labUsers.find(u => u.id === formData.whatsapp_user_id)?.synced && (
+                  <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1.5 mt-3">
+                    This user has not been synced to the WhatsApp backend yet. Go to WhatsApp → User Sync,
+                    sync them, then connect their number.
+                  </p>
+                )}
               </div>
 
               {/* Report Customization - Only for existing locations */}

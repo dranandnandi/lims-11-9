@@ -272,7 +272,8 @@
       "Bash(node -e \"console.log\\(require\\('./package.json'\\).scripts\\)\")",
       "PowerShell(if \\($?\\) { \"TYPECHECK OK\" })",
       "Bash(node \"C:/Users/Lenovo/AppData/Local/Temp/claude/d--LIMS-version-2-project/85d7a479-6b5c-40b1-b40e-f23264c4b4ad/scratchpad/verify.mjs\")",
-      "Bash(node -e \"const p=require\\('./package.json'\\);console.log\\(Object.keys\\(p.devDependencies||{}\\).join\\(' '\\)\\);console.log\\('jspdf:',\\(p.dependencies||{}\\).jspdf\\)\")"
+      "Bash(node -e \"const p=require\\('./package.json'\\);console.log\\(Object.keys\\(p.devDependencies||{}\\).join\\(' '\\)\\);console.log\\('jspdf:',\\(p.dependencies||{}\\).jspdf\\)\")",
+      "Bash(powershell -NoProfile -Command 'cmdkey /list 2>$null | Select-String -Pattern '\\\\''supabase'\\\\'' -Context 0,2')"
     ]
   }
 }

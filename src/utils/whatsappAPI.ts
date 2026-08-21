@@ -1,5 +1,10 @@
 // src/utils/whatsappAPI.ts
 import { supabase, database } from './supabase';
+import {
+  resolveWhatsAppSender,
+  DEFAULT_COUNTRY_CODE,
+  type ResolvedWhatsAppSender,
+} from './whatsappSenderResolver';
 
 // Simple in-memory auth cache to avoid frequent /auth/v1/user calls during polling
 // IMPORTANT: userId here is the LIMS users.id (integer), NOT the Supabase auth UUID
@@ -174,57 +179,53 @@ export class WhatsAppAPI {
   }
 
   /**
-   * Get the effective WhatsApp User ID for sending messages
-   * This is the user ID selected in Settings -> Lab Settings -> WhatsApp Sender Account
-   * Stored in labs.whatsapp_user_id
+   * Resolve which WhatsApp account should send, for a given location.
+   *
+   * Cascade is location -> lab -> current user (see whatsappSenderResolver).
+   * When no location is passed we fall back to the operator's own branch, so a
+   * receptionist at Branch B messaging from the dashboard sends from Branch B's
+   * number without having to pass anything through.
    */
-  static async getEffectiveWhatsAppUserId(): Promise<string | null> {
+  static async resolveSender(locationId?: string | null): Promise<ResolvedWhatsAppSender> {
     try {
-      // Get auth session
       const { data: { session } } = await supabase.auth.getSession();
       const authUser = session?.user;
-      
+
       if (!authUser?.id) {
-        console.warn('[WhatsAppAPI] No auth user for getEffectiveWhatsAppUserId');
-        return null;
+        console.warn('[WhatsAppAPI] No auth user for resolveSender');
+        return { userId: null, countryCode: DEFAULT_COUNTRY_CODE, source: 'none', locationId: null };
       }
 
-      // Get current user's lab_id
       const { data: currentUser } = await supabase
         .from('users')
-        .select('id, lab_id')
+        .select('id, lab_id, default_location_id')
         .eq('auth_user_id', authUser.id)
-        .single();
-      
+        .maybeSingle();
+
       const labId = currentUser?.lab_id;
       if (!labId) {
         console.warn('[WhatsAppAPI] No lab_id for user');
-        return null;
+        return { userId: null, countryCode: DEFAULT_COUNTRY_CODE, source: 'none', locationId: null };
       }
 
-      // Get lab's whatsapp_user_id (this is the user ID selected in Settings)
-      const { data: lab } = await supabase
-        .from('labs')
-        .select('whatsapp_user_id')
-        .eq('id', labId)
-        .single();
-      
-      if (lab?.whatsapp_user_id) {
-        console.log('[WhatsAppAPI] Using lab whatsapp_user_id:', lab.whatsapp_user_id);
-        return lab.whatsapp_user_id;
-      }
+      const effectiveLocationId = locationId ?? currentUser?.default_location_id ?? null;
 
-      // Fallback: Use current user's ID if lab doesn't have one set
-      if (currentUser?.id) {
-        console.log('[WhatsAppAPI] Fallback: Using current user ID:', currentUser.id);
-        return currentUser.id;
-      }
+      const sender = await resolveWhatsAppSender({
+        labId,
+        locationId: effectiveLocationId,
+        // users.id, not the auth UUID — the backend registers sessions under
+        // the LIMS id (see sync-user-to-whatsapp).
+        fallbackUserId: currentUser?.id ?? null,
+      });
 
-      console.warn('[WhatsAppAPI] No whatsapp_user_id found');
-      return null;
+      console.log(
+        `[WhatsAppAPI] sender=${sender.userId} via ${sender.source}` +
+        (sender.locationId ? ` (location ${sender.locationId})` : ''),
+      );
+      return sender;
     } catch (err) {
-      console.error('[WhatsAppAPI] Error in getEffectiveWhatsAppUserId:', err);
-      return null;
+      console.error('[WhatsAppAPI] Error in resolveSender:', err);
+      return { userId: null, countryCode: DEFAULT_COUNTRY_CODE, source: 'none', locationId: null };
     }
   }
 
@@ -492,22 +493,24 @@ export class WhatsAppAPI {
   static async sendTextMessage(
     phoneNumber: string, 
     message: string,
-    templateData?: Record<string, string>
+    templateData?: Record<string, string>,
+    /** Order's location; omit to use the operator's own branch. */
+    locationId?: string | null
   ): Promise<MessageResult> {
     try {
       const labId = await database.getCurrentUserLabId();
-      // Get the effective WhatsApp user ID (priority: current user > lab users > lab-level)
-      const whatsappUserId = await this.getEffectiveWhatsAppUserId();
+      // Sender cascade: this location -> lab default -> current user
+      const { userId: whatsappUserId, countryCode } = await this.resolveSender(locationId);
       
       if (!whatsappUserId || !labId) {
         return {
           success: false,
-          message: 'WhatsApp not configured. Please sync a user in WhatsApp → User Sync or set Lab WhatsApp Sender in Settings.'
+          message: 'WhatsApp not configured. Set a sender on this location (Masters → Locations) or a lab default in Settings → Lab Settings.'
         };
       }
 
-      const formattedPhone = this.formatPhoneNumber(phoneNumber);
-      if (!this.validatePhoneNumber(phoneNumber)) {
+      const formattedPhone = this.formatPhoneNumber(phoneNumber, countryCode);
+      if (!this.validatePhoneNumber(phoneNumber, countryCode)) {
         return {
           success: false,
           message: 'Invalid phone number format'
@@ -562,13 +565,16 @@ export class WhatsAppAPI {
     reportFile: File,
     caption?: string,
     patientName?: string,
-    testName?: string
+    testName?: string,
+    /** Order's location; omit to use the operator's own branch. */
+    locationId?: string | null
   ): Promise<MessageResult> {
     // Use the new sendDocument method which handles all modes properly
     return await this.sendDocument(phoneNumber, reportFile, {
       caption,
       patientName,
-      testName
+      testName,
+      locationId
     });
   }
 
@@ -577,15 +583,17 @@ export class WhatsAppAPI {
     reportUrl: string,
     caption?: string,
     patientName?: string,
-    testName?: string
+    testName?: string,
+    /** Order's location; omit to use the operator's own branch. */
+    locationId?: string | null
   ): Promise<MessageResult> {
     try {
       const labId = await database.getCurrentUserLabId();
-      // Get the effective WhatsApp user ID (priority: current user > lab users > lab-level)
-      const whatsappUserId = await this.getEffectiveWhatsAppUserId();
+      // Sender cascade: this location -> lab default -> current user
+      const { userId: whatsappUserId, countryCode } = await this.resolveSender(locationId);
       
       if (!whatsappUserId || !labId) {
-        return { success: false, message: 'WhatsApp not configured. Please sync a user in WhatsApp → User Sync or set Lab WhatsApp Sender in Settings.' };
+        return { success: false, message: 'WhatsApp not configured. Set a sender on this location (Masters → Locations) or a lab default in Settings → Lab Settings.' };
       }
 
       // Prefer backend to fetch from URL (avoids CORS and big downloads in browser)
@@ -602,8 +610,8 @@ export class WhatsAppAPI {
         if (!error && data) return data as MessageResult;
         // Fallback to REST URL endpoint if available
       } else if (WHATSAPP_API_MODE === 'netlify-functions') {
-        const formattedPhone = this.formatPhoneNumber(phoneNumber);
-        if (!this.validatePhoneNumber(phoneNumber)) {
+        const formattedPhone = this.formatPhoneNumber(phoneNumber, countryCode);
+        if (!this.validatePhoneNumber(phoneNumber, countryCode)) {
           return { success: false, message: 'Invalid phone number format' };
         }
         const e164Phone = `+${formattedPhone}`;
@@ -916,23 +924,25 @@ export class WhatsAppAPI {
       caption?: string;
       patientName?: string;
       testName?: string;
+      /** Order's location; omit to use the operator's own branch. */
+      locationId?: string | null;
     } = {}
   ): Promise<MessageResult> {
     try {
-      // Use the effective WhatsApp sender account (labs.whatsapp_user_id)
-      // so the session lookup on the backend matches the connected account
-      const whatsappUserId = await this.getEffectiveWhatsAppUserId();
+      // Resolve the branch's sender so the session lookup on the backend
+      // matches the number actually connected for this location
+      const { userId: whatsappUserId, countryCode } = await this.resolveSender(options.locationId);
       const labId = await database.getCurrentUserLabId();
       if (!whatsappUserId || !labId) {
         return {
           success: false,
-          message: 'WhatsApp not configured. Please sync a user in WhatsApp → User Sync or set Lab WhatsApp Sender in Settings.'
+          message: 'WhatsApp not configured. Set a sender on this location (Masters → Locations) or a lab default in Settings → Lab Settings.'
         };
       }
 
       // Format phone number
-      const formattedPhone = this.formatPhoneNumber(to);
-      if (!this.validatePhoneNumber(formattedPhone)) {
+      const formattedPhone = this.formatPhoneNumber(to, countryCode);
+      if (!this.validatePhoneNumber(formattedPhone, countryCode)) {
         return {
           success: false,
           message: 'Invalid phone number format'
@@ -1030,25 +1040,30 @@ export class WhatsAppAPI {
   }
 
   // Utility functions
-  static formatPhoneNumber(phone: string): string {
+  static formatPhoneNumber(phone: string, countryCode: string = '+91'): string {
     // Remove all non-digits
     const digits = phone.replace(/\D/g, '');
-    
-    // Add country code if not present (assuming +91 for India)
+    const cc = countryCode.replace(/\D/g, '') || '91';
+
+    // Add the country code if not already present
     if (digits.length === 10) {
-      return '91' + digits;
-    } else if (digits.length === 12 && digits.startsWith('91')) {
+      return cc + digits;
+    } else if (digits.length === 10 + cc.length && digits.startsWith(cc)) {
       return digits;
-    } else if (digits.length === 13 && digits.startsWith('091')) {
+    } else if (digits.startsWith('0' + cc)) {
       return digits.substring(1);
+    } else if (digits.length === 11 && digits.startsWith('0')) {
+      // Local trunk prefix
+      return cc + digits.substring(1);
     }
     
     return digits;
   }
 
-  static validatePhoneNumber(phone: string): boolean {
-    const formatted = this.formatPhoneNumber(phone);
-    return /^91\d{10}$/.test(formatted);
+  static validatePhoneNumber(phone: string, countryCode: string = '+91'): boolean {
+    const cc = countryCode.replace(/\D/g, '') || '91';
+    const formatted = this.formatPhoneNumber(phone, countryCode);
+    return new RegExp(`^${cc}\\d{10}$`).test(formatted);
   }
 }
 

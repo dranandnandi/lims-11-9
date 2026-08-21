@@ -81,13 +81,165 @@ export async function fetchLetterheadBackgroundForOrder(
   }
 }
 
+export type LetterheadMode = 'background' | 'header_footer';
+
+export interface ReportBranding {
+  /** Which rendering style won for this order */
+  mode: LetterheadMode;
+  /** Which entity supplied the branding */
+  source: 'account' | 'location' | 'lab';
+  /** Full-page A4 background image (only in 'background' mode) */
+  letterheadUrl: string | null;
+  /** Top strip image (only in 'header_footer' mode) */
+  headerUrl: string | null;
+  /** Bottom strip image (only in 'header_footer' mode) */
+  footerUrl: string | null;
+}
+
+/**
+ * Read an entity's own letterhead mode override.
+ * Returns null when the entity inherits (or when the column is not deployed yet).
+ */
+async function getEntityLetterheadMode(
+  supabase: any,
+  table: 'locations' | 'accounts' | 'labs',
+  id: string
+): Promise<LetterheadMode | null> {
+  try {
+    const { data, error } = await supabase
+      .from(table)
+      .select('pdf_letterhead_mode')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (error || !data) return null;
+    const mode = data.pdf_letterhead_mode;
+    return mode === 'background' || mode === 'header_footer' ? mode : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve the complete report branding for an order in a single pass.
+ *
+ * Priority for WHICH entity's artwork is used: B2B Account > Location > Lab.
+ * The winning entity also decides HOW its artwork is rendered:
+ *   - explicit `pdf_letterhead_mode` on that entity wins;
+ *   - otherwise auto-detect: a footer image implies separate header/footer strips,
+ *     while a header image on its own is treated as a full-page letterhead
+ *     (matching how the lab-level default letterhead behaves);
+ *   - the lab always follows its own `labs.pdf_letterhead_mode` setting.
+ *
+ * Any image the winning entity does not supply falls back to the lab's artwork,
+ * so a location can override just the header and keep the lab footer.
+ */
+export async function resolveReportBranding(
+  supabase: any,
+  orderId: string,
+  labId: string
+): Promise<ReportBranding> {
+  const labMode = (await getEntityLetterheadMode(supabase, 'labs', labId)) || 'background';
+
+  const labFallback = async (): Promise<ReportBranding> => {
+    if (labMode === 'header_footer') {
+      const headerUrl = (await getAttachmentImageUrl(supabase, 'lab', labId, 'header')) ||
+        (await fetchLabAssetUrl(supabase, labId, 'header'));
+      const footerUrl = (await getAttachmentImageUrl(supabase, 'lab', labId, 'footer')) ||
+        (await fetchLabAssetUrl(supabase, labId, 'footer'));
+      return { mode: 'header_footer', source: 'lab', letterheadUrl: null, headerUrl, footerUrl };
+    }
+
+    const letterheadUrl = (await getAttachmentImageUrl(supabase, 'lab', labId, 'header')) ||
+      (await fetchLetterheadBackground(supabase, labId));
+    return { mode: 'background', source: 'lab', letterheadUrl, headerUrl: null, footerUrl: null };
+  };
+
+  try {
+    const { data: order, error: orderError } = await supabase
+      .from('orders')
+      .select('account_id, location_id')
+      .eq('id', orderId)
+      .single();
+
+    if (orderError) {
+      console.log('[BRANDING] Could not read order, falling back to lab branding:', orderError.message);
+      return labFallback();
+    }
+
+    console.log('[BRANDING] Order context:', {
+      orderId,
+      account_id: order?.account_id,
+      location_id: order?.location_id,
+      lab_id: labId,
+      labMode,
+    });
+
+    const candidates: Array<{
+      source: 'account' | 'location';
+      entityType: 'account' | 'location';
+      table: 'accounts' | 'locations';
+      id: string;
+    }> = [];
+
+    if (order?.account_id) {
+      candidates.push({ source: 'account', entityType: 'account', table: 'accounts', id: order.account_id });
+    }
+    if (order?.location_id) {
+      candidates.push({ source: 'location', entityType: 'location', table: 'locations', id: order.location_id });
+    }
+
+    for (const candidate of candidates) {
+      const [ownHeader, ownFooter] = await Promise.all([
+        getAttachmentImageUrl(supabase, candidate.entityType, candidate.id, 'header'),
+        getAttachmentImageUrl(supabase, candidate.entityType, candidate.id, 'footer'),
+      ]);
+
+      // Nothing uploaded for this entity - let the next candidate (or the lab) win.
+      if (!ownHeader && !ownFooter) continue;
+
+      const explicitMode = await getEntityLetterheadMode(supabase, candidate.table, candidate.id);
+      const mode: LetterheadMode = explicitMode || (ownFooter ? 'header_footer' : 'background');
+
+      console.log(`[BRANDING] Using ${candidate.source} branding`, {
+        mode,
+        explicitMode: explicitMode || 'auto',
+        hasHeader: !!ownHeader,
+        hasFooter: !!ownFooter,
+      });
+
+      if (mode === 'header_footer') {
+        const headerUrl = ownHeader ||
+          (await getAttachmentImageUrl(supabase, 'lab', labId, 'header')) ||
+          (await fetchLabAssetUrl(supabase, labId, 'header'));
+        const footerUrl = ownFooter ||
+          (await getAttachmentImageUrl(supabase, 'lab', labId, 'footer')) ||
+          (await fetchLabAssetUrl(supabase, labId, 'footer'));
+        return { mode, source: candidate.source, letterheadUrl: null, headerUrl, footerUrl };
+      }
+
+      // Full-page letterhead: the header upload IS the whole page.
+      const letterheadUrl = ownHeader ||
+        (await getAttachmentImageUrl(supabase, 'lab', labId, 'header')) ||
+        (await fetchLetterheadBackground(supabase, labId));
+      return { mode, source: candidate.source, letterheadUrl, headerUrl: null, footerUrl: null };
+    }
+
+    return labFallback();
+  } catch (error) {
+    console.error('[BRANDING] Error resolving report branding:', error);
+    return labFallback();
+  }
+}
+
 /**
  * Get header image URL from ATTACHMENTS table (for location/account)
  */
 async function getAttachmentImageUrl(
   supabase: any,
   entityType: string,
-  entityId: string
+  entityId: string,
+  attachmentType: 'header' | 'footer' = 'header'
 ): Promise<string | null> {
   try {
     const { data: attachment, error } = await supabase
@@ -95,19 +247,19 @@ async function getAttachmentImageUrl(
       .select('file_url, imagekit_url, mime_type')
       .eq('entity_type', entityType)
       .eq('entity_id', entityId)
-      .eq('attachment_type', 'header')
+      .eq('attachment_type', attachmentType)
       .order('created_at', { ascending: false })
       .limit(1)
       .single();
 
     if (error || !attachment) {
-      console.log(`[LETTERHEAD] No ${entityType} header found`);
+      console.log(`[LETTERHEAD] No ${entityType} ${attachmentType} found`);
       return null;
     }
 
     // Prefer ImageKit URL for better performance
     const headerUrl = attachment.imagekit_url || attachment.file_url;
-    console.log(`[LETTERHEAD] Found ${entityType} header:`, headerUrl);
+    console.log(`[LETTERHEAD] Found ${entityType} ${attachmentType}:`, headerUrl);
     return headerUrl;
 
   } catch (error) {
@@ -254,24 +406,37 @@ export async function fetchHeaderFooterImages(
       .eq('id', orderId)
       .single();
 
-    // Try B2B account-level first
+    // Try B2B account-level first - an account footer overrides the lab footer
     if (order?.account_id) {
-      const accountHeader = await getAttachmentImageUrl(supabase, 'account', order.account_id);
-      if (accountHeader) {
-        // For account-level, only header is typically available; footer falls back to lab
-        const footerUrl = await fetchLabAssetUrl(supabase, labId, 'footer');
-        console.log('[HEADER_FOOTER] Using B2B account header + lab footer');
-        return { headerUrl: accountHeader, footerUrl };
+      const [accountHeader, accountFooter] = await Promise.all([
+        getAttachmentImageUrl(supabase, 'account', order.account_id, 'header'),
+        getAttachmentImageUrl(supabase, 'account', order.account_id, 'footer'),
+      ]);
+      if (accountHeader || accountFooter) {
+        const footerUrl = accountFooter || await fetchLabAssetUrl(supabase, labId, 'footer');
+        const headerUrl = accountHeader || await fetchLabAssetUrl(supabase, labId, 'header');
+        console.log('[HEADER_FOOTER] Using B2B account header/footer', {
+          ownHeader: !!accountHeader,
+          ownFooter: !!accountFooter,
+        });
+        return { headerUrl, footerUrl };
       }
     }
 
-    // Try location-level
+    // Try location-level - a location footer overrides the lab footer
     if (order?.location_id) {
-      const locationHeader = await getAttachmentImageUrl(supabase, 'location', order.location_id);
-      if (locationHeader) {
-        const footerUrl = await fetchLabAssetUrl(supabase, labId, 'footer');
-        console.log('[HEADER_FOOTER] Using location header + lab footer');
-        return { headerUrl: locationHeader, footerUrl };
+      const [locationHeader, locationFooter] = await Promise.all([
+        getAttachmentImageUrl(supabase, 'location', order.location_id, 'header'),
+        getAttachmentImageUrl(supabase, 'location', order.location_id, 'footer'),
+      ]);
+      if (locationHeader || locationFooter) {
+        const footerUrl = locationFooter || await fetchLabAssetUrl(supabase, labId, 'footer');
+        const headerUrl = locationHeader || await fetchLabAssetUrl(supabase, labId, 'header');
+        console.log('[HEADER_FOOTER] Using location header/footer', {
+          ownHeader: !!locationHeader,
+          ownFooter: !!locationFooter,
+        });
+        return { headerUrl, footerUrl };
       }
     }
 

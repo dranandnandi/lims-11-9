@@ -10,6 +10,12 @@
 import { useState, useEffect, useCallback } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { supabase } from "../utils/supabase";
+import {
+  contextForGroup,
+  fetchPatientRangeInfo,
+  fetchRangeRules,
+  resolveForAnalyte,
+} from "../utils/referenceRangeLoader";
 import { ResultIntake } from "../components/Orders/ResultIntake";
 import { ResultAudit } from "../components/Orders/ResultAudit";
 import { useOrderStatusSync } from "../hooks/useOrderStatusSync";
@@ -125,6 +131,7 @@ export default function OrderDetail() {
             test_group_id,
             test_name,
             price,
+            sample_condition,
             test_groups(
               id,
               name,
@@ -152,6 +159,10 @@ export default function OrderDetail() {
                   unit,
                   reference_range,
                   lab_specific_reference_range,
+                  reference_range_male,
+                  reference_range_female,
+                  low_critical,
+                  high_critical,
                   is_calculated,
                   formula,
                   formula_variables
@@ -164,6 +175,7 @@ export default function OrderDetail() {
             test_name,
             test_group_id,
             sample_id,
+            sample_condition,
             test_groups(
               id,
               name,
@@ -191,6 +203,10 @@ export default function OrderDetail() {
                   unit,
                   reference_range,
                   lab_specific_reference_range,
+                  reference_range_male,
+                  reference_range_female,
+                  low_critical,
+                  high_critical,
                   is_calculated,
                   formula,
                   formula_variables
@@ -238,6 +254,31 @@ export default function OrderDetail() {
 
       if (error) throw error;
 
+      // Deterministic (non-AI) reference ranges. Resolved here rather than in
+      // ResultIntake because that component receives its analytes pre-built.
+      const labAnalyteIdsForRanges: string[] = [
+        ...(data.order_test_groups || []),
+        ...(data.order_tests || []),
+      ].flatMap((row: any) =>
+        (row.test_groups?.test_group_analytes || []).map((tga: any) => tga.lab_analyte_id),
+      ).filter(Boolean);
+
+      const [rangeRulesMap, patientRangeData] = await Promise.all([
+        fetchRangeRules(labAnalyteIdsForRanges),
+        fetchPatientRangeInfo(data.id, data.patient_id),
+      ]);
+
+      const resolveAnalyteRange = (la: any, a: any, labAnalyteId: string | null, sampleCondition: string | null) =>
+        resolveForAnalyte(rangeRulesMap, {
+          lab_analyte_id: labAnalyteId,
+          lab_specific_reference_range: la?.lab_specific_reference_range,
+          reference_range: la?.reference_range ?? a?.reference_range,
+          reference_range_male: la?.reference_range_male,
+          reference_range_female: la?.reference_range_female,
+          low_critical: la?.low_critical,
+          high_critical: la?.high_critical,
+        }, contextForGroup(patientRangeData, sampleCondition));
+
       // Build test groups from both order_test_groups and order_tests
       const testGroupsFromOTG =
         data.order_test_groups
@@ -253,12 +294,17 @@ export default function OrderDetail() {
               otg.test_groups.test_group_analytes?.map((tga: any) => {
                 const a = tga.analytes;
                 const la = tga.lab_analyte_id ? tga.lab_analytes : null;
+                const labAnalyteId = tga.lab_analyte_id || la?.id || null;
+                const resolvedRange = resolveAnalyteRange(la, a, labAnalyteId, otg.sample_condition || null);
                 return {
                   ...a,
-                  lab_analyte_id: tga.lab_analyte_id || la?.id || null,
+                  lab_analyte_id: labAnalyteId,
                   name: la?.name || a.name,
                   unit: la?.unit || a.unit,
-                  reference_range: la?.lab_specific_reference_range ?? la?.reference_range ?? a.reference_range,
+                  reference_range: resolvedRange.range_text,
+                  range_rule_id: resolvedRange.rule_id,
+                  range_source: resolvedRange.source,
+                  applied_range_rule: resolvedRange.applied_rule,
                   is_calculated: la?.is_calculated ?? a.is_calculated,
                   formula: la?.formula ?? a.formula,
                   formula_variables: la?.formula_variables ?? a.formula_variables,
@@ -288,12 +334,17 @@ export default function OrderDetail() {
               ot.test_groups.test_group_analytes?.map((tga: any) => {
                 const a = tga.analytes;
                 const la = tga.lab_analyte_id ? tga.lab_analytes : null;
+                const labAnalyteId = tga.lab_analyte_id || la?.id || null;
+                const resolvedRange = resolveAnalyteRange(la, a, labAnalyteId, ot.sample_condition || null);
                 return {
                   ...a,
-                  lab_analyte_id: tga.lab_analyte_id || la?.id || null,
+                  lab_analyte_id: labAnalyteId,
                   name: la?.name || a.name,
                   unit: la?.unit || a.unit,
-                  reference_range: la?.lab_specific_reference_range ?? la?.reference_range ?? a.reference_range,
+                  reference_range: resolvedRange.range_text,
+                  range_rule_id: resolvedRange.rule_id,
+                  range_source: resolvedRange.source,
+                  applied_range_rule: resolvedRange.applied_rule,
                   is_calculated: la?.is_calculated ?? a.is_calculated,
                   formula: la?.formula ?? a.formula,
                   formula_variables: la?.formula_variables ?? a.formula_variables,

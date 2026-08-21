@@ -180,6 +180,7 @@ const Orders: React.FC = () => {
   const [orderSortMode, setOrderSortMode] = useState<OrderSortMode>("sample_desc");
   const [isRefreshingOrders, setIsRefreshingOrders] = useState(false);
   const progressRowsCacheRef = useRef<Map<string, ProgressRow[]>>(new Map());
+  const ordersRefreshTimerRef = useRef<number | null>(null);
 
   // Filter state
   const [filters, setFilters] = useState<OrderFilters>({
@@ -321,6 +322,25 @@ const Orders: React.FC = () => {
   // 🔬 ANALYZER REALTIME: Track LIS result arrivals per order
   const analyzerActivity = useAnalyzerRealtime(userLabId);
 
+  // Trailing-edge refresh for realtime bursts. The list load is four queries
+  // over every order in the lab, so it must run once per burst, not once per
+  // changed row.
+  const scheduleOrdersRefresh = () => {
+    if (ordersRefreshTimerRef.current !== null) {
+      window.clearTimeout(ordersRefreshTimerRef.current);
+    }
+    ordersRefreshTimerRef.current = window.setTimeout(() => {
+      ordersRefreshTimerRef.current = null;
+      fetchOrders();
+    }, 1200);
+  };
+
+  useEffect(() => () => {
+    if (ordersRefreshTimerRef.current !== null) {
+      window.clearTimeout(ordersRefreshTimerRef.current);
+    }
+  }, []);
+
   // 🔴 REALTIME: Subscribe to order changes
   const { isConnected: realtimeConnected } = useRealtimeOrders({
     labId: userLabId,
@@ -381,8 +401,10 @@ const Orders: React.FC = () => {
       }
     },
     onUpdate: (updatedOrder) => {
-      // Refresh that specific order
-      fetchOrders();
+      // Saving results touches an order several times in quick succession, and
+      // each event used to trigger the full four-query list load. Coalesce the
+      // burst into one refresh once the writes settle.
+      scheduleOrdersRefresh();
     },
     onDelete: (deletedOrderId) => {
       setOrders(prev => prev.filter(order => order.id !== deletedOrderId));
@@ -435,6 +457,11 @@ const Orders: React.FC = () => {
   };
 
   const fetchOrders = async () => {
+    // A direct refresh satisfies any burst still waiting on the debounce.
+    if (ordersRefreshTimerRef.current !== null) {
+      window.clearTimeout(ordersRefreshTimerRef.current);
+      ordersRefreshTimerRef.current = null;
+    }
     setIsRefreshingOrders(true);
     // Get current user's lab_id
     try {
@@ -484,9 +511,16 @@ const Orders: React.FC = () => {
       }
 
     // 2) view-based progress (Using ENHANCED view for TAT)
+    // Only the columns the cards actually read. select=* on this view carried
+    // ~40 columns per panel row and dominated the payload of every refresh.
     const { data: prog, error: pErr } = await supabase
       .from("v_order_test_progress_enhanced")
-      .select("*")
+      .select(
+        "order_id, test_group_id, test_group_name, expected_analytes, entered_analytes, " +
+        "is_verified, panel_status, sample_type, sample_color, " +
+        "tat_hours, tat_start_time, hours_until_tat_breach, is_tat_breached, " +
+        "is_section_only, has_section_content, section_verification_status"
+      )
       .in("order_id", orderIds);
 
     if (pErr) console.error("progress view error", pErr);

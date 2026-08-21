@@ -119,6 +119,8 @@ export interface Location {
   is_collection_center?: boolean;
   is_processing_center?: boolean;
   can_receive_samples?: boolean;
+  /** null/undefined = inherit lab default & auto-detect from uploaded artwork */
+  pdf_letterhead_mode?: 'background' | 'header_footer' | null;
   is_main_lab?: boolean;
   notes?: string;
   upi_id?: string;
@@ -134,6 +136,10 @@ export interface Location {
   barcode_browser_print_enabled?: boolean | null;
   auto_print_barcode_on_order?: boolean | null;
   auto_print_report_on_approval?: boolean | null;
+  /** users.id whose WhatsApp session sends for this branch; null = inherit labs.whatsapp_user_id */
+  whatsapp_user_id?: string | null;
+  /** null = inherit labs.country_code */
+  whatsapp_country_code?: string | null;
   created_at: string;
   updated_at: string;
 }

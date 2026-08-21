@@ -33,6 +33,8 @@ export interface NotificationSettings {
 export interface QueuedNotification {
   id: string;
   lab_id: string;
+  /** Branch the notification came from; picks that branch's WhatsApp sender at drain time. */
+  location_id: string | null;
   recipient_type: 'patient' | 'doctor';
   recipient_phone: string;
   recipient_name: string | null;
@@ -177,7 +179,9 @@ export const notificationTriggerService = {
     message: string,
     attachmentUrl?: string,
     patientName?: string,
-    testName?: string
+    testName?: string,
+    /** Location the notification belongs to; picks that branch's WhatsApp sender. */
+    locationId?: string | null
   ): Promise<{ success: boolean; messageId?: string; error?: string }> => {
     try {
       const formattedPhone = formatPhoneNumber(phone);
@@ -193,11 +197,12 @@ export const notificationTriggerService = {
           attachmentUrl,
           message,
           patientName,
-          testName
+          testName,
+          locationId
         );
       } else {
         // Send text message
-        result = await WhatsAppAPI.sendTextMessage(formattedPhone, message);
+        result = await WhatsAppAPI.sendTextMessage(formattedPhone, message, undefined, locationId);
       }
 
       return {
@@ -246,6 +251,7 @@ export const notificationTriggerService = {
       .select(`
         id,
         order_display,
+        location_id,
         patient_name,
         doctor,
         referring_doctor_id,
@@ -303,7 +309,8 @@ export const notificationTriggerService = {
           patientMessage,
           pdfUrl,
           order.patient_name,
-          testNames
+          testNames,
+          order.location_id
         )
         : { success: false, error: !statusMatches ? `Waiting for status ${statusGate}` : 'Outside send window' };
 
@@ -323,6 +330,7 @@ export const notificationTriggerService = {
         if (settings.queue_outside_window !== false || statusMatches) {
           await notificationTriggerService.queueNotification({
             lab_id: labId,
+            location_id: order.location_id,
             recipient_type: 'patient',
             recipient_phone: order.patients.phone,
             recipient_name: order.patient_name,
@@ -356,7 +364,8 @@ export const notificationTriggerService = {
           doctorMessage,
           pdfUrl,
           order.patient_name,
-          testNames
+          testNames,
+          order.location_id
         )
         : { success: false, error: !statusMatches ? `Waiting for status ${statusGate}` : 'Outside send window' };
 
@@ -373,6 +382,7 @@ export const notificationTriggerService = {
         if (settings.queue_outside_window !== false || statusMatches) {
           await notificationTriggerService.queueNotification({
             lab_id: labId,
+            location_id: order.location_id,
             recipient_type: 'doctor',
             recipient_phone: order.doctors.phone,
             recipient_name: order.doctors.name,
@@ -410,13 +420,15 @@ export const notificationTriggerService = {
           doctorMessage,
           pdfUrl,
           order.patient_name,
-          testNames
+          testNames,
+          order.location_id
         )
         : { success: false, error: !statusMatches ? `Waiting for status ${statusGate}` : 'Outside send window' };
 
       if (!sendResult.success && (settings.queue_outside_window !== false || statusMatches)) {
         await notificationTriggerService.queueNotification({
           lab_id: labId,
+          location_id: order.location_id,
           recipient_type: 'doctor',
           recipient_phone: order.doctors.hospital_phone,
           recipient_name: order.doctors.name,
@@ -459,6 +471,7 @@ export const notificationTriggerService = {
         total,
         patient_name,
         order_id,
+        location_id,
         whatsapp_sent_at,
         patients!inner (id, name, phone)
       `)
@@ -502,6 +515,7 @@ export const notificationTriggerService = {
 
     const queued = await notificationTriggerService.queueNotification({
       lab_id: labId,
+      location_id: invoice.location_id,
       recipient_type: 'patient',
       recipient_phone: invoice.patients.phone,
       recipient_name: invoice.patient_name,
@@ -545,7 +559,9 @@ export const notificationTriggerService = {
       invoice.patients.phone,
       message,
       pdfUrl,
-      invoice.patient_name
+      invoice.patient_name,
+      undefined,
+      invoice.location_id
     );
 
     if (sendResult.success) {
@@ -600,6 +616,7 @@ export const notificationTriggerService = {
       .select(`
         id,
         order_display,
+        location_id,
         patient_name,
         doctor,
         expected_date,
@@ -659,7 +676,11 @@ export const notificationTriggerService = {
       const sendResult = shouldAttemptNow
         ? await notificationTriggerService.sendWithFallback(
           order.patients.phone,
-          message
+          message,
+          undefined,
+          undefined,
+          undefined,
+          order.location_id
         )
         : { success: false, error: 'Outside send window' };
 
@@ -668,6 +689,7 @@ export const notificationTriggerService = {
       } else if (settings.queue_outside_window !== false) {
         await notificationTriggerService.queueNotification({
           lab_id: labId,
+          location_id: order.location_id,
           recipient_type: 'patient',
           recipient_phone: order.patients.phone,
           recipient_name: order.patient_name,
@@ -699,7 +721,11 @@ export const notificationTriggerService = {
       const sendResult = shouldAttemptNow
         ? await notificationTriggerService.sendWithFallback(
           order.doctors.phone,
-          doctorMessage
+          doctorMessage,
+          undefined,
+          undefined,
+          undefined,
+          order.location_id
         )
         : { success: false, error: 'Outside send window' };
 
@@ -708,6 +734,7 @@ export const notificationTriggerService = {
       } else if (settings.queue_outside_window !== false) {
         await notificationTriggerService.queueNotification({
           lab_id: labId,
+          location_id: order.location_id,
           recipient_type: 'doctor',
           recipient_phone: order.doctors.phone,
           recipient_name: order.doctors.name,
@@ -766,7 +793,7 @@ export const notificationTriggerService = {
 
     const { data: order } = await supabase
       .from('orders')
-      .select('id, order_display')
+      .select('id, order_display, location_id')
       .eq('id', orderId)
       .maybeSingle();
 
@@ -813,7 +840,14 @@ export const notificationTriggerService = {
     const message = replacePlaceholders(templateMessage, templateData);
 
     const sendResult = shouldAttemptNow
-      ? await notificationTriggerService.sendWithFallback(patient.phone, message)
+      ? await notificationTriggerService.sendWithFallback(
+        patient.phone,
+        message,
+        undefined,
+        undefined,
+        undefined,
+        order?.location_id
+      )
       : { success: false, error: 'Outside send window' };
 
     if (sendResult.success) {
@@ -823,6 +857,7 @@ export const notificationTriggerService = {
     if (settings.queue_outside_window !== false) {
       await notificationTriggerService.queueNotification({
         lab_id: labId,
+        location_id: order?.location_id,
         recipient_type: 'patient',
         recipient_phone: patient.phone,
         recipient_name: patient.name,
@@ -943,7 +978,9 @@ export const notificationTriggerService = {
         item.recipient_phone,
         item.message_content || '',
         item.attachment_url || undefined,
-        item.recipient_name || undefined
+        item.recipient_name || undefined,
+        undefined,
+        item.location_id
       );
 
       if (sendResult.success) {

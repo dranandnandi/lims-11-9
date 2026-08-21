@@ -348,7 +348,10 @@ class WhatsAppUserSyncService {
   }
 
   /**
-   * Get sync status for users
+   * Get sync status for users.
+   *
+   * Restricted to active users to match syncAllUsersInLab — otherwise the list
+   * offers rows that "Sync All" silently skips. Keep the two filters in step.
    */
   async getSyncStatus(labId?: string): Promise<any[]> {
     try {
@@ -362,13 +365,16 @@ class WhatsAppUserSyncService {
           whatsapp_last_sync,
           whatsapp_user_id,
           whatsapp_sync_error
-        `);
+        `)
+        .eq('status', 'Active');
 
       if (labId) {
         query = query.eq('lab_id', labId);
       }
 
-      const { data, error } = await query;
+      // .order() returns a transform builder with no .eq, so it has to come
+      // after the conditional filter above.
+      const { data, error } = await query.order('name');
 
       if (error) {
         throw new Error(`Failed to fetch sync status: ${error.message}`);

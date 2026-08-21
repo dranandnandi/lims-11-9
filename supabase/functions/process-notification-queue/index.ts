@@ -3,6 +3,7 @@
 
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.38.4'
+import { resolveWhatsAppSender, formatPhoneForSender } from '../_shared/whatsappSender.ts'
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -117,48 +118,25 @@ serve(async (req: Request) => {
     // Helper function to send WhatsApp via Netlify function
     const sendWhatsApp = async (item: any): Promise<boolean> => {
       try {
-        // Get lab's country code
-        const { data: labData } = await supabaseClient
-          .from('labs')
-          .select('whatsapp_user_id, country_code')
-          .eq('id', item.lab_id)
-          .single()
-        
-        const whatsappUserId = labData?.whatsapp_user_id
-        const countryCode = labData?.country_code || '+91' // Default to India
-        
+        // Route to the branch's own WhatsApp number when the originating
+        // location has one; otherwise fall through to the lab default.
+        const sender = await resolveWhatsAppSender(supabaseClient, {
+          labId: item.lab_id,
+          locationId: item.location_id,
+        })
+
+        const whatsappUserId = sender.userId
+        const countryCode = sender.countryCode
+
         if (!whatsappUserId) {
-          console.error('❌ No whatsapp_user_id configured for lab:', item.lab_id)
+          console.error('❌ No WhatsApp sender configured for lab:', item.lab_id, 'location:', item.location_id)
           return false
         }
-        
-        console.log('✅ Found lab whatsapp_user_id:', whatsappUserId)
+
+        console.log(`✅ Sender ${whatsappUserId} via ${sender.source}`)
         console.log('🌍 Using country code:', countryCode)
 
-        let cleanPhone = item.recipient_phone.replace(/\D/g, '')
-        
-        // Remove leading 0 (common for local numbers)
-        if (cleanPhone.startsWith('0')) {
-          cleanPhone = cleanPhone.substring(1)
-        }
-        
-        // Format phone number with lab's country code
-        let formattedPhone: string
-        const countryCodeDigits = countryCode.replace(/\D/g, '')
-        
-        if (cleanPhone.length === 10) {
-          // 10 digit number - add country code
-          formattedPhone = countryCode + cleanPhone
-        } else if (cleanPhone.startsWith(countryCodeDigits) && cleanPhone.length === (10 + countryCodeDigits.length)) {
-          // Already has country code digits - just add +
-          formattedPhone = '+' + cleanPhone
-        } else if (cleanPhone.length > 10) {
-          // Assume it has country code, just add +
-          formattedPhone = '+' + cleanPhone
-        } else {
-          // Fallback - add country code
-          formattedPhone = countryCode + cleanPhone
-        }
+        const formattedPhone = formatPhoneForSender(item.recipient_phone, countryCode)
 
         console.log(`📤 Sending to ${formattedPhone} (original: ${item.recipient_phone})`)
 

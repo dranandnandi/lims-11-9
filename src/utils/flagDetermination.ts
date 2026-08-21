@@ -126,6 +126,21 @@ const SEMI_QUANT_ABNORMAL_ORDER = [
  * - "70-110 mg/dL"
  * - "< 100 (Optimal)"
  */
+/**
+ * Local copy of the gender normalizer in referenceRangeResolver.
+ *
+ * Kept local rather than imported because the resolver imports
+ * parseReferenceRange from this file, and a cycle between the two is not worth
+ * five lines of reuse.
+ */
+function normalizeGenderValue(value: unknown): "male" | "female" | "other" | null {
+  const raw = String(value ?? "").trim().toLowerCase();
+  if (!raw) return null;
+  if (raw === "m" || raw.startsWith("male") || raw === "man" || raw === "boy") return "male";
+  if (raw === "f" || raw.startsWith("female") || raw === "woman" || raw === "girl") return "female";
+  return "other";
+}
+
 export function parseReferenceRange(
   refRange: string | null | undefined,
 ): ParsedRange {
@@ -300,11 +315,15 @@ function determineNumericFlag(
     };
   }
 
-  // Get appropriate reference range based on gender
+  // Get appropriate reference range based on gender.
+  // Compared case-insensitively: labs configure their own gender_options, so an
+  // exact "Male" match silently dropped the gender range for any lab using M/F
+  // or lowercase values.
   let refRange = config.reference_range;
-  if (patient?.gender === "Male" && config.reference_range_male) {
+  const normalizedGender = normalizeGenderValue(patient?.gender);
+  if (normalizedGender === "male" && config.reference_range_male) {
     refRange = config.reference_range_male;
-  } else if (patient?.gender === "Female" && config.reference_range_female) {
+  } else if (normalizedGender === "female" && config.reference_range_female) {
     refRange = config.reference_range_female;
   }
 
